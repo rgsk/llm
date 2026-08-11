@@ -1,12 +1,13 @@
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-from torch import Tensor
 from typing import Literal
-from utils import repo_root
+
+import torch
+import torch.nn.functional as F
+from beartype import beartype
 from einops import rearrange
 from jaxtyping import Float, Int, jaxtyped
-from beartype import beartype
+from torch import Tensor, nn
+
+from utils import repo_root
 
 ROOT = repo_root()
 DATA = ROOT / "data" / "input.txt"
@@ -60,12 +61,13 @@ class Head(nn.Module):
 
     @jaxtyped(typechecker=beartype)
     def forward(self, x: Float[Tensor, "b t e"]):
-        B, T, E = x.shape
+        _, T, _ = x.shape
         q = self.query(x)  # [B, T, hs]
         k = self.key(x)  # [B, T, hs]
         scores = (
             q @ rearrange(k, "b t hs -> b hs t") * self.head_size**-0.5
         )  # [B, T, T]
+
         scores = scores.masked_fill(self.tril[:T, :T] == 0, float("-inf"))
         w = F.softmax(scores, dim=-1)  # [B, T, T]
         v = self.value(x)  # [B, T, hs]
@@ -73,12 +75,25 @@ class Head(nn.Module):
         return out
 
 
-class BigramLM(nn.Module):
+class MultiHeadAttention(nn.Module):
+    def __init__(self, n_head: int):
+        super().__init__()
+        assert n_embed % n_head == 0, "n_embed must divide by n_head"
+        head_size = n_embed // n_head
+        self.heads = nn.ModuleList([Head(head_size) for _ in range(n_head)])
+
+    @jaxtyped(typechecker=beartype)
+    def forward(self, x: Float[Tensor, "b t e"]):
+        out = torch.cat([h(x) for h in self.heads], dim=-1)  # [B, T, E]
+        return out
+
+
+class GPT(nn.Module):
     def __init__(self):
         super().__init__()
         self.token_embedding_table = nn.Embedding(vocab_size, n_embed)
         self.position_embedding_table = nn.Embedding(block_size, n_embed)
-        self.sa_head = Head(n_embed)
+        self.attn = MultiHeadAttention(4)
         self.lm_head = nn.Linear(n_embed, vocab_size)
 
     @jaxtyped(typechecker=beartype)
@@ -87,12 +102,12 @@ class BigramLM(nn.Module):
         idx: Int[Tensor, "b t"],
         targets: Int[Tensor, "b t"] | None = None,
     ) -> tuple[Float[Tensor, "b t v"], Float[Tensor, ""] | None]:
-        B, T = idx.shape
+        _, T = idx.shape
         tok_embed = self.token_embedding_table(idx)  # [B, T, E]
         pos = torch.arange(T, device=idx.device)
         pos_embed = self.position_embedding_table(pos)  # [T, E]
         x = tok_embed + pos_embed  # [B, T, E]
-        x = self.sa_head(x)  # [B, T, E]
+        x = self.attn(x)  # [B, T, E]
         logits = self.lm_head(x)  # [B, T, V]
         loss = None
         if targets is not None:
@@ -115,7 +130,7 @@ class BigramLM(nn.Module):
         return idx
 
 
-model = BigramLM()
+model = GPT()
 model.to(device)
 lr = 1e-2
 opt = torch.optim.AdamW(model.parameters(), lr=lr)
