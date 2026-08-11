@@ -1,20 +1,10 @@
-from pathlib import Path
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from typing import Literal
+from pathlib import Path
 
-def repo_root() -> Path:
-    """Walk up from the cwd to the folder holding pyproject.toml, so paths work no
-    matter where the kernel is launched from."""
-    here = Path(__file__).parent
-    for d in (here, *here.parents):
-        if (d / "pyproject.toml").exists():
-            return d
-    return here
-
-ROOT = repo_root()
-DATA = ROOT / "data" / "input.txt"
+DATA = Path(__file__).parent.parent.parent / "data" / "input.txt"
 text = DATA.read_text(encoding="utf-8")
 itoc = sorted(set(text))
 ctoi = {c: i for i, c in enumerate(itoc)}
