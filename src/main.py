@@ -46,6 +46,8 @@ def get_batch(
 
 vocab_size = len(itoc)  # V
 n_embed = 32  # E
+n_head = 4
+n_layer = 3
 
 
 class Head(nn.Module):
@@ -60,7 +62,7 @@ class Head(nn.Module):
         self.register_buffer("tril", torch.tril(torch.ones(block_size, block_size)))
 
     @jaxtyped(typechecker=beartype)
-    def forward(self, x: Float[Tensor, "b t e"]):
+    def forward(self, x: Float[Tensor, "b t e"]) -> Float[Tensor, "b t hs"]:
         _, T, _ = x.shape
         q = self.query(x)  # [B, T, hs]
         k = self.key(x)  # [B, T, hs]
@@ -76,16 +78,46 @@ class Head(nn.Module):
 
 
 class MultiHeadAttention(nn.Module):
-    def __init__(self, n_head: int):
+    def __init__(self):
         super().__init__()
         assert n_embed % n_head == 0, "n_embed must divide by n_head"
         head_size = n_embed // n_head
         self.heads = nn.ModuleList([Head(head_size) for _ in range(n_head)])
+        self.proj = nn.Linear(n_embed, n_embed)
 
     @jaxtyped(typechecker=beartype)
-    def forward(self, x: Float[Tensor, "b t e"]):
+    def forward(self, x: Float[Tensor, "b t e"]) -> Float[Tensor, "b t e"]:
         out = torch.cat([h(x) for h in self.heads], dim=-1)  # [B, T, E]
-        return out
+        return self.proj(out)  # [B, T, E]
+
+
+class FeedForward(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(n_embed, 4 * n_embed),
+            nn.ReLU(),
+            nn.Linear(4 * n_embed, n_embed),
+        )
+
+    @jaxtyped(typechecker=beartype)
+    def forward(self, x: Float[Tensor, "b t e"]) -> Float[Tensor, "b t e"]:
+        return self.net(x)  # [B, T, E]
+
+
+class Block(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.ln1 = nn.LayerNorm(n_embed)
+        self.ln2 = nn.LayerNorm(n_embed)
+        self.attn = MultiHeadAttention()
+        self.ffwd = FeedForward()
+
+    @jaxtyped(typechecker=beartype)
+    def forward(self, x: Float[Tensor, "b t e"]) -> Float[Tensor, "b t e"]:
+        x = x + self.attn(self.ln1(x))
+        x = x + self.ffwd(self.ln2(x))
+        return x  # [B, T, E]
 
 
 class GPT(nn.Module):
@@ -93,7 +125,8 @@ class GPT(nn.Module):
         super().__init__()
         self.token_embedding_table = nn.Embedding(vocab_size, n_embed)
         self.position_embedding_table = nn.Embedding(block_size, n_embed)
-        self.attn = MultiHeadAttention(4)
+        self.blocks = nn.Sequential(*[Block() for _ in range(n_layer)])
+        self.ln_f = nn.LayerNorm(n_embed)
         self.lm_head = nn.Linear(n_embed, vocab_size)
 
     @jaxtyped(typechecker=beartype)
@@ -107,7 +140,8 @@ class GPT(nn.Module):
         pos = torch.arange(T, device=idx.device)
         pos_embed = self.position_embedding_table(pos)  # [T, E]
         x = tok_embed + pos_embed  # [B, T, E]
-        x = self.attn(x)  # [B, T, E]
+        x = self.blocks(x)  # [B, T, E]
+        x = self.ln_f(x)  # [B, T, E]
         logits = self.lm_head(x)  # [B, T, V]
         loss = None
         if targets is not None:
@@ -132,6 +166,23 @@ class GPT(nn.Module):
 
 model = GPT()
 model.to(device)
+
+
+@torch.no_grad()
+def estimate_loss(eval_iters=200):
+    model.eval()
+    out = {}
+    for split in ("train", "val"):
+        losses = []
+        for _ in range(eval_iters):
+            xb, yb = get_batch(split)
+            _, loss = model(xb, yb)
+            losses.append(loss)
+        out[split] = torch.stack(losses).mean().item()
+    model.train()
+    return out
+
+
 lr = 1e-2
 opt = torch.optim.AdamW(model.parameters(), lr=lr)
 max_steps = 1000
@@ -142,7 +193,9 @@ for it in range(max_steps):
     loss.backward()
     opt.step()
     if it % 100 == 0 or it == max_steps - 1:
-        print(f"it: {it}, loss: {loss.item()}")
+        out = estimate_loss()
+        train_loss, val_loss = out["train"], out["val"]
+        print(f"step {it:>4} : train {train_loss:.3f}   val {val_loss:.3f}")
 
 start = torch.tensor([encode("\n")], device=device)
 sample = decode(model.generate(start, max_new_tokens=500)[0].tolist())
