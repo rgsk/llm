@@ -1,8 +1,12 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch import Tensor
 from typing import Literal
 from utils import repo_root
+from einops import rearrange
+from jaxtyping import Float, Int, jaxtyped
+from beartype import beartype
 
 ROOT = repo_root()
 DATA = ROOT / "data" / "input.txt"
@@ -23,11 +27,14 @@ data = torch.tensor(encode(text))
 n = int(0.9 * len(data))
 train_data, val_data = data[:n], data[n:]
 
-block_size = 8  # T
-batch_size = 32  # B
+block_size = 8  # t
+batch_size = 32  # b
 
 
-def get_batch(split: Literal["train", "val"]):
+@jaxtyped(typechecker=beartype)
+def get_batch(
+    split: Literal["train", "val"],
+) -> tuple[Int[Tensor, "b t"], Int[Tensor, "b t"]]:
     d = train_data if split == "train" else val_data
     ix = torch.randint(len(d) - block_size, (batch_size,))
     x = torch.stack([d[i : i + block_size] for i in ix])
@@ -35,7 +42,7 @@ def get_batch(split: Literal["train", "val"]):
     return x, y
 
 
-vocab_size = len(itoc)  # V
+vocab_size = len(itoc)  # v
 
 
 class BigramLM(nn.Module):
@@ -43,21 +50,30 @@ class BigramLM(nn.Module):
         super().__init__()
         self.token_embedding_table = nn.Embedding(vocab_size, vocab_size)
 
-    def forward(self, idx: torch.Tensor, targets: torch.Tensor | None = None):
-        B, T = idx.shape
-        logits = self.token_embedding_table(idx)  # (B, T, V)
+    @jaxtyped(typechecker=beartype)
+    def forward(
+        self,
+        idx: Int[Tensor, "b t"],
+        targets: Int[Tensor, "b t"] | None = None,
+    ) -> tuple[Float[Tensor, "b t v"], Float[Tensor, ""] | None]:
+        logits = self.token_embedding_table(idx)
         loss = None
         if targets is not None:
-            loss = F.cross_entropy(logits.view(B * T, -1), targets.view(B * T))
+            loss = F.cross_entropy(
+                rearrange(logits, "b t v -> (b t) v"),
+                rearrange(targets, "b t -> (b t)"),
+            )
         return logits, loss
 
     @torch.no_grad()
-    def generate(self, idx: torch.Tensor, max_new_tokens: int):
-        # idx (B, T)
+    @jaxtyped(typechecker=beartype)
+    def generate(
+        self, idx: Int[Tensor, "b t"], max_new_tokens: int
+    ) -> Int[Tensor, "b t_out"]:
         for _ in range(max_new_tokens):
             logits, _ = self(idx[:, -block_size:])
-            probs = F.softmax(logits[:, -1, :], dim=-1)  # (B, V)
-            nxt = torch.multinomial(probs, num_samples=1)  # (B, 1)
+            probs = F.softmax(logits[:, -1, :], dim=-1)  # (b, v)
+            nxt = torch.multinomial(probs, num_samples=1)  # (b, 1)
             idx = torch.cat([idx, nxt], dim=1)
         return idx
 
