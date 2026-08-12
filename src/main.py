@@ -9,7 +9,6 @@ from einops import rearrange
 from jaxtyping import Float, Int, jaxtyped
 from torch import Tensor, nn
 
-from archive.attention import CausalSelfAttention
 from utils import repo_root
 
 ROOT = repo_root()
@@ -130,19 +129,12 @@ class FeedForward(nn.Module):
         return self.net(x)  # [B, T, E]
 
 
-use_flash = False
-
-
 class Block(nn.Module):
     def __init__(self, block_size: int, n_embed: int, n_head: int, dropout: float):
         super().__init__()
         self.ln1 = nn.LayerNorm(n_embed)
         self.ln2 = nn.LayerNorm(n_embed)
-        self.attn = (
-            FlashAttention(n_embed, n_head, dropout)
-            if use_flash
-            else CausalSelfAttention(block_size, n_embed, n_head, dropout)
-        )
+        self.attn = FlashAttention(n_embed, n_head, dropout)
         self.ffwd = FeedForward(n_embed, dropout)
 
     @jaxtyped(typechecker=beartype)
