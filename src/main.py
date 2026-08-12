@@ -48,6 +48,7 @@ vocab_size = len(itoc)  # V
 n_embed = 32  # E
 n_head = 4
 n_layer = 3
+dropout = 0.2
 
 
 class Head(nn.Module):
@@ -60,6 +61,7 @@ class Head(nn.Module):
         self.query = nn.Linear(n_embed, head_size, bias=False)
         self.value = nn.Linear(n_embed, head_size, bias=False)
         self.register_buffer("tril", torch.tril(torch.ones(block_size, block_size)))
+        self.dropout = nn.Dropout(dropout)
 
     @jaxtyped(typechecker=beartype)
     def forward(self, x: Float[Tensor, "b t e"]) -> Float[Tensor, "b t hs"]:
@@ -72,6 +74,7 @@ class Head(nn.Module):
 
         scores = scores.masked_fill(self.tril[:T, :T] == 0, float("-inf"))
         w = F.softmax(scores, dim=-1)  # [B, T, T]
+        w = self.dropout(w)
         v = self.value(x)  # [B, T, hs]
         out = w @ v  # [B, T, hs]
         return out
@@ -84,11 +87,12 @@ class MultiHeadAttention(nn.Module):
         head_size = n_embed // n_head
         self.heads = nn.ModuleList([Head(head_size) for _ in range(n_head)])
         self.proj = nn.Linear(n_embed, n_embed)
+        self.dropout = nn.Dropout(dropout)
 
     @jaxtyped(typechecker=beartype)
     def forward(self, x: Float[Tensor, "b t e"]) -> Float[Tensor, "b t e"]:
         out = torch.cat([h(x) for h in self.heads], dim=-1)  # [B, T, E]
-        return self.proj(out)  # [B, T, E]
+        return self.dropout(self.proj(out))  # [B, T, E]
 
 
 class FeedForward(nn.Module):
@@ -98,6 +102,7 @@ class FeedForward(nn.Module):
             nn.Linear(n_embed, 4 * n_embed),
             nn.ReLU(),
             nn.Linear(4 * n_embed, n_embed),
+            nn.Dropout(dropout),
         )
 
     @jaxtyped(typechecker=beartype)
