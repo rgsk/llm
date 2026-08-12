@@ -50,6 +50,7 @@ class GPTConfig:
     max_steps: int = 1000
     eval_interval: int = 100
     eval_iters: int = 200
+    use_compile: bool = False
 
 
 small_cfg = GPTConfig(vocab_size=len(itoc))
@@ -65,6 +66,7 @@ scaled_cfg = GPTConfig(
     max_steps=5000,
     eval_interval=500,
     eval_iters=100,
+    use_compile=True,
 )
 bench_cfg = replace(scaled_cfg, max_steps=100, eval_interval=10**9)
 
@@ -82,50 +84,35 @@ def get_batch(
     return x.to(device), y.to(device)
 
 
-class Head(nn.Module):
+class CausalSelfAttention(nn.Module):
     tril: Tensor
 
-    def __init__(self, block_size: int, n_embed: int, head_size: int, dropout: float):
-        super().__init__()
-        self.head_size = head_size
-        self.key = nn.Linear(n_embed, head_size, bias=False)
-        self.query = nn.Linear(n_embed, head_size, bias=False)
-        self.value = nn.Linear(n_embed, head_size, bias=False)
-        self.register_buffer("tril", torch.tril(torch.ones(block_size, block_size)))
-        self.dropout = nn.Dropout(dropout)
-
-    @jaxtyped(typechecker=beartype)
-    def forward(self, x: Float[Tensor, "b t e"]) -> Float[Tensor, "b t hs"]:
-        _, T, _ = x.shape
-        q = self.query(x)  # [B, T, hs]
-        k = self.key(x)  # [B, T, hs]
-        scores = (
-            q @ rearrange(k, "b t hs -> b hs t") * self.head_size**-0.5
-        )  # [B, T, T]
-
-        scores = scores.masked_fill(self.tril[:T, :T] == 0, float("-inf"))
-        w = F.softmax(scores, dim=-1)  # [B, T, T]
-        w = self.dropout(w)
-        v = self.value(x)  # [B, T, hs]
-        out = w @ v  # [B, T, hs]
-        return out
-
-
-class MultiHeadAttention(nn.Module):
     def __init__(self, block_size: int, n_embed: int, n_head: int, dropout: float):
         super().__init__()
-        assert n_embed % n_head == 0, "n_embed must divide by n_head"
-        head_size = n_embed // n_head
-        self.heads = nn.ModuleList(
-            [Head(block_size, n_embed, head_size, dropout) for _ in range(n_head)]
-        )
+        assert n_embed % n_head == 0
+        self.n_head = n_head
+        self.head_size = n_embed // n_head
+        self.qkv = nn.Linear(n_embed, 3 * n_embed, bias=False)
         self.proj = nn.Linear(n_embed, n_embed)
-        self.dropout = nn.Dropout(dropout)
+        self.register_buffer("tril", torch.tril(torch.ones(block_size, block_size)))
+        self.attn_dropout = nn.Dropout(dropout)
+        self.resid_dropout = nn.Dropout(dropout)
 
     @jaxtyped(typechecker=beartype)
     def forward(self, x: Float[Tensor, "b t e"]) -> Float[Tensor, "b t e"]:
-        out = torch.cat([h(x) for h in self.heads], dim=-1)  # [B, T, E]
-        return self.dropout(self.proj(out))  # [B, T, E]
+        _, T, _ = x.shape
+        nh, hs = self.n_head, self.head_size
+        qkv = self.qkv(x)  # [B, T, 3E]
+        q, k, v = rearrange(
+            qkv, "b t (three nh hs) -> three b nh t hs", three=3, nh=nh
+        )  # [B, nh, T, hs]
+        scores = q @ rearrange(k, "b nh t hs -> b nh hs t") * hs**-0.5  # [B, nh, T, T]
+        scores = scores.masked_fill(self.tril[:T, :T] == 0, float("-inf"))
+        w = F.softmax(scores, dim=-1)
+        w = self.attn_dropout(w)
+        out = w @ v  # [B, nh, T, hs]
+        out = rearrange(out, "b nh t hs -> b t (nh hs)")  # [B, T, E]
+        return self.resid_dropout(self.proj(out))
 
 
 class FeedForward(nn.Module):
@@ -148,7 +135,7 @@ class Block(nn.Module):
         super().__init__()
         self.ln1 = nn.LayerNorm(n_embed)
         self.ln2 = nn.LayerNorm(n_embed)
-        self.attn = MultiHeadAttention(block_size, n_embed, n_head, dropout)
+        self.attn = CausalSelfAttention(block_size, n_embed, n_head, dropout)
         self.ffwd = FeedForward(n_embed, dropout)
 
     @jaxtyped(typechecker=beartype)
@@ -236,7 +223,7 @@ def estimate_loss(
 
 def train(model: GPT):
     cfg = model.cfg
-    fwd = torch.compile(model)
+    fwd = torch.compile(model) if cfg.use_compile else model
     opt = torch.optim.AdamW(model.parameters(), lr=cfg.lr)
     best_val = float("inf")
     WARMUP = 10
@@ -314,7 +301,7 @@ def full_val_loss(model: GPT) -> float:
 
 
 if __name__ == "__main__":
-    model = GPT(bench_cfg)
+    model = GPT(small_cfg)
     model.to(device)
     train(model)
     # generate_sample(model)
