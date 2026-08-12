@@ -1,5 +1,7 @@
 import time
 from dataclasses import asdict, dataclass, replace
+from datetime import datetime
+from pathlib import Path
 from typing import Literal
 
 import torch
@@ -51,9 +53,10 @@ class GPTConfig:
     eval_interval: int = 100
     eval_iters: int = 200
     use_compile: bool = False
+    name: str = "default"
 
 
-small_cfg = GPTConfig(vocab_size=len(itoc))
+small_cfg = GPTConfig(vocab_size=len(itoc), name="test")
 
 scaled_cfg = GPTConfig(
     vocab_size=len(itoc),
@@ -67,6 +70,7 @@ scaled_cfg = GPTConfig(
     eval_interval=500,
     eval_iters=100,
     use_compile=True,
+    name="scaled",
 )
 bench_cfg = replace(scaled_cfg, max_steps=100, eval_interval=10**9)
 
@@ -218,13 +222,14 @@ def estimate_loss(
     return out
 
 
-def train(model: GPT):
+def train(model: GPT, ckpt_path: Path):
     cfg = model.cfg
     fwd = torch.compile(model) if cfg.use_compile else model
     opt = torch.optim.AdamW(model.parameters(), lr=cfg.lr)
     best_val = float("inf")
     WARMUP = 10
     t0, dt = None, None
+
     for it in range(cfg.max_steps):
         if it == WARMUP:
             torch.cuda.synchronize()
@@ -250,7 +255,6 @@ def train(model: GPT):
             val_loss = full_val_loss(model)
             if val_loss < best_val:
                 best_val = val_loss
-                ckpt = CKPT_DIR / "gpt.pt"
                 torch.save(
                     {
                         "model": model.state_dict(),
@@ -259,7 +263,7 @@ def train(model: GPT):
                         "step": it,
                         "val_loss": val_loss,
                     },
-                    ckpt,
+                    ckpt_path,
                 )
             print(f"step {it:>4} : train {train_loss:.3f}   val {val_loss:.3f}")
     n = cfg.max_steps - WARMUP
@@ -300,12 +304,24 @@ def full_val_loss(model: GPT) -> float:
     return total / count
 
 
+def timestamp(dt=None):
+    return (dt or datetime.now()).strftime("%Y-%m-%d_%H-%M-%S")  # noqa: DTZ005
+
+
+def generate_ckpt_path(name: str):
+    if name == "default":
+        return CKPT_DIR / "default.pt"
+    return CKPT_DIR / f"{name}_{timestamp()}.pt"
+
+
 if __name__ == "__main__":
-    model = GPT(bench_cfg)
+    model = GPT(small_cfg)
     model.to(device)
-    train(model)
+    ckpt_path = generate_ckpt_path(model.cfg.name)
+    train(model, ckpt_path)
     # generate_sample(model)
-    ckpt = CKPT_DIR / "gpt.pt"
+    ckpt = ckpt_path
+    # ckpt = CKPT_DIR / "test_2026-08-12_20-59-56.pt"
     saved = torch.load(ckpt, map_location=device)
     # rebuild the exact architecture from the saved config, then load the weights
     reloaded = GPT(GPTConfig(**saved["config"])).to(device)
@@ -315,3 +331,4 @@ if __name__ == "__main__":
         f"best checkpoint model at step: {saved['step']}, "
         f"saved val_loss: {saved['val_loss']:.3f}, calculated val_loss: {loss:.3f}"
     )
+    generate_sample(reloaded)
