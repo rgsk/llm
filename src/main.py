@@ -206,11 +206,16 @@ class GPT(nn.Module):
 
 
 @torch.no_grad()
-def estimate_loss(model: GPT, iters=200):
+def estimate_loss(
+    model: GPT,
+    iters=200,
+    splits=("train", "val"),
+):
+    was_training = model.training
     model.eval()
     cfg = model.cfg
     out = {}
-    for split in ("train", "val"):
+    for split in splits:
         losses = []
         for _ in range(iters):
             xb, yb = get_batch(
@@ -221,13 +226,15 @@ def estimate_loss(model: GPT, iters=200):
             _, loss = model(xb, yb)
             losses.append(loss)
         out[split] = torch.stack(losses).mean().item()
-    model.train()
+    if was_training:
+        model.train()
     return out
 
 
 def train(model: GPT):
     cfg = model.cfg
     opt = torch.optim.AdamW(model.parameters(), lr=cfg.lr)
+    best_val = float("inf")
     for it in range(cfg.max_steps):
         xb, yb = get_batch(
             "train",
@@ -239,8 +246,22 @@ def train(model: GPT):
         loss.backward()
         opt.step()
         if it % cfg.eval_interval == 0 or it == cfg.max_steps - 1:
-            out = estimate_loss(model, cfg.eval_iters)
-            train_loss, val_loss = out["train"], out["val"]
+            out = estimate_loss(model, cfg.eval_iters, splits=("train",))
+            train_loss = out["train"]
+            val_loss = full_val_loss(model)
+            if val_loss < best_val:
+                best_val = val_loss
+                ckpt = CKPT_DIR / "gpt.pt"
+                torch.save(
+                    {
+                        "model": model.state_dict(),
+                        "opt": opt.state_dict(),
+                        "config": asdict(model.cfg),
+                        "step": it,
+                        "val_loss": val_loss,
+                    },
+                    ckpt,
+                )
             print(f"step {it:>4} : train {train_loss:.3f}   val {val_loss:.3f}")
 
 
@@ -251,21 +272,24 @@ def generate_sample(model: GPT):
 
 
 @torch.no_grad()
-def full_val_loss(model: GPT, bs=256) -> float:
+def full_val_loss(model: GPT) -> float:
+    was_training = model.training
     model.eval()
     cfg = model.cfg
+    B = cfg.batch_size
     T = cfg.block_size
     nwin = (len(val_data) - 1) // T  # how many full windows fit
     x = val_data[: nwin * T].view(nwin, T)  # [nwin, T] inputs
     y = val_data[1 : nwin * T + 1].view(nwin, T)  # targets, shifted +1
     total = count = 0
-    for i in range(0, nwin, bs):  # batch the windows through the model
-        xb, yb = x[i : i + bs].to(device), y[i : i + bs].to(device)
+    for i in range(0, nwin, B):  # batch the windows through the model
+        xb, yb = x[i : i + B].to(device), y[i : i + B].to(device)
         _, loss = model(xb, yb)
         # weight by no. of tokens so the mean is correct over uneven chunks
         total += loss.item() * yb.numel()
         count += yb.numel()
-    model.train()
+    if was_training:
+        model.train()
     return total / count
 
 
@@ -275,16 +299,12 @@ if __name__ == "__main__":
     train(model)
     # generate_sample(model)
     ckpt = CKPT_DIR / "gpt.pt"
-    torch.save(
-        {"model": model.state_dict(), "config": asdict(model.cfg)},
-        ckpt,
-    )
-    print(f"saved -> {ckpt.relative_to(ROOT)}")
-    saved = torch.load(ckpt)
+    saved = torch.load(ckpt, map_location=device)
     # rebuild the exact architecture from the saved config, then load the weights
     reloaded = GPT(GPTConfig(**saved["config"])).to(device)
     reloaded.load_state_dict(saved["model"])
-    before, after = full_val_loss(model), full_val_loss(reloaded)
+    loss = full_val_loss(reloaded)
     print(
-        f"full val loss: trained {before:.3f} vs reloaded {after:.3f} -> round-trips ✓"
+        f"best checkpoint model at step: {saved['step']}, "
+        f"saved val_loss: {saved['val_loss']:.3f}, calculated val_loss: {loss:.3f}"
     )
