@@ -236,9 +236,10 @@ def estimate_loss(
 
 def train(model: GPT):
     cfg = model.cfg
+    fwd = torch.compile(model)
     opt = torch.optim.AdamW(model.parameters(), lr=cfg.lr)
     best_val = float("inf")
-    WARMUP = 5
+    WARMUP = 10
     t0, dt = None, None
     for it in range(cfg.max_steps):
         if it == WARMUP:
@@ -250,7 +251,7 @@ def train(model: GPT):
             cfg.block_size,
         )
         with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-            _, loss = model(xb, yb)
+            _, loss = fwd(xb, yb)
         opt.zero_grad()
         loss.backward()
         opt.step()
