@@ -19,9 +19,9 @@ Two things that row tells you:
 **tf32 + bf16 = nothing extra** (194.3 → 194.6, i.e. noise). They're not additive: autocast already routes matmuls through bf16 tensor cores, so there's no fp32 matmul left for TF32 to accelerate. Keep the line anyway — `full_val_loss` and `generate` run outside autocast, and tf32 helps there.
 
 
-                        ms/step   peak mem
-    compile + CSA              80.5     2.3 GB
-    compile + flash            65.1     1.6 GB
+                              ms/step   max_memory_allocated  max_memory_reserved
+    compile + CSA              80.5     2.3 GB                2.5 GB
+    compile + flash            65.1     1.6 GB                1.8 GB
     
 
 **0.7 GB saved, ~30%.** And the arithmetic confirms where it comes from: your score tensor is `[64, 6, 256, 256]` = 25.2M elements ≈ 50 MB in bf16, and autograd retains a couple of those per layer for the backward pass. 6 layers × ~100 MB ≈ 0.6 GB — which is what disappeared.

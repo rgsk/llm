@@ -85,8 +85,6 @@ def get_batch(
 
 
 class FlashAttention(nn.Module):
-    tril: Tensor
-
     def __init__(self, n_embed: int, n_head: int, dropout: float):
         super().__init__()
         assert n_embed % n_head == 0
@@ -271,6 +269,7 @@ def train(model: GPT):
         f"{dt / n * 1000:.1f} ms/step  |  {dt / n * 5000 / 60:.1f} min per 5000 steps"
     )
     print(f"max_memory_allocated: ~{torch.cuda.max_memory_allocated() / 1e9:.1f} GB")
+    print(f"max_memory_reserved: ~{torch.cuda.max_memory_reserved() / 1e9:.1f} GB")
 
 
 def generate_sample(model: GPT):
