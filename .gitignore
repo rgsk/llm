@@ -9,6 +9,6 @@ wheels/
 # Virtual environments
 .venv
 
-
+checkpoints/
 rough.ipynb
 prac.ipynb

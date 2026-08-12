@@ -1,4 +1,4 @@
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from typing import Literal
 
 import torch
@@ -11,6 +11,8 @@ from torch import Tensor, nn
 from utils import repo_root
 
 ROOT = repo_root()
+CKPT_DIR = ROOT / "checkpoints"
+CKPT_DIR.mkdir(exist_ok=True)
 DATA = ROOT / "data" / "input.txt"
 text = DATA.read_text(encoding="utf-8")
 itoc = sorted(set(text))
@@ -18,11 +20,11 @@ ctoi = {c: i for i, c in enumerate(itoc)}
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
 
-def encode(s: str):
+def encode(s: str) -> list[int]:
     return [ctoi[c] for c in s]
 
 
-def decode(ids: list[int]):
+def decode(ids: list[int]) -> str:
     return "".join(itoc[i] for i in ids)
 
 
@@ -203,21 +205,18 @@ class GPT(nn.Module):
         return idx
 
 
-model = GPT(scaled_cfg)
-model.to(device)
-
-
 @torch.no_grad()
-def estimate_loss(iters=200):
+def estimate_loss(model: GPT, iters=200):
     model.eval()
+    cfg = model.cfg
     out = {}
     for split in ("train", "val"):
         losses = []
         for _ in range(iters):
             xb, yb = get_batch(
                 split,
-                model.cfg.batch_size,
-                model.cfg.block_size,
+                cfg.batch_size,
+                cfg.block_size,
             )
             _, loss = model(xb, yb)
             losses.append(loss)
@@ -226,7 +225,7 @@ def estimate_loss(iters=200):
     return out
 
 
-def train():
+def train(model: GPT):
     cfg = model.cfg
     opt = torch.optim.AdamW(model.parameters(), lr=cfg.lr)
     for it in range(cfg.max_steps):
@@ -240,17 +239,52 @@ def train():
         loss.backward()
         opt.step()
         if it % cfg.eval_interval == 0 or it == cfg.max_steps - 1:
-            out = estimate_loss(cfg.eval_iters)
+            out = estimate_loss(model, cfg.eval_iters)
             train_loss, val_loss = out["train"], out["val"]
             print(f"step {it:>4} : train {train_loss:.3f}   val {val_loss:.3f}")
 
 
-def generate_sample():
+def generate_sample(model: GPT):
     start = torch.tensor([encode("\n")], device=device)
     sample = decode(model.generate(start, max_new_tokens=500)[0].tolist())
     print(sample)
 
 
+@torch.no_grad()
+def full_val_loss(model: GPT, bs=256) -> float:
+    model.eval()
+    cfg = model.cfg
+    T = cfg.block_size
+    nwin = (len(val_data) - 1) // T  # how many full windows fit
+    x = val_data[: nwin * T].view(nwin, T)  # [nwin, T] inputs
+    y = val_data[1 : nwin * T + 1].view(nwin, T)  # targets, shifted +1
+    total = count = 0
+    for i in range(0, nwin, bs):  # batch the windows through the model
+        xb, yb = x[i : i + bs].to(device), y[i : i + bs].to(device)
+        _, loss = model(xb, yb)
+        # weight by no. of tokens so the mean is correct over uneven chunks
+        total += loss.item() * yb.numel()
+        count += yb.numel()
+    model.train()
+    return total / count
+
+
 if __name__ == "__main__":
-    train()
-    generate_sample()
+    model = GPT(small_cfg)
+    model.to(device)
+    train(model)
+    # generate_sample(model)
+    ckpt = CKPT_DIR / "gpt.pt"
+    torch.save(
+        {"model": model.state_dict(), "config": asdict(model.cfg)},
+        ckpt,
+    )
+    print(f"saved -> {ckpt.relative_to(ROOT)}")
+    saved = torch.load(ckpt)
+    # rebuild the exact architecture from the saved config, then load the weights
+    reloaded = GPT(GPTConfig(**saved["config"])).to(device)
+    reloaded.load_state_dict(saved["model"])
+    before, after = full_val_loss(model), full_val_loss(reloaded)
+    print(
+        f"full val loss: trained {before:.3f} vs reloaded {after:.3f} -> round-trips ✓"
+    )
