@@ -50,3 +50,34 @@ class MultiHeadAttention(nn.Module):
     def forward(self, x: Float[Tensor, "b t e"]) -> Float[Tensor, "b t e"]:
         out = torch.cat([h(x) for h in self.heads], dim=-1)  # [B, T, E]
         return self.dropout(self.proj(out))  # [B, T, E]
+
+
+class CausalSelfAttention(nn.Module):
+    tril: Tensor
+
+    def __init__(self, block_size: int, n_embed: int, n_head: int, dropout: float):
+        super().__init__()
+        assert n_embed % n_head == 0
+        self.n_head = n_head
+        self.head_size = n_embed // n_head
+        self.qkv = nn.Linear(n_embed, 3 * n_embed, bias=False)
+        self.proj = nn.Linear(n_embed, n_embed)
+        self.register_buffer("tril", torch.tril(torch.ones(block_size, block_size)))
+        self.attn_dropout = nn.Dropout(dropout)
+        self.resid_dropout = nn.Dropout(dropout)
+
+    @jaxtyped(typechecker=beartype)
+    def forward(self, x: Float[Tensor, "b t e"]) -> Float[Tensor, "b t e"]:
+        _, T, _ = x.shape
+        nh, hs = self.n_head, self.head_size
+        qkv = self.qkv(x)  # [B, T, 3E]
+        q, k, v = rearrange(
+            qkv, "b t (three nh hs) -> three b nh t hs", three=3, nh=nh
+        )  # [B, nh, T, hs]
+        scores = q @ rearrange(k, "b nh t hs -> b nh hs t") * hs**-0.5  # [B, nh, T, T]
+        scores = scores.masked_fill(self.tril[:T, :T] == 0, float("-inf"))
+        w = F.softmax(scores, dim=-1)
+        w = self.attn_dropout(w)
+        out = w @ v  # [B, nh, T, hs]
+        out = rearrange(out, "b nh t hs -> b t (nh hs)")  # [B, T, E]
+        return self.resid_dropout(self.proj(out))

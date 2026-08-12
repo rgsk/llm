@@ -9,6 +9,7 @@ from einops import rearrange
 from jaxtyping import Float, Int, jaxtyped
 from torch import Tensor, nn
 
+from archive.attention import CausalSelfAttention
 from utils import repo_root
 
 ROOT = repo_root()
@@ -84,33 +85,32 @@ def get_batch(
     return x.to(device), y.to(device)
 
 
-class CausalSelfAttention(nn.Module):
+class FlashAttention(nn.Module):
     tril: Tensor
 
-    def __init__(self, block_size: int, n_embed: int, n_head: int, dropout: float):
+    def __init__(self, n_embed: int, n_head: int, dropout: float):
         super().__init__()
         assert n_embed % n_head == 0
         self.n_head = n_head
-        self.head_size = n_embed // n_head
+        self.dropout_p = dropout
         self.qkv = nn.Linear(n_embed, 3 * n_embed, bias=False)
         self.proj = nn.Linear(n_embed, n_embed)
-        self.register_buffer("tril", torch.tril(torch.ones(block_size, block_size)))
-        self.attn_dropout = nn.Dropout(dropout)
         self.resid_dropout = nn.Dropout(dropout)
 
     @jaxtyped(typechecker=beartype)
     def forward(self, x: Float[Tensor, "b t e"]) -> Float[Tensor, "b t e"]:
-        _, T, _ = x.shape
-        nh, hs = self.n_head, self.head_size
+        nh = self.n_head
         qkv = self.qkv(x)  # [B, T, 3E]
         q, k, v = rearrange(
             qkv, "b t (three nh hs) -> three b nh t hs", three=3, nh=nh
         )  # [B, nh, T, hs]
-        scores = q @ rearrange(k, "b nh t hs -> b nh hs t") * hs**-0.5  # [B, nh, T, T]
-        scores = scores.masked_fill(self.tril[:T, :T] == 0, float("-inf"))
-        w = F.softmax(scores, dim=-1)
-        w = self.attn_dropout(w)
-        out = w @ v  # [B, nh, T, hs]
+        out = F.scaled_dot_product_attention(
+            q,
+            k,
+            v,
+            dropout_p=self.dropout_p if self.training else 0.0,
+            is_causal=True,
+        )  # [B, nh, T, hs]
         out = rearrange(out, "b nh t hs -> b t (nh hs)")  # [B, T, E]
         return self.resid_dropout(self.proj(out))
 
@@ -130,12 +130,19 @@ class FeedForward(nn.Module):
         return self.net(x)  # [B, T, E]
 
 
+use_flash = False
+
+
 class Block(nn.Module):
     def __init__(self, block_size: int, n_embed: int, n_head: int, dropout: float):
         super().__init__()
         self.ln1 = nn.LayerNorm(n_embed)
         self.ln2 = nn.LayerNorm(n_embed)
-        self.attn = CausalSelfAttention(block_size, n_embed, n_head, dropout)
+        self.attn = (
+            FlashAttention(n_embed, n_head, dropout)
+            if use_flash
+            else CausalSelfAttention(block_size, n_embed, n_head, dropout)
+        )
         self.ffwd = FeedForward(n_embed, dropout)
 
     @jaxtyped(typechecker=beartype)
@@ -232,6 +239,7 @@ def train(model: GPT):
         if it == WARMUP:
             torch.cuda.synchronize()
             t0 = time.perf_counter()
+            torch.cuda.reset_peak_memory_stats()
         xb, yb = get_batch(
             "train",
             cfg.batch_size,
@@ -270,6 +278,7 @@ def train(model: GPT):
     print(
         f"{dt / n * 1000:.1f} ms/step  |  {dt / n * 5000 / 60:.1f} min per 5000 steps"
     )
+    print(f"max_memory_allocated: ~{torch.cuda.max_memory_allocated() / 1e9:.1f} GB")
 
 
 def generate_sample(model: GPT):
@@ -301,7 +310,7 @@ def full_val_loss(model: GPT) -> float:
 
 
 if __name__ == "__main__":
-    model = GPT(small_cfg)
+    model = GPT(bench_cfg)
     model.to(device)
     train(model)
     # generate_sample(model)
