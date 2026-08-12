@@ -1,4 +1,5 @@
-from dataclasses import asdict, dataclass
+import time
+from dataclasses import asdict, dataclass, replace
 from typing import Literal
 
 import torch
@@ -18,6 +19,7 @@ text = DATA.read_text(encoding="utf-8")
 itoc = sorted(set(text))
 ctoi = {c: i for i, c in enumerate(itoc)}
 device = "cuda" if torch.cuda.is_available() else "cpu"
+torch.set_float32_matmul_precision("high")
 
 
 def encode(s: str) -> list[int]:
@@ -64,6 +66,7 @@ scaled_cfg = GPTConfig(
     eval_interval=500,
     eval_iters=100,
 )
+bench_cfg = replace(scaled_cfg, max_steps=100, eval_interval=10**9)
 
 
 @jaxtyped(typechecker=beartype)
@@ -235,16 +238,26 @@ def train(model: GPT):
     cfg = model.cfg
     opt = torch.optim.AdamW(model.parameters(), lr=cfg.lr)
     best_val = float("inf")
+    WARMUP = 5
+    t0, dt = None, None
     for it in range(cfg.max_steps):
+        if it == WARMUP:
+            torch.cuda.synchronize()
+            t0 = time.perf_counter()
         xb, yb = get_batch(
             "train",
             cfg.batch_size,
             cfg.block_size,
         )
-        _, loss = model(xb, yb)
+        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+            _, loss = model(xb, yb)
         opt.zero_grad()
         loss.backward()
         opt.step()
+        if it == cfg.max_steps - 1:
+            torch.cuda.synchronize()
+            assert t0 is not None
+            dt = time.perf_counter() - t0
         if it % cfg.eval_interval == 0 or it == cfg.max_steps - 1:
             out = estimate_loss(model, cfg.eval_iters, splits=("train",))
             train_loss = out["train"]
@@ -263,6 +276,12 @@ def train(model: GPT):
                     ckpt,
                 )
             print(f"step {it:>4} : train {train_loss:.3f}   val {val_loss:.3f}")
+    n = cfg.max_steps - WARMUP
+    assert dt is not None
+    print(f"for {n} steps time elapsed: {dt:.1f} s")
+    print(
+        f"{dt / n * 1000:.1f} ms/step  |  {dt / n * 5000 / 60:.1f} min per 5000 steps"
+    )
 
 
 def generate_sample(model: GPT):
@@ -294,7 +313,7 @@ def full_val_loss(model: GPT) -> float:
 
 
 if __name__ == "__main__":
-    model = GPT(small_cfg)
+    model = GPT(bench_cfg)
     model.to(device)
     train(model)
     # generate_sample(model)
