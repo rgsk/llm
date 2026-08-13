@@ -85,7 +85,7 @@ class GPTConfig:
     warmup_steps: int  # (2% of max_steps)
     eval_interval: int
     eval_iters: int
-    use_compile: bool
+    use_compile: bool  # needs JAXTYPING_DISABLE=1
     name: str
 
 
@@ -365,7 +365,9 @@ def train(model: GPT, ckpt_path: Path):
 
 def generate_sample(model: GPT):
     start = torch.tensor([tok.encode("\n")], device=device)
-    sample = tok.decode(model.generate(start, max_new_tokens=500)[0].tolist())
+    sample = tok.decode(
+        model.generate(start, max_new_tokens=100 if use_bpe else 500)[0].tolist()
+    )
     print(sample)
 
 
@@ -402,13 +404,13 @@ def generate_ckpt_path(name: str):
 
 
 if __name__ == "__main__":
-    model = GPT(scaled_cfg)
-    model.to(device)
-    ckpt_path = generate_ckpt_path(model.cfg.name)
-    train(model, ckpt_path)
-    # generate_sample(model)
-    ckpt = ckpt_path
-    # ckpt = CKPT_DIR / "scaled_2026-08-12_21-04-07.pt"
+    # model = GPT(scaled_cfg)
+    # model.to(device)
+    # ckpt_path = generate_ckpt_path(model.cfg.name)
+    # train(model, ckpt_path)
+    # # generate_sample(model)
+    # ckpt = ckpt_path
+    ckpt = CKPT_DIR / "scaled_2026-08-13_16-51-07.pt"
     saved = torch.load(ckpt, map_location=device)
     # rebuild the exact architecture from the saved config, then load the weights
     reloaded = GPT(GPTConfig(**saved["config"])).to(device)
