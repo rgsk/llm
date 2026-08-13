@@ -1,3 +1,4 @@
+import math
 import time
 from dataclasses import asdict, dataclass, replace
 from datetime import datetime
@@ -11,21 +12,58 @@ from einops import rearrange
 from jaxtyping import Float, Int, jaxtyped
 from torch import Tensor, nn
 
-from tokenizer import CharTokenizer
+from tokenizer import BPETokenizer, CharTokenizer
 from utils import repo_root
 
 ROOT = repo_root()
-CKPT_DIR = ROOT / "checkpoints"
-CKPT_DIR.mkdir(exist_ok=True)
+CKPT_DIR = ROOT / "artifacts" / "checkpoints"
+CKPT_DIR.mkdir(parents=True, exist_ok=True)
 DATA = ROOT / "data" / "input.txt"
 text = DATA.read_text(encoding="utf-8")
 device = "cuda" if torch.cuda.is_available() else "cpu"
 torch.set_float32_matmul_precision("high")
 
+use_bpe = False
 
-tok = CharTokenizer(text)
+BPE_VOCAB = 4096
 
-data = torch.tensor(tok.encode(text))
+
+def load_or_build_bpe(text: str, vocab_size: int):
+    dir = ROOT / "artifacts" / "tokenizer"
+    dir.mkdir(parents=True, exist_ok=True)
+    path = dir / f"bpe_{vocab_size}.json"
+    if path.exists():
+        return BPETokenizer.load(str(path))
+    t = BPETokenizer()
+    t.train(text, vocab_size)
+    t.save(str(path))
+    return t
+
+
+def get_tokenizer():
+    if use_bpe:
+        return load_or_build_bpe(text, BPE_VOCAB)
+    return CharTokenizer(text)
+
+
+tok = get_tokenizer()
+
+
+def load_or_encode_tokens():
+    if not use_bpe:
+        return torch.tensor(tok.encode(text))  # ~0.1s, not worth caching
+    dir = ROOT / "artifacts" / "tokenizer"
+    dir.mkdir(parents=True, exist_ok=True)
+    path = dir / f"tokens_bpe_{tok.vocab_size}.pt"
+    if path.exists():
+        return torch.load(path)
+    ids = torch.tensor(tok.encode(text))
+    torch.save(ids, path)
+    return ids
+
+
+data = load_or_encode_tokens()
+chars_per_token = len(text) / len(data)
 n = int(0.9 * len(data))
 train_data, val_data = data[:n], data[n:]
 
@@ -246,6 +284,8 @@ def train(model: GPT, ckpt_path: Path):
             out = estimate_loss(model, cfg.eval_iters, splits=("train",))
             train_loss = out["train"]
             val_loss = full_val_loss(model)
+            # bits per char
+            bpc = val_loss / math.log(2) / chars_per_token
             if val_loss < best_val:
                 best_val = val_loss
                 torch.save(
@@ -255,10 +295,14 @@ def train(model: GPT, ckpt_path: Path):
                         "config": asdict(model.cfg),
                         "step": it,
                         "val_loss": val_loss,
+                        "bpc": bpc,
                     },
                     ckpt_path,
                 )
-            print(f"step {it:>4} : train {train_loss:.3f}   val {val_loss:.3f}")
+            print(
+                f"step {it:>4} : train {train_loss:.3f}   val {val_loss:.3f}   bpc {bpc:.3f}"
+            )
+
     n = cfg.max_steps - WARMUP
     assert dt is not None
     print(f"for {n} steps time elapsed: {dt:.1f} s")
@@ -322,6 +366,7 @@ if __name__ == "__main__":
     loss = full_val_loss(reloaded)
     print(
         f"best checkpoint model at step: {saved['step']}, "
-        f"saved val_loss: {saved['val_loss']:.3f}, calculated val_loss: {loss:.3f}"
+        f"saved val_loss: {saved['val_loss']:.3f}, calculated val_loss: {loss:.3f}, "
+        f"saved bpc: {saved['bpc']:.3f}"
     )
-    generate_sample(reloaded)
+    # generate_sample(reloaded)

@@ -9,6 +9,6 @@ wheels/
 # Virtual environments
 .venv
 
-checkpoints/
+artifacts/
 rough.ipynb
 prac.ipynb
