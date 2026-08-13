@@ -11,6 +11,7 @@ from einops import rearrange
 from jaxtyping import Float, Int, jaxtyped
 from torch import Tensor, nn
 
+from tokenizer import CharTokenizer
 from utils import repo_root
 
 ROOT = repo_root()
@@ -18,21 +19,13 @@ CKPT_DIR = ROOT / "checkpoints"
 CKPT_DIR.mkdir(exist_ok=True)
 DATA = ROOT / "data" / "input.txt"
 text = DATA.read_text(encoding="utf-8")
-itoc = sorted(set(text))
-ctoi = {c: i for i, c in enumerate(itoc)}
 device = "cuda" if torch.cuda.is_available() else "cpu"
 torch.set_float32_matmul_precision("high")
 
 
-def encode(s: str) -> list[int]:
-    return [ctoi[c] for c in s]
+tok = CharTokenizer(text)
 
-
-def decode(ids: list[int]) -> str:
-    return "".join(itoc[i] for i in ids)
-
-
-data = torch.tensor(encode(text))
+data = torch.tensor(tok.encode(text))
 n = int(0.9 * len(data))
 train_data, val_data = data[:n], data[n:]
 
@@ -56,10 +49,10 @@ class GPTConfig:
     name: str = "scratch"
 
 
-small_cfg = GPTConfig(vocab_size=len(itoc))
+small_cfg = GPTConfig(vocab_size=tok.vocab_size)
 
 scaled_cfg = GPTConfig(
-    vocab_size=len(itoc),
+    vocab_size=tok.vocab_size,
     n_embed=384,
     n_head=6,
     n_layer=6,
@@ -277,8 +270,8 @@ def train(model: GPT, ckpt_path: Path):
 
 
 def generate_sample(model: GPT):
-    start = torch.tensor([encode("\n")], device=device)
-    sample = decode(model.generate(start, max_new_tokens=500)[0].tolist())
+    start = torch.tensor([tok.encode("\n")], device=device)
+    sample = tok.decode(model.generate(start, max_new_tokens=500)[0].tolist())
     print(sample)
 
 
