@@ -23,7 +23,7 @@ text = DATA.read_text(encoding="utf-8")
 device = "cuda" if torch.cuda.is_available() else "cpu"
 torch.set_float32_matmul_precision("high")
 
-use_bpe = False
+use_bpe = True
 
 BPE_VOCAB = 4096
 
@@ -71,23 +71,41 @@ train_data, val_data = data[:n], data[n:]
 @dataclass(frozen=True, kw_only=True)
 class GPTConfig:
     # model
-    n_embed: int = 32  # E
-    n_head: int = 4  # nh
-    n_layer: int = 3
-    block_size: int = 8  # T
-    dropout: float = 0.2
+    n_embed: int  # E
+    n_head: int  # nh
+    n_layer: int
+    block_size: int  # T
+    dropout: float
     vocab_size: int  # V
     # training
-    batch_size: int = 32  # B
-    lr: float = 1e-2
-    max_steps: int = 1000
-    eval_interval: int = 100
-    eval_iters: int = 200
-    use_compile: bool = False
-    name: str = "scratch"
+    batch_size: int  # B
+    max_steps: int
+    lr: float
+    min_lr: float  # lr / 10
+    warmup_steps: int  # (2% of max_steps)
+    eval_interval: int
+    eval_iters: int
+    use_compile: bool
+    name: str
 
 
-small_cfg = GPTConfig(vocab_size=tok.vocab_size)
+small_cfg = GPTConfig(
+    vocab_size=tok.vocab_size,
+    n_embed=32,
+    n_head=4,
+    n_layer=3,
+    block_size=8,
+    batch_size=32,
+    dropout=0.2,
+    lr=1e-2,
+    min_lr=1e-3,
+    max_steps=1000,
+    warmup_steps=20,
+    eval_interval=100,
+    eval_iters=100,
+    use_compile=False,
+    name="scratch",
+)
 
 scaled_cfg = GPTConfig(
     vocab_size=tok.vocab_size,
@@ -96,14 +114,22 @@ scaled_cfg = GPTConfig(
     n_layer=6,
     block_size=512,
     batch_size=64,
+    dropout=0.2,
     lr=3e-4,
+    min_lr=3e-5,
     max_steps=5000,
+    warmup_steps=100,
     eval_interval=500,
     eval_iters=100,
     use_compile=True,
     name="scaled",
 )
-bench_cfg = replace(scaled_cfg, max_steps=100, eval_interval=10**9)
+bench_cfg = replace(
+    scaled_cfg,
+    max_steps=100,
+    warmup_steps=2,
+    eval_interval=10**9,
+)
 
 
 @jaxtyped(typechecker=beartype)
@@ -253,16 +279,31 @@ def estimate_loss(
     return out
 
 
+def get_lr(
+    step: int, *, warmup_steps: int, max_steps: int, max_lr: float, min_lr: float
+) -> float:
+    """Learning rate at `step`: linear warmup to max_lr, then cosine decay to min_lr."""
+    if step < warmup_steps:
+        return max_lr * (step + 1) / warmup_steps
+
+    if step > max_steps:
+        return min_lr
+
+    decay_ratio = (step - warmup_steps) / (max_steps - warmup_steps)
+    coeff = 0.5 * (1 + math.cos(math.pi * decay_ratio))
+    return min_lr + coeff * (max_lr - min_lr)
+
+
 def train(model: GPT, ckpt_path: Path):
     cfg = model.cfg
     fwd = torch.compile(model) if cfg.use_compile else model
     opt = torch.optim.AdamW(model.parameters(), lr=cfg.lr)
     best_val = float("inf")
-    WARMUP = 10
+    TIMING_WARMUP = 10
     t0, dt = None, None
 
     for it in range(cfg.max_steps):
-        if it == WARMUP:
+        if it == TIMING_WARMUP:
             torch.cuda.synchronize()
             t0 = time.perf_counter()
             torch.cuda.reset_peak_memory_stats()
@@ -275,6 +316,15 @@ def train(model: GPT, ckpt_path: Path):
             _, loss = fwd(xb, yb)
         opt.zero_grad()
         loss.backward()
+        lr = get_lr(
+            it,
+            warmup_steps=cfg.warmup_steps,
+            max_steps=cfg.max_steps,
+            max_lr=cfg.lr,
+            min_lr=cfg.min_lr,
+        )
+        for g in opt.param_groups:
+            g["lr"] = lr
         opt.step()
         if it == cfg.max_steps - 1:
             torch.cuda.synchronize()
@@ -303,7 +353,7 @@ def train(model: GPT, ckpt_path: Path):
                 f"step {it:>4} : train {train_loss:.3f}   val {val_loss:.3f}   bpc {bpc:.3f}"
             )
 
-    n = cfg.max_steps - WARMUP
+    n = cfg.max_steps - TIMING_WARMUP
     assert dt is not None
     print(f"for {n} steps time elapsed: {dt:.1f} s")
     print(
@@ -352,7 +402,7 @@ def generate_ckpt_path(name: str):
 
 
 if __name__ == "__main__":
-    model = GPT(small_cfg)
+    model = GPT(scaled_cfg)
     model.to(device)
     ckpt_path = generate_ckpt_path(model.cfg.name)
     train(model, ckpt_path)
@@ -369,4 +419,4 @@ if __name__ == "__main__":
         f"saved val_loss: {saved['val_loss']:.3f}, calculated val_loss: {loss:.3f}, "
         f"saved bpc: {saved['bpc']:.3f}"
     )
-    # generate_sample(reloaded)
+    generate_sample(reloaded)
