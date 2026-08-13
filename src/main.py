@@ -53,17 +53,17 @@ class GPTConfig:
     eval_interval: int = 100
     eval_iters: int = 200
     use_compile: bool = False
-    name: str = "default"
+    name: str = "scratch"
 
 
-small_cfg = GPTConfig(vocab_size=len(itoc), name="test")
+small_cfg = GPTConfig(vocab_size=len(itoc))
 
 scaled_cfg = GPTConfig(
     vocab_size=len(itoc),
     n_embed=384,
     n_head=6,
     n_layer=6,
-    block_size=256,
+    block_size=512,
     batch_size=64,
     lr=3e-4,
     max_steps=5000,
@@ -304,13 +304,13 @@ def full_val_loss(model: GPT) -> float:
     return total / count
 
 
-def timestamp(dt=None):
-    return (dt or datetime.now()).strftime("%Y-%m-%d_%H-%M-%S")  # noqa: DTZ005
+def timestamp():
+    return datetime.now().strftime("%Y-%m-%d_%H-%M-%S")  # noqa: DTZ005
 
 
 def generate_ckpt_path(name: str):
-    if name == "default":
-        return CKPT_DIR / "default.pt"
+    if name == "scratch":
+        return CKPT_DIR / "scratch.pt"
     return CKPT_DIR / f"{name}_{timestamp()}.pt"
 
 
@@ -321,7 +321,7 @@ if __name__ == "__main__":
     train(model, ckpt_path)
     # generate_sample(model)
     ckpt = ckpt_path
-    # ckpt = CKPT_DIR / "test_2026-08-12_20-59-56.pt"
+    # ckpt = CKPT_DIR / "scaled_2026-08-12_21-04-07.pt"
     saved = torch.load(ckpt, map_location=device)
     # rebuild the exact architecture from the saved config, then load the weights
     reloaded = GPT(GPTConfig(**saved["config"])).to(device)
