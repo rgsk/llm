@@ -223,12 +223,45 @@ class GPT(nn.Module):
     @torch.no_grad()
     @jaxtyped(typechecker=beartype)
     def generate(
-        self, idx: Int[Tensor, "b t"], max_new_tokens: int
+        self,
+        idx: Int[Tensor, "b t"],
+        max_new_tokens: int,
+        temperature: float = 1.0,  # 1.0 no-op | 0.0 greedy | 0.8 recommended
+        top_k: int | None = None,  # None no-op | 1 greedy   | prefer top_p
+        top_p: float | None = None,  # 1.0 no-op | 0.0 greedy  | 0.95 recommended
+        # alternative to top_p
+        min_p: float | None = None,  # 0.0 no-op | 1.0 greedy  | 0.05-0.1 recommended
     ) -> Int[Tensor, "b t_out"]:
+        assert temperature >= 0.0
+        assert top_k is None or top_k > 0
+        assert top_p is None or 0.0 <= top_p <= 1.0
+        assert min_p is None or 0.0 <= min_p <= 1.0
         for _ in range(max_new_tokens):
             logits, _ = self(idx[:, -self.cfg.block_size :])
-            probs = F.softmax(logits[:, -1, :], dim=-1)  # [B, V]
-            nxt = torch.multinomial(probs, num_samples=1)  # [B, 1]
+            logits = logits[:, -1, :]  # [B, V]
+            if temperature == 0.0:
+                nxt = logits.argmax(dim=-1, keepdim=True)  # [B, 1]
+            else:
+                logits = logits / temperature
+                if top_k is not None:
+                    k = min(top_k, logits.shape[-1])
+                    v, _ = torch.topk(logits, k, dim=-1)  # [B, k]
+                    logits = logits.masked_fill(logits < v[:, [-1]], float("-inf"))
+                probs = F.softmax(logits, dim=-1)  # [B, V]
+                if top_p is not None:
+                    sorted_probs, sorted_idx = probs.sort(descending=True, dim=-1)
+                    cumprobs = sorted_probs.cumsum(dim=-1)
+                    sorted_remove = (cumprobs - sorted_probs) > top_p
+                    remove = torch.zeros_like(sorted_remove).scatter(
+                        -1, sorted_idx, sorted_remove
+                    )
+                    probs = probs.masked_fill(remove, 0.0)
+                    probs = probs / probs.sum(dim=-1, keepdim=True)
+                if min_p is not None:
+                    keep = probs >= min_p * probs.max(dim=-1, keepdim=True).values
+                    probs = probs.masked_fill(~keep, 0.0)
+                    probs = probs / probs.sum(dim=-1, keepdim=True)
+                nxt = torch.multinomial(probs, num_samples=1)  # [B, 1]
             idx = torch.cat([idx, nxt], dim=1)
         return idx
 
@@ -394,7 +427,7 @@ def set_seed(seed: int):
 
 
 if __name__ == "__main__":
-    cfg = big_cfg
+    cfg = small_cfg
     set_seed(cfg.seed)
     model = GPT(cfg)
     num_params = sum(p.numel() for p in model.parameters())
@@ -404,7 +437,7 @@ if __name__ == "__main__":
     train(model, ckpt_path)
     # generate_sample(model)
     ckpt = ckpt_path
-    # ckpt = CKPT_DIR / "scaled_2026-08-13_16-51-07.pt"
+    # ckpt = CKPT_DIR / "big_2026-08-14_23-54-11.pt"
     saved = torch.load(ckpt, map_location=device)
     # rebuild the exact architecture from the saved config, then load the weights
     reloaded = GPT(GPTConfig(**saved["config"])).to(device)
