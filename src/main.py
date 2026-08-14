@@ -99,6 +99,16 @@ bench_cfg = replace(
     warmup_steps=2,
     eval_interval=10**9,
 )
+big_cfg = replace(
+    scaled_cfg,
+    n_embed=512,
+    n_head=8,
+    n_layer=8,
+    dropout=0.0,
+    batch_size=32,
+    grad_accum_steps=2,
+    name="big",
+)
 
 
 @jaxtyped(typechecker=beartype)
@@ -384,9 +394,11 @@ def set_seed(seed: int):
 
 
 if __name__ == "__main__":
-    cfg = small_cfg
+    cfg = big_cfg
     set_seed(cfg.seed)
     model = GPT(cfg)
+    num_params = sum(p.numel() for p in model.parameters())
+    print(f"{num_params / 1e6:.1f}M params")
     model.to(device)
     ckpt_path = generate_ckpt_path(model.cfg.name)
     train(model, ckpt_path)
