@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import json
+from collections import Counter
+
+import regex
 
 
 class CharTokenizer:
@@ -14,6 +17,15 @@ class CharTokenizer:
 
     def decode(self, ids: list[int]) -> str:
         return "".join(self.itoc[i] for i in ids)
+
+
+PAT = regex.compile(
+    r"'(?i:[sdmt]|ll|ve|re)|[^\r\n\p{L}\p{N}]?+\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]++[\r\n]*|\s*[\r\n]|\s+(?!\S)|\s+"
+)
+
+
+def split_chunks(text: str) -> list[str]:
+    return PAT.findall(text)
 
 
 def get_stats(ids: list[int]) -> dict[tuple[int, int], int]:
@@ -42,12 +54,22 @@ def merge(ids: list[int], pair: tuple[int, int], idx: int) -> list[int]:
     return new_ids
 
 
+def get_stats_weighted(corpus) -> dict[tuple[int, int], int]:
+    counts = {}
+    for ids, n in corpus:
+        for i in range(len(ids) - 1):
+            pair = (ids[i], ids[i + 1])
+            counts[pair] = counts.get(pair, 0) + n
+    return counts
+
+
 class BPETokenizer:
     def __init__(self):
         # learned during train(); merges records the ORDER pairs were merged in.
         self.merges: dict[tuple[int, int], int] = {}  # (a, b) -> new_id
         self.vocab: dict[int, bytes] = {}  # id -> the bytes it expands to
         self.vocab_size = 0
+        self._cache: dict[str, list[int]] = {}
 
     def train(self, text: str, vocab_size: int) -> None:
         """Learn (vocab_size - 256) merges: greedily merge the most frequent pair, repeat.
@@ -57,16 +79,20 @@ class BPETokenizer:
         after the earlier one it builds on (e.g. t+h->th before th+e->the).
         """
         assert vocab_size >= 256, "vocab_size must be at least 256 (the byte base)"
-        self.merges = {}
-        ids = list(text.encode("utf-8"))  # 0..255
+        self.merges.clear()
+        self._cache.clear()
+
         num_merges = vocab_size - 256
+        counts = Counter(split_chunks(text))
+        corpus = [(list(ch.encode("utf-8")), n) for ch, n in counts.items()]
+
         for i in range(num_merges):
-            stats = get_stats(ids)
+            stats = get_stats_weighted(corpus)
             if not stats:
                 break  # nothing left to merge
             pair = max(stats, key=stats.get)  # type: ignore
             idx = 256 + i
-            ids = merge(ids, pair, idx)
+            corpus = [(merge(c, pair, idx), n) for c, n in corpus]
             self.merges[pair] = idx
 
         # id -> bytes, so decode can expand. Built in learned order so each
@@ -76,14 +102,8 @@ class BPETokenizer:
             self.vocab[idx] = self.vocab[pair[0]] + self.vocab[pair[1]]
         self.vocab_size = len(self.vocab)
 
-    def encode(self, s: str) -> list[int]:
-        """str -> list[int], replaying merges in LEARNED order (not by frequency).
-
-        Each pass merges the pair with the lowest merge index = learned earliest;
-        the inf default makes never-learned pairs sort last so they're never picked.
-        (len >= 2 guarantees stats is non-empty, so min() is safe.)
-        """
-        ids = list(s.encode("utf-8"))
+    def _encode_chunk(self, chunk: str) -> list[int]:
+        ids = list(chunk.encode("utf-8"))
         while len(ids) >= 2:
             stats = get_stats(ids)
             pair = min(stats, key=lambda p: self.merges.get(p, float("inf")))
@@ -91,6 +111,20 @@ class BPETokenizer:
                 break  # no remaining pair is mergeable
             ids = merge(ids, pair, self.merges[pair])
         return ids
+
+    def encode(self, s: str) -> list[int]:
+        """str -> list[int], replaying merges in LEARNED order (not by frequency).
+
+        Each pass merges the pair with the lowest merge index = learned earliest;
+        the inf default makes never-learned pairs sort last so they're never picked.
+        (len >= 2 guarantees stats is non-empty, so min() is safe.)
+        """
+        out = []
+        for chunk in split_chunks(s):
+            if chunk not in self._cache:
+                self._cache[chunk] = self._encode_chunk(chunk)
+            out.extend(self._cache[chunk])
+        return out
 
     def decode(self, ids: list[int]) -> str:
         # errors="replace": ids can form invalid UTF-8 mid-character

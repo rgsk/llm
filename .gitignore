@@ -10,5 +10,6 @@ wheels/
 .venv
 
 artifacts/
+data/tinystories_*.txt
 rough.ipynb
 prac.ipynb

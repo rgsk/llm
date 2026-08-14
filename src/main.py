@@ -1,3 +1,4 @@
+import json
 import math
 import time
 from dataclasses import asdict, dataclass, replace
@@ -5,6 +6,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Literal
 
+import numpy as np
 import torch
 import torch.nn.functional as F
 from beartype import beartype
@@ -12,60 +14,20 @@ from einops import rearrange
 from jaxtyping import Float, Int, jaxtyped
 from torch import Tensor, nn
 
-from tokenizer import BPETokenizer, CharTokenizer
+from tokenizer import BPETokenizer
 from utils import repo_root
 
 ROOT = repo_root()
 CKPT_DIR = ROOT / "artifacts" / "checkpoints"
 CKPT_DIR.mkdir(parents=True, exist_ok=True)
-DATA = ROOT / "data" / "input.txt"
-text = DATA.read_text(encoding="utf-8")
 device = "cuda" if torch.cuda.is_available() else "cpu"
 torch.set_float32_matmul_precision("high")
 
-use_bpe = True
 
-BPE_VOCAB = 4096
-
-
-def load_or_build_bpe(text: str, vocab_size: int):
-    dir = ROOT / "artifacts" / "tokenizer"
-    dir.mkdir(parents=True, exist_ok=True)
-    path = dir / f"bpe_{vocab_size}.json"
-    if path.exists():
-        return BPETokenizer.load(str(path))
-    t = BPETokenizer()
-    t.train(text, vocab_size)
-    t.save(str(path))
-    return t
-
-
-def get_tokenizer():
-    if use_bpe:
-        return load_or_build_bpe(text, BPE_VOCAB)
-    return CharTokenizer(text)
-
-
-tok = get_tokenizer()
-
-
-def load_or_encode_tokens():
-    if not use_bpe:
-        return torch.tensor(tok.encode(text))  # ~0.1s, not worth caching
-    dir = ROOT / "artifacts" / "tokenizer"
-    dir.mkdir(parents=True, exist_ok=True)
-    path = dir / f"tokens_bpe_{tok.vocab_size}.pt"
-    if path.exists():
-        return torch.load(path)
-    ids = torch.tensor(tok.encode(text))
-    torch.save(ids, path)
-    return ids
-
-
-data = load_or_encode_tokens()
-chars_per_token = len(text) / len(data)
-n = int(0.9 * len(data))
-train_data, val_data = data[:n], data[n:]
+BIN_DIR = ROOT / "artifacts" / "data" / "tinystories"
+meta = json.loads((BIN_DIR / "meta.json").read_text())
+chars_per_token = meta["val"]["chars_per_token"]
+tok = BPETokenizer.load(str(ROOT / "artifacts" / "tokenizer" / "bpe_ts_4096.json"))
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -96,7 +58,7 @@ small_cfg = GPTConfig(
     n_layer=3,
     block_size=8,
     batch_size=32,
-    dropout=0.2,
+    dropout=0.0,
     lr=1e-2,
     min_lr=1e-3,
     max_steps=1000,
@@ -114,7 +76,7 @@ scaled_cfg = GPTConfig(
     n_layer=6,
     block_size=512,
     batch_size=64,
-    dropout=0.2,
+    dropout=0.0,
     lr=3e-4,
     min_lr=3e-5,
     max_steps=5000,
@@ -138,11 +100,11 @@ def get_batch(
     batch_size: int,
     block_size: int,
 ) -> tuple[Int[Tensor, "b t"], Int[Tensor, "b t"]]:
-    d = train_data if split == "train" else val_data
-    ix = torch.randint(len(d) - block_size, (batch_size,))
-    x = torch.stack([d[i : i + block_size] for i in ix])
-    y = torch.stack([d[i + 1 : i + 1 + block_size] for i in ix])
-    return x.to(device), y.to(device)
+    d = np.memmap(BIN_DIR / f"{split}.bin", dtype=np.uint16, mode="r")
+    ix = np.random.randint(len(d) - block_size, size=batch_size)
+    x = np.stack([d[i : i + block_size] for i in ix]).astype(np.int64)
+    y = np.stack([d[i + 1 : i + 1 + block_size] for i in ix]).astype(np.int64)
+    return torch.from_numpy(x).to(device), torch.from_numpy(y).to(device)
 
 
 class FlashAttention(nn.Module):
@@ -365,9 +327,7 @@ def train(model: GPT, ckpt_path: Path):
 
 def generate_sample(model: GPT):
     start = torch.tensor([tok.encode("\n")], device=device)
-    sample = tok.decode(
-        model.generate(start, max_new_tokens=100 if use_bpe else 500)[0].tolist()
-    )
+    sample = tok.decode(model.generate(start, max_new_tokens=100)[0].tolist())
     print(sample)
 
 
@@ -378,9 +338,14 @@ def full_val_loss(model: GPT) -> float:
     cfg = model.cfg
     B = cfg.batch_size
     T = cfg.block_size
-    nwin = (len(val_data) - 1) // T  # how many full windows fit
-    x = val_data[: nwin * T].view(nwin, T)  # [nwin, T] inputs
-    y = val_data[1 : nwin * T + 1].view(nwin, T)  # targets, shifted +1
+    d = np.memmap(BIN_DIR / "val.bin", dtype=np.uint16, mode="r")
+    nwin = (len(d) - 1) // T  # how many full windows fit
+    x = torch.from_numpy(d[: nwin * T].astype(np.int64)).view(
+        nwin, T
+    )  # [nwin, T] inputs
+    y = torch.from_numpy(d[1 : nwin * T + 1].astype(np.int64)).view(
+        nwin, T
+    )  # targets, shifted +1
     total = count = 0
     for i in range(0, nwin, B):  # batch the windows through the model
         xb, yb = x[i : i + B].to(device), y[i : i + B].to(device)
@@ -404,13 +369,13 @@ def generate_ckpt_path(name: str):
 
 
 if __name__ == "__main__":
-    # model = GPT(scaled_cfg)
-    # model.to(device)
-    # ckpt_path = generate_ckpt_path(model.cfg.name)
-    # train(model, ckpt_path)
-    # # generate_sample(model)
-    # ckpt = ckpt_path
-    ckpt = CKPT_DIR / "scaled_2026-08-13_16-51-07.pt"
+    model = GPT(scaled_cfg)
+    model.to(device)
+    ckpt_path = generate_ckpt_path(model.cfg.name)
+    train(model, ckpt_path)
+    # generate_sample(model)
+    ckpt = ckpt_path
+    # ckpt = CKPT_DIR / "scaled_2026-08-13_16-51-07.pt"
     saved = torch.load(ckpt, map_location=device)
     # rebuild the exact architecture from the saved config, then load the weights
     reloaded = GPT(GPTConfig(**saved["config"])).to(device)
