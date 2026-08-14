@@ -29,6 +29,9 @@ meta = json.loads((BIN_DIR / "meta.json").read_text())
 chars_per_token = meta["val"]["chars_per_token"]
 tok = BPETokenizer.load(str(ROOT / "artifacts" / "tokenizer" / "bpe_ts_4096.json"))
 
+train_rng = np.random.default_rng(1337)
+eval_rng = np.random.default_rng(1337)
+
 
 @dataclass(frozen=True, kw_only=True)
 class GPTConfig:
@@ -49,6 +52,8 @@ class GPTConfig:
     eval_iters: int
     use_compile: bool  # needs JAXTYPING_DISABLE=1
     name: str
+    grad_accum_steps: int
+    seed: int = 1337
 
 
 small_cfg = GPTConfig(
@@ -67,6 +72,7 @@ small_cfg = GPTConfig(
     eval_iters=100,
     use_compile=False,
     name="scratch",
+    grad_accum_steps=1,
 )
 
 scaled_cfg = GPTConfig(
@@ -85,6 +91,7 @@ scaled_cfg = GPTConfig(
     eval_iters=100,
     use_compile=True,
     name="scaled",
+    grad_accum_steps=1,
 )
 bench_cfg = replace(
     scaled_cfg,
@@ -99,9 +106,10 @@ def get_batch(
     split: Literal["train", "val"],
     batch_size: int,
     block_size: int,
+    rng: np.random.Generator,
 ) -> tuple[Int[Tensor, "b t"], Int[Tensor, "b t"]]:
     d = np.memmap(BIN_DIR / f"{split}.bin", dtype=np.uint16, mode="r")
-    ix = np.random.randint(len(d) - block_size, size=batch_size)
+    ix = rng.integers(len(d) - block_size, size=batch_size)
     x = np.stack([d[i : i + block_size] for i in ix]).astype(np.int64)
     y = np.stack([d[i + 1 : i + 1 + block_size] for i in ix]).astype(np.int64)
     return torch.from_numpy(x).to(device), torch.from_numpy(y).to(device)
@@ -232,6 +240,7 @@ def estimate_loss(
                 split,
                 cfg.batch_size,
                 cfg.block_size,
+                eval_rng,
             )
             _, loss = model(xb, yb)
             losses.append(loss)
@@ -269,15 +278,13 @@ def train(model: GPT, ckpt_path: Path):
             torch.cuda.synchronize()
             t0 = time.perf_counter()
             torch.cuda.reset_peak_memory_stats()
-        xb, yb = get_batch(
-            "train",
-            cfg.batch_size,
-            cfg.block_size,
-        )
-        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-            _, loss = fwd(xb, yb)
         opt.zero_grad()
-        loss.backward()
+        for _ in range(cfg.grad_accum_steps):
+            xb, yb = get_batch("train", cfg.batch_size, cfg.block_size, train_rng)
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                _, loss = fwd(xb, yb)
+            loss = loss / cfg.grad_accum_steps
+            loss.backward()
         lr = get_lr(
             it,
             warmup_steps=cfg.warmup_steps,
@@ -368,8 +375,18 @@ def generate_ckpt_path(name: str):
     return CKPT_DIR / f"{name}_{timestamp()}.pt"
 
 
+def set_seed(seed: int):
+    global train_rng, eval_rng
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    train_rng = np.random.default_rng(seed)
+    eval_rng = np.random.default_rng(seed + 1)
+
+
 if __name__ == "__main__":
-    model = GPT(scaled_cfg)
+    cfg = small_cfg
+    set_seed(cfg.seed)
+    model = GPT(cfg)
     model.to(device)
     ckpt_path = generate_ckpt_path(model.cfg.name)
     train(model, ckpt_path)
