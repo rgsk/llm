@@ -143,6 +143,10 @@ type KVCacheIn = tuple[Float[Tensor, "b nh t_past hs"], Float[Tensor, "b nh t_pa
 type KVCacheOut = tuple[Float[Tensor, "b nh t_kv hs"], Float[Tensor, "b nh t_kv hs"]]
 
 
+class ResidualProj(nn.Linear):
+    """Linear whose output is added to the residual stream; gets 1/√(2·n_layer) init."""
+
+
 class CausalSelfAttention(nn.Module):
     tril: Tensor
 
@@ -152,7 +156,7 @@ class CausalSelfAttention(nn.Module):
         self.n_head = n_head
         self.head_size = n_embed // n_head
         self.qkv = nn.Linear(n_embed, 3 * n_embed, bias=False)
-        self.proj = nn.Linear(n_embed, n_embed)
+        self.proj = ResidualProj(n_embed, n_embed)
         self.register_buffer("tril", torch.tril(torch.ones(block_size, block_size)))
         self.attn_dropout = nn.Dropout(dropout)
         self.resid_dropout = nn.Dropout(dropout)
@@ -197,7 +201,7 @@ class FlashAttention(nn.Module):
         self.n_head = n_head
         self.dropout_p = dropout
         self.qkv = nn.Linear(n_embed, 3 * n_embed, bias=False)
-        self.proj = nn.Linear(n_embed, n_embed)
+        self.proj = ResidualProj(n_embed, n_embed)
         self.resid_dropout = nn.Dropout(dropout)
 
     @jaxtyped(typechecker=beartype)
@@ -243,7 +247,7 @@ class FeedForward(nn.Module):
         self.net = nn.Sequential(
             nn.Linear(n_embed, 4 * n_embed),
             nn.ReLU(),
-            nn.Linear(4 * n_embed, n_embed),
+            ResidualProj(4 * n_embed, n_embed),
             nn.Dropout(dropout),
         )
 
@@ -290,7 +294,25 @@ class GPT(nn.Module):
             ]
         )
         self.ln_f = nn.LayerNorm(cfg.n_embed)
-        self.lm_head = nn.Linear(cfg.n_embed, cfg.vocab_size)
+        self.lm_head = nn.Linear(cfg.n_embed, cfg.vocab_size, bias=False)
+
+        self.apply(self._init_weights)
+        self.lm_head.weight = self.token_embedding_table.weight
+
+    def _init_weights(self, module: nn.Module) -> None:
+        if isinstance(module, nn.Linear):
+            std = 0.02
+            # layers that write back into the residual stream are scaled down by
+            # 1/sqrt(2*n_layer): each block adds to the stream twice (attn + ffwd),
+            # so over n_layer blocks the variance would grow ~linearly with the
+            # number of adds. Shrinking each contributing projection keeps it flat.
+            if isinstance(module, ResidualProj):
+                std *= (2 * self.cfg.n_layer) ** -0.5
+            nn.init.normal_(module.weight, mean=0.0, std=std)
+            if module.bias is not None:
+                nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Embedding):
+            nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
     @jaxtyped(typechecker=beartype)
     def forward(
@@ -624,7 +646,7 @@ if __name__ == "__main__":
         model = GPT(cfg)
         print(f"model.cfg.name: {model.cfg.name}")
         num_params = sum(p.numel() for p in model.parameters())
-        print(f"{num_params / 1e6:.1f}M params")
+        print(f"{num_params / 1e6:.1f}M params ({num_params})")
         model.to(device)
         ckpt_path = generate_ckpt_path(model.cfg.name)
         train(model, ckpt_path)
