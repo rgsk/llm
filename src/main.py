@@ -9,6 +9,7 @@ from typing import Literal
 import numpy as np
 import torch
 import torch.nn.functional as F
+import wandb
 from beartype import beartype
 from einops import rearrange
 from jaxtyping import Float, Int, jaxtyped
@@ -310,6 +311,11 @@ def get_lr(
 
 def train(model: GPT, ckpt_path: Path):
     cfg = model.cfg
+    wandb.init(
+        project="llm",
+        name=f"{cfg.name}_{timestamp()}",
+        config=asdict(cfg),
+    )
     fwd = torch.compile(model) if cfg.use_compile else model
     opt = torch.optim.AdamW(model.parameters(), lr=cfg.lr)
     best_val = float("inf")
@@ -364,6 +370,11 @@ def train(model: GPT, ckpt_path: Path):
             print(
                 f"step {it:>4} : train {train_loss:.3f}   val {val_loss:.3f}   bpc {bpc:.3f}"
             )
+            wandb.log(
+                {"train_loss": train_loss, "val_loss": val_loss, "bpc": bpc, "lr": lr},
+                step=it,
+            )
+    wandb.finish()
 
     n = cfg.max_steps - TIMING_WARMUP
     assert dt is not None

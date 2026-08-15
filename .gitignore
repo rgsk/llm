@@ -13,3 +13,4 @@ artifacts/
 data/tinystories_*.txt
 rough.ipynb
 prac.ipynb
+wandb/
