@@ -9,12 +9,12 @@ from typing import Literal
 import numpy as np
 import torch
 import torch.nn.functional as F
-import wandb
 from beartype import beartype
 from einops import rearrange
 from jaxtyping import Float, Int, jaxtyped
 from torch import Tensor, nn
 
+import wandb
 from tokenizer import BPETokenizer
 from utils import repo_root
 
@@ -310,22 +310,24 @@ def get_lr(
 
 
 def train(model: GPT, ckpt_path: Path):
+    t_start = time.perf_counter()
     cfg = model.cfg
     wandb.init(
         project="llm",
         name=f"{cfg.name}_{timestamp()}",
         config=asdict(cfg),
+        settings=wandb.Settings(silent=True),
     )
     fwd = torch.compile(model) if cfg.use_compile else model
     opt = torch.optim.AdamW(model.parameters(), lr=cfg.lr)
     best_val = float("inf")
     TIMING_WARMUP = 10
-    t0, dt = None, None
-
+    t0 = last_it = last_t = None
     for it in range(cfg.max_steps):
         if it == TIMING_WARMUP:
             torch.cuda.synchronize()
             t0 = time.perf_counter()
+            last_t, last_it = t0, it
             torch.cuda.reset_peak_memory_stats()
         opt.zero_grad()
         for _ in range(cfg.grad_accum_steps):
@@ -344,11 +346,13 @@ def train(model: GPT, ckpt_path: Path):
         for g in opt.param_groups:
             g["lr"] = lr
         opt.step()
-        if it == cfg.max_steps - 1:
-            torch.cuda.synchronize()
-            assert t0 is not None
-            dt = time.perf_counter() - t0
         if it % cfg.eval_interval == 0 or it == cfg.max_steps - 1:
+            ms_step = float("nan")
+            if last_it is not None and it > last_it and last_t is not None:
+                torch.cuda.synchronize()
+                now = time.perf_counter()
+                ms_step = (now - last_t) / (it - last_it) * 1000
+
             out = estimate_loss(model, cfg.eval_iters, splits=("train",))
             train_loss = out["train"]
             val_loss = full_val_loss(model)
@@ -369,21 +373,30 @@ def train(model: GPT, ckpt_path: Path):
                 )
             print(
                 f"step {it:>4} : train {train_loss:.3f}   val {val_loss:.3f}   bpc {bpc:.3f}"
+                f"   {ms_step:.1f} ms/step"
             )
             wandb.log(
-                {"train_loss": train_loss, "val_loss": val_loss, "bpc": bpc, "lr": lr},
+                {
+                    "train_loss": train_loss,
+                    "val_loss": val_loss,
+                    "bpc": bpc,
+                    "lr": lr,
+                    "ms_step": ms_step,
+                },
                 step=it,
             )
-    wandb.finish()
+            torch.cuda.synchronize()
+            last_t, last_it = time.perf_counter(), it
 
-    n = cfg.max_steps - TIMING_WARMUP
-    assert dt is not None
-    print(f"for {n} steps time elapsed: {dt:.1f} s")
-    print(
-        f"{dt / n * 1000:.1f} ms/step  |  {dt / n * 5000 / 60:.1f} min per 5000 steps"
-    )
+    torch.cuda.synchronize()
+    wandb.summary["total_time_s"] = time.perf_counter() - t_start
+    assert t0 is not None
+    wandb.summary["train_time_s"] = time.perf_counter() - t0
+    print(f"total time elapsed: {wandb.summary['total_time_s']:.1f} s")
+    print(f"time elapsed (post-warmup): {wandb.summary['train_time_s']:.1f} s")
     print(f"max_memory_allocated: ~{torch.cuda.max_memory_allocated() / 1e9:.1f} GB")
     print(f"max_memory_reserved: ~{torch.cuda.max_memory_reserved() / 1e9:.1f} GB")
+    wandb.finish()
 
 
 def generate_sample(model: GPT):
