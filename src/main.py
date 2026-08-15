@@ -1,5 +1,6 @@
 import json
 import math
+import os
 import time
 from dataclasses import asdict, dataclass, replace
 from datetime import datetime
@@ -18,8 +19,8 @@ import wandb
 from tokenizer import BPETokenizer
 from utils import repo_root
 
-use_cuda = False
-use_flash = False
+use_cuda = True
+use_flash = True
 
 ROOT = repo_root()
 CKPT_DIR = ROOT / "artifacts" / "checkpoints"
@@ -202,22 +203,40 @@ class FlashAttention(nn.Module):
         self.resid_dropout = nn.Dropout(dropout)
 
     @jaxtyped(typechecker=beartype)
-    def forward(self, x: Float[Tensor, "b t e"]) -> Float[Tensor, "b t e"]:
+    def forward(
+        self, x: Float[Tensor, "b t e"], kv_cache: KVCacheIn | None = None
+    ) -> tuple[Float[Tensor, "b t e"], KVCacheOut]:
         nh = self.n_head
         qkv = self.qkv(x)  # [B, T, 3E]
         q, k, v = rearrange(
             qkv, "b t (three nh hs) -> three b nh t hs", three=3, nh=nh
         )  # [B, nh, T, hs]
+        if kv_cache is not None:
+            past_k, past_v = kv_cache
+            k = torch.cat(
+                [past_k, k], dim=2
+            )  # [B, nh, T_past + T, hs] = [B, nh, T_kv, hs]
+            v = torch.cat([past_v, v], dim=2)
+        new_cache = (k, v)
+        if kv_cache is None:
+            is_causal = True
+        else:
+            assert q.size(2) == 1, (
+                "cached path assumes one new token at a time; T>1 with a non-empty "
+                "cache needs an explicit attn_mask, since is_causal aligns top-left"
+            )
+            is_causal = False
+
         out = F.scaled_dot_product_attention(
             q,
             k,
             v,
             dropout_p=self.dropout_p if self.training else 0.0,
-            is_causal=True,
+            is_causal=is_causal,
         )  # [B, nh, T, hs]
         out = rearrange(out, "b nh t hs -> b t (nh hs)")  # [B, T, E]
         out = self.resid_dropout(self.proj(out))
-        return out
+        return out, new_cache
 
 
 class FeedForward(nn.Module):
@@ -528,10 +547,10 @@ def train(model: GPT, ckpt_path: Path):
 
 
 def generate_sample(model: GPT):
-    start = torch.tensor([tok.encode("\n")], device=device)
+    prompt = torch.tensor([tok.encode("\n")], device=device)
     sample = tok.decode(
         model.generate(
-            start,
+            prompt,
             max_new_tokens=8,
             use_cache=True,
             # temperature=0.8,
@@ -588,12 +607,47 @@ def set_seed(seed: int):
     eval_rng = np.random.default_rng(seed + 1)
 
 
+def test(model: GPT):
+    prompt = torch.tensor(
+        [tok.encode("Once upon a time there was a little girl")], device=device
+    )
+    a = model.generate(prompt, 410, temperature=0.0, use_cache=False)
+    b = model.generate(prompt, 410, temperature=0.0, use_cache=True)
+    print(f"{tok.decode(a[0].tolist())=}")
+    print(f"{tok.decode(b[0].tolist())=}")
+    # 1. same-input logits must match within tolerance
+    l1, _ = model(prompt)
+    l2, _, _ = model(prompt, use_cache=True)
+    print((l1 - l2).abs().max().item())  # expect ~1e-6, not ~1e-2
+
+    # 2. at the first divergent step, how close were the top two logits?
+    i = (a[0] != b[0]).nonzero()[0].item()
+    logits, _ = model(a[:, :i])
+    indices = logits[0, -1].topk(2).indices
+    ind1, ind2 = indices[0].item(), indices[1].item()
+    print(f"{tok.decode([ind1])=}")
+    print(f"{tok.decode([ind2])=}")
+    top2 = logits[0, -1].topk(2).values
+    print(i, (top2[0] - top2[1]).item())  # expect a tiny gap
+    idx = a[:, :i]
+    full, _ = model(idx)  # one-shot
+    _, _, caches = model(idx[:, :1], use_cache=True)  # replay incrementally
+    for t in range(1, int(i)):
+        lg, _, caches = model(idx[:, t : t + 1], use_cache=True, kv_caches=caches)
+    print((full[0, -1] - lg[0, -1]).abs().max().item())  # type:ignore
+
+
 if __name__ == "__main__":
     run_training = 0
+    print(f"use_cuda: {use_cuda}")
+    print(f"use_flash: {use_flash}")
+    print(f"JAXTYPING_DISABLE: {os.getenv('JAXTYPING_DISABLE')}")
+    print(f"run_training: {run_training}")
     if run_training:
         cfg = small_cfg
         set_seed(cfg.seed)
         model = GPT(cfg)
+        print(f"model.cfg.name: {model.cfg.name}")
         num_params = sum(p.numel() for p in model.parameters())
         print(f"{num_params / 1e6:.1f}M params")
         model.to(device)
@@ -601,7 +655,7 @@ if __name__ == "__main__":
         train(model, ckpt_path)
         ckpt = ckpt_path
     else:
-        ckpt = CKPT_DIR / "scratch.pt"
+        ckpt = CKPT_DIR / "big_2026-08-15_12-41-02.pt"
     saved = torch.load(ckpt, map_location=device)
     # rebuild the exact architecture from the saved config, then load the weights
     reloaded = GPT(GPTConfig(**saved["config"])).to(device)
@@ -611,3 +665,4 @@ if __name__ == "__main__":
         f"saved val_loss: {saved['val_loss']:.3f}, saved bpc: {saved['bpc']:.3f}"
     )
     generate_sample(reloaded)
+    test(reloaded)

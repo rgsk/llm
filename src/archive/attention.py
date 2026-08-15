@@ -81,3 +81,32 @@ class CausalSelfAttention(nn.Module):
         out = w @ v  # [B, nh, T, hs]
         out = rearrange(out, "b nh t hs -> b t (nh hs)")  # [B, T, E]
         return self.resid_dropout(self.proj(out))
+
+
+class FlashAttention(nn.Module):
+    def __init__(self, n_embed: int, n_head: int, dropout: float):
+        super().__init__()
+        assert n_embed % n_head == 0
+        self.n_head = n_head
+        self.dropout_p = dropout
+        self.qkv = nn.Linear(n_embed, 3 * n_embed, bias=False)
+        self.proj = nn.Linear(n_embed, n_embed)
+        self.resid_dropout = nn.Dropout(dropout)
+
+    @jaxtyped(typechecker=beartype)
+    def forward(self, x: Float[Tensor, "b t e"]) -> Float[Tensor, "b t e"]:
+        nh = self.n_head
+        qkv = self.qkv(x)  # [B, T, 3E]
+        q, k, v = rearrange(
+            qkv, "b t (three nh hs) -> three b nh t hs", three=3, nh=nh
+        )  # [B, nh, T, hs]
+        out = F.scaled_dot_product_attention(
+            q,
+            k,
+            v,
+            dropout_p=self.dropout_p if self.training else 0.0,
+            is_causal=True,
+        )  # [B, nh, T, hs]
+        out = rearrange(out, "b nh t hs -> b t (nh hs)")  # [B, T, E]
+        out = self.resid_dropout(self.proj(out))
+        return out
