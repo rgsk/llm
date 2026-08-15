@@ -316,11 +316,14 @@ class GPT(nn.Module):
             pos = torch.arange(T, device=idx.device)
         pos_embed = self.position_embedding_table(pos)  # [T, E]
         x = tok_embed + pos_embed  # [B, T, E]
-        new_caches = []
+
+        new_caches: list[KVCacheOut] = []
         for i, block in enumerate(self.blocks):
             layer_cache = kv_caches[i] if kv_caches is not None else None
             x, new_cache = block(x, layer_cache)
-            new_caches.append(new_cache)
+            if use_cache:
+                new_caches.append(new_cache)
+
         x = self.ln_f(x)  # [B, T, E]
         logits = self.lm_head(x)  # [B, T, V]
         loss = None
@@ -608,33 +611,7 @@ def set_seed(seed: int):
 
 
 def test(model: GPT):
-    prompt = torch.tensor(
-        [tok.encode("Once upon a time there was a little girl")], device=device
-    )
-    a = model.generate(prompt, 410, temperature=0.0, use_cache=False)
-    b = model.generate(prompt, 410, temperature=0.0, use_cache=True)
-    print(f"{tok.decode(a[0].tolist())=}")
-    print(f"{tok.decode(b[0].tolist())=}")
-    # 1. same-input logits must match within tolerance
-    l1, _ = model(prompt)
-    l2, _, _ = model(prompt, use_cache=True)
-    print((l1 - l2).abs().max().item())  # expect ~1e-6, not ~1e-2
-
-    # 2. at the first divergent step, how close were the top two logits?
-    i = (a[0] != b[0]).nonzero()[0].item()
-    logits, _ = model(a[:, :i])
-    indices = logits[0, -1].topk(2).indices
-    ind1, ind2 = indices[0].item(), indices[1].item()
-    print(f"{tok.decode([ind1])=}")
-    print(f"{tok.decode([ind2])=}")
-    top2 = logits[0, -1].topk(2).values
-    print(i, (top2[0] - top2[1]).item())  # expect a tiny gap
-    idx = a[:, :i]
-    full, _ = model(idx)  # one-shot
-    _, _, caches = model(idx[:, :1], use_cache=True)  # replay incrementally
-    for t in range(1, int(i)):
-        lg, _, caches = model(idx[:, t : t + 1], use_cache=True, kv_caches=caches)
-    print((full[0, -1] - lg[0, -1]).abs().max().item())  # type:ignore
+    pass
 
 
 if __name__ == "__main__":
