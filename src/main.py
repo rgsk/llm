@@ -4,7 +4,7 @@ import time
 from dataclasses import asdict, dataclass, replace
 from datetime import datetime
 from pathlib import Path
-from typing import Literal
+from typing import Literal, cast
 
 import numpy as np
 import torch
@@ -99,6 +99,7 @@ bench_cfg = replace(
     max_steps=100,
     warmup_steps=2,
     eval_interval=10**9,
+    name="bench",
 )
 big_cfg = replace(
     scaled_cfg,
@@ -109,6 +110,12 @@ big_cfg = replace(
     batch_size=32,
     grad_accum_steps=2,
     name="big",
+)
+temp_cfg = replace(
+    big_cfg,
+    max_steps=200,
+    eval_interval=100,
+    name="temp",
 )
 
 
@@ -286,7 +293,8 @@ def estimate_loss(
                 cfg.block_size,
                 eval_rng,
             )
-            _, loss = model(xb, yb)
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                _, loss = model(xb, yb)
             losses.append(loss)
         out[split] = torch.stack(losses).mean().item()
     if was_training:
@@ -318,7 +326,7 @@ def train(model: GPT, ckpt_path: Path):
         config=asdict(cfg),
         settings=wandb.Settings(silent=True),
     )
-    fwd = torch.compile(model) if cfg.use_compile else model
+    fwd = cast(GPT, torch.compile(model)) if cfg.use_compile else model
     opt = torch.optim.AdamW(model.parameters(), lr=cfg.lr)
     best_val = float("inf")
     TIMING_WARMUP = 10
@@ -353,9 +361,18 @@ def train(model: GPT, ckpt_path: Path):
                 now = time.perf_counter()
                 ms_step = (now - last_t) / (it - last_it) * 1000
 
-            out = estimate_loss(model, cfg.eval_iters, splits=("train",))
+            torch.cuda.synchronize()
+            t_e = time.perf_counter()
+            out = estimate_loss(fwd, cfg.eval_iters, splits=("train",))
+            torch.cuda.synchronize()
+            est_s = time.perf_counter() - t_e
+
+            t_v = time.perf_counter()
+            val_loss = full_val_loss(fwd)
+            torch.cuda.synchronize()
+            val_s = time.perf_counter() - t_v
+
             train_loss = out["train"]
-            val_loss = full_val_loss(model)
             # bits per char
             bpc = val_loss / math.log(2) / chars_per_token
             if val_loss < best_val:
@@ -373,7 +390,7 @@ def train(model: GPT, ckpt_path: Path):
                 )
             print(
                 f"step {it:>4} : train {train_loss:.3f}   val {val_loss:.3f}   bpc {bpc:.3f}"
-                f"   {ms_step:.1f} ms/step"
+                f"   {ms_step:.1f} ms/step   est_s {est_s:.1f} s   val_s {val_s:.1f} s"
             )
             wandb.log(
                 {
@@ -382,6 +399,8 @@ def train(model: GPT, ckpt_path: Path):
                     "bpc": bpc,
                     "lr": lr,
                     "ms_step": ms_step,
+                    "est_s": est_s,
+                    "val_s": val_s,
                 },
                 step=it,
             )
@@ -392,10 +411,13 @@ def train(model: GPT, ckpt_path: Path):
     wandb.summary["total_time_s"] = time.perf_counter() - t_start
     assert t0 is not None
     wandb.summary["train_time_s"] = time.perf_counter() - t0
+    wandb.summary["max_memory_allocated_gb"] = torch.cuda.max_memory_allocated() / 1e9
+    wandb.summary["max_memory_reserved_gb"] = torch.cuda.max_memory_reserved() / 1e9
+
     print(f"total time elapsed: {wandb.summary['total_time_s']:.1f} s")
     print(f"time elapsed (post-warmup): {wandb.summary['train_time_s']:.1f} s")
-    print(f"max_memory_allocated: ~{torch.cuda.max_memory_allocated() / 1e9:.1f} GB")
-    print(f"max_memory_reserved: ~{torch.cuda.max_memory_reserved() / 1e9:.1f} GB")
+    print(f"max_memory_allocated: ~{wandb.summary['max_memory_allocated_gb']:.1f} GB")
+    print(f"max_memory_reserved: ~{wandb.summary['max_memory_reserved_gb']:.1f} GB")
     wandb.finish()
 
 
@@ -423,7 +445,8 @@ def full_val_loss(model: GPT) -> float:
     total = count = 0
     for i in range(0, nwin, B):  # batch the windows through the model
         xb, yb = x[i : i + B].to(device), y[i : i + B].to(device)
-        _, loss = model(xb, yb)
+        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+            _, loss = model(xb, yb)
         # weight by no. of tokens so the mean is correct over uneven chunks
         total += loss.item() * yb.numel()
         count += yb.numel()
@@ -451,7 +474,7 @@ def set_seed(seed: int):
 
 
 if __name__ == "__main__":
-    cfg = small_cfg
+    cfg = temp_cfg
     set_seed(cfg.seed)
     model = GPT(cfg)
     num_params = sum(p.numel() for p in model.parameters())
