@@ -19,7 +19,7 @@ import wandb
 from tokenizer import BPETokenizer
 from utils import repo_root
 
-use_cuda = True
+use_cuda = False
 use_flash = True
 
 ROOT = repo_root()
@@ -61,6 +61,8 @@ class GPTConfig:
     seed: int = 1337
     use_wandb: bool = True
     norm: Literal["layer", "rms"] = "layer"
+    ffn: Literal["dense", "gated"] = "dense"
+    activation: Literal["relu", "gelu", "silu"] = "relu"
 
 
 small_cfg = GPTConfig(
@@ -82,6 +84,8 @@ small_cfg = GPTConfig(
     grad_accum_steps=1,
     use_wandb=False,
     norm="rms",
+    ffn="gated",
+    activation="silu",
 )
 
 scaled_cfg = GPTConfig(
@@ -256,12 +260,24 @@ class FlashAttention(nn.Module):
         return out, new_cache
 
 
+def make_activation(cfg: GPTConfig) -> nn.Module:
+    match cfg.activation:
+        case "relu":
+            return nn.ReLU()
+        case "gelu":
+            return nn.GELU(approximate="tanh")
+        case "silu":
+            return nn.SiLU()
+        case _:
+            assert_never(cfg.activation)
+
+
 class FeedForward(nn.Module):
     def __init__(self, cfg: GPTConfig) -> None:
         super().__init__()
         self.net = nn.Sequential(
             nn.Linear(cfg.n_embed, 4 * cfg.n_embed),
-            nn.ReLU(),
+            make_activation(cfg),
             ResidualProj(4 * cfg.n_embed, cfg.n_embed),
             nn.Dropout(cfg.dropout),
         )
@@ -271,13 +287,40 @@ class FeedForward(nn.Module):
         return self.net(x)  # [B, T, E]
 
 
+class GatedFeedForward(nn.Module):
+    def __init__(self, cfg: GPTConfig) -> None:
+        super().__init__()
+        # param-matched to the ReLU FFN: that has 2*E*4E weights, SwiGLU has 3*E*h,
+        # so h = 8E/3. Rounded to a multiple of 64 for GEMM-friendly shapes.
+        hidden = round(8 * cfg.n_embed / 3 / 64) * 64  # E=512 -> 1344
+        self.gate_up = nn.Linear(cfg.n_embed, 2 * hidden, bias=False)
+        self.activation = make_activation(cfg)
+        self.down = ResidualProj(hidden, cfg.n_embed, bias=False)
+        self.dropout = nn.Dropout(cfg.dropout)
+
+    @jaxtyped(typechecker=beartype)
+    def forward(self, x: Float[Tensor, "b t e"]) -> Float[Tensor, "b t e"]:
+        gate, up = rearrange(self.gate_up(x), "b t (two h) -> two b t h", two=2)
+        return self.dropout(self.down(self.activation(gate) * up))  # [B, T, E]
+
+
+def make_ffwd(cfg: GPTConfig) -> nn.Module:
+    match cfg.ffn:
+        case "dense":
+            return FeedForward(cfg)
+        case "gated":
+            return GatedFeedForward(cfg)
+        case _:
+            assert_never(cfg.ffn)
+
+
 class Block(nn.Module):
     def __init__(self, cfg: GPTConfig):
         super().__init__()
         self.ln1 = make_norm(cfg)
         self.ln2 = make_norm(cfg)
         self.attn = FlashAttention(cfg) if use_flash else CausalSelfAttention(cfg)
-        self.ffwd = FeedForward(cfg)
+        self.ffwd = make_ffwd(cfg)
 
     @jaxtyped(typechecker=beartype)
     def forward(
