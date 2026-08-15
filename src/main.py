@@ -5,7 +5,7 @@ import time
 from dataclasses import asdict, dataclass, replace
 from datetime import datetime
 from pathlib import Path
-from typing import Literal, cast
+from typing import Literal, assert_never, cast
 
 import numpy as np
 import torch
@@ -60,6 +60,7 @@ class GPTConfig:
     grad_accum_steps: int
     seed: int = 1337
     use_wandb: bool = True
+    norm: Literal["layer", "rms"] = "layer"
 
 
 small_cfg = GPTConfig(
@@ -80,6 +81,7 @@ small_cfg = GPTConfig(
     name="scratch",
     grad_accum_steps=1,
     use_wandb=False,
+    norm="rms",
 )
 
 scaled_cfg = GPTConfig(
@@ -100,6 +102,7 @@ scaled_cfg = GPTConfig(
     name="scaled",
     grad_accum_steps=1,
     use_wandb=True,
+    norm="rms",
 )
 
 big_cfg = replace(
@@ -139,6 +142,16 @@ def get_batch(
     return torch.from_numpy(x).to(device), torch.from_numpy(y).to(device)
 
 
+def make_norm(cfg: GPTConfig) -> nn.LayerNorm | nn.RMSNorm:
+    match cfg.norm:
+        case "layer":
+            return nn.LayerNorm(cfg.n_embed, eps=1e-5)
+        case "rms":
+            return nn.RMSNorm(cfg.n_embed, eps=1e-5)
+        case _:
+            assert_never(cfg.norm)
+
+
 type KVCacheIn = tuple[Float[Tensor, "b nh t_past hs"], Float[Tensor, "b nh t_past hs"]]
 type KVCacheOut = tuple[Float[Tensor, "b nh t_kv hs"], Float[Tensor, "b nh t_kv hs"]]
 
@@ -150,16 +163,18 @@ class ResidualProj(nn.Linear):
 class CausalSelfAttention(nn.Module):
     tril: Tensor
 
-    def __init__(self, block_size: int, n_embed: int, n_head: int, dropout: float):
+    def __init__(self, cfg: GPTConfig):
         super().__init__()
-        assert n_embed % n_head == 0
-        self.n_head = n_head
-        self.head_size = n_embed // n_head
-        self.qkv = nn.Linear(n_embed, 3 * n_embed, bias=False)
-        self.proj = ResidualProj(n_embed, n_embed)
-        self.register_buffer("tril", torch.tril(torch.ones(block_size, block_size)))
-        self.attn_dropout = nn.Dropout(dropout)
-        self.resid_dropout = nn.Dropout(dropout)
+        assert cfg.n_embed % cfg.n_head == 0
+        self.n_head = cfg.n_head
+        self.head_size = cfg.n_embed // cfg.n_head
+        self.qkv = nn.Linear(cfg.n_embed, 3 * cfg.n_embed, bias=False)
+        self.proj = ResidualProj(cfg.n_embed, cfg.n_embed)
+        self.register_buffer(
+            "tril", torch.tril(torch.ones(cfg.block_size, cfg.block_size))
+        )
+        self.attn_dropout = nn.Dropout(cfg.dropout)
+        self.resid_dropout = nn.Dropout(cfg.dropout)
 
     @jaxtyped(typechecker=beartype)
     def forward(
@@ -195,14 +210,14 @@ class CausalSelfAttention(nn.Module):
 
 
 class FlashAttention(nn.Module):
-    def __init__(self, n_embed: int, n_head: int, dropout: float):
+    def __init__(self, cfg: GPTConfig):
         super().__init__()
-        assert n_embed % n_head == 0
-        self.n_head = n_head
-        self.dropout_p = dropout
-        self.qkv = nn.Linear(n_embed, 3 * n_embed, bias=False)
-        self.proj = ResidualProj(n_embed, n_embed)
-        self.resid_dropout = nn.Dropout(dropout)
+        assert cfg.n_embed % cfg.n_head == 0
+        self.n_head = cfg.n_head
+        self.dropout_p = cfg.dropout
+        self.qkv = nn.Linear(cfg.n_embed, 3 * cfg.n_embed, bias=False)
+        self.proj = ResidualProj(cfg.n_embed, cfg.n_embed)
+        self.resid_dropout = nn.Dropout(cfg.dropout)
 
     @jaxtyped(typechecker=beartype)
     def forward(
@@ -242,13 +257,13 @@ class FlashAttention(nn.Module):
 
 
 class FeedForward(nn.Module):
-    def __init__(self, n_embed: int, dropout: float) -> None:
+    def __init__(self, cfg: GPTConfig) -> None:
         super().__init__()
         self.net = nn.Sequential(
-            nn.Linear(n_embed, 4 * n_embed),
+            nn.Linear(cfg.n_embed, 4 * cfg.n_embed),
             nn.ReLU(),
-            ResidualProj(4 * n_embed, n_embed),
-            nn.Dropout(dropout),
+            ResidualProj(4 * cfg.n_embed, cfg.n_embed),
+            nn.Dropout(cfg.dropout),
         )
 
     @jaxtyped(typechecker=beartype)
@@ -257,16 +272,12 @@ class FeedForward(nn.Module):
 
 
 class Block(nn.Module):
-    def __init__(self, block_size: int, n_embed: int, n_head: int, dropout: float):
+    def __init__(self, cfg: GPTConfig):
         super().__init__()
-        self.ln1 = nn.LayerNorm(n_embed)
-        self.ln2 = nn.LayerNorm(n_embed)
-        self.attn = (
-            FlashAttention(n_embed, n_head, dropout)
-            if use_flash
-            else CausalSelfAttention(block_size, n_embed, n_head, dropout)
-        )
-        self.ffwd = FeedForward(n_embed, dropout)
+        self.ln1 = make_norm(cfg)
+        self.ln2 = make_norm(cfg)
+        self.attn = FlashAttention(cfg) if use_flash else CausalSelfAttention(cfg)
+        self.ffwd = FeedForward(cfg)
 
     @jaxtyped(typechecker=beartype)
     def forward(
@@ -287,13 +298,8 @@ class GPT(nn.Module):
         self.cfg = cfg
         self.token_embedding_table = nn.Embedding(cfg.vocab_size, cfg.n_embed)
         self.position_embedding_table = nn.Embedding(cfg.block_size, cfg.n_embed)
-        self.blocks = nn.ModuleList(
-            [
-                Block(cfg.block_size, cfg.n_embed, cfg.n_head, cfg.dropout)
-                for _ in range(cfg.n_layer)
-            ]
-        )
-        self.ln_f = nn.LayerNorm(cfg.n_embed)
+        self.blocks = nn.ModuleList([Block(cfg) for _ in range(cfg.n_layer)])
+        self.ln_f = make_norm(cfg)
         self.lm_head = nn.Linear(cfg.n_embed, cfg.vocab_size, bias=False)
 
         self.apply(self._init_weights)
@@ -575,7 +581,7 @@ def generate_sample(model: GPT):
     sample = tok.decode(
         model.generate(
             prompt,
-            max_new_tokens=100,
+            max_new_tokens=300,
             use_cache=False,
             temperature=0.8,
             top_p=0.95,
@@ -652,7 +658,7 @@ if __name__ == "__main__":
         train(model, ckpt_path)
         ckpt = ckpt_path
     else:
-        ckpt = CKPT_DIR / "big_2026-08-15_12-41-02.pt"
+        ckpt = CKPT_DIR / "big_2026-08-15_20-22-57.pt"
     saved = torch.load(ckpt, map_location=device)
     # rebuild the exact architecture from the saved config, then load the weights
     reloaded = GPT(GPTConfig(**saved["config"])).to(device)
