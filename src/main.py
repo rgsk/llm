@@ -18,10 +18,13 @@ import wandb
 from tokenizer import BPETokenizer
 from utils import repo_root
 
+use_cuda = False
+use_flash = False
+
 ROOT = repo_root()
 CKPT_DIR = ROOT / "artifacts" / "checkpoints"
 CKPT_DIR.mkdir(parents=True, exist_ok=True)
-device = "cuda" if torch.cuda.is_available() else "cpu"
+device = "cuda" if use_cuda and torch.cuda.is_available() else "cpu"
 torch.set_float32_matmul_precision("high")
 
 
@@ -67,7 +70,7 @@ small_cfg = GPTConfig(
     dropout=0.0,
     lr=1e-2,
     min_lr=1e-3,
-    max_steps=1000,
+    max_steps=200,
     warmup_steps=20,
     eval_interval=100,
     eval_iters=100,
@@ -107,10 +110,14 @@ big_cfg = replace(
     n_head=8,
     n_layer=8,
     dropout=0.0,
-    batch_size=32,
-    grad_accum_steps=2,
+    batch_size=64,
+    grad_accum_steps=1,
+    max_steps=20000,
+    warmup_steps=400,
+    eval_interval=1000,
     name="big",
 )
+
 temp_cfg = replace(
     big_cfg,
     max_steps=200,
@@ -131,6 +138,57 @@ def get_batch(
     x = np.stack([d[i : i + block_size] for i in ix]).astype(np.int64)
     y = np.stack([d[i + 1 : i + 1 + block_size] for i in ix]).astype(np.int64)
     return torch.from_numpy(x).to(device), torch.from_numpy(y).to(device)
+
+
+type KVCacheIn = tuple[Float[Tensor, "b nh t_past hs"], Float[Tensor, "b nh t_past hs"]]
+type KVCacheOut = tuple[Float[Tensor, "b nh t_kv hs"], Float[Tensor, "b nh t_kv hs"]]
+
+
+class CausalSelfAttention(nn.Module):
+    tril: Tensor
+
+    def __init__(self, block_size: int, n_embed: int, n_head: int, dropout: float):
+        super().__init__()
+        assert n_embed % n_head == 0
+        self.n_head = n_head
+        self.head_size = n_embed // n_head
+        self.qkv = nn.Linear(n_embed, 3 * n_embed, bias=False)
+        self.proj = nn.Linear(n_embed, n_embed)
+        self.register_buffer("tril", torch.tril(torch.ones(block_size, block_size)))
+        self.attn_dropout = nn.Dropout(dropout)
+        self.resid_dropout = nn.Dropout(dropout)
+
+    @jaxtyped(typechecker=beartype)
+    def forward(
+        self, x: Float[Tensor, "b t e"], kv_cache: KVCacheIn | None = None
+    ) -> tuple[Float[Tensor, "b t e"], KVCacheOut]:
+        _, T, _ = x.shape
+        nh, hs = self.n_head, self.head_size
+        qkv = self.qkv(x)  # [B, T, 3E]
+        q, k, v = rearrange(
+            qkv, "b t (three nh hs) -> three b nh t hs", three=3, nh=nh
+        )  # [B, nh, T, hs]
+        if kv_cache is not None:
+            past_k, past_v = kv_cache
+            k = torch.cat(
+                [past_k, k], dim=2
+            )  # [B, nh, T_past + T, hs] = [B, nh, T_kv, hs]
+            v = torch.cat([past_v, v], dim=2)
+        new_cache = (k, v)
+        scores = (
+            q @ rearrange(k, "b nh t_kv hs -> b nh hs t_kv") * hs**-0.5
+        )  # [B, nh, T, T_kv]
+        T_kv = k.size(2)
+        assert T_kv <= self.tril.size(0)
+        T_past = T_kv - T
+        causal = self.tril[T_past:T_kv, :T_kv]  # [T, T_kv]
+        scores = scores.masked_fill(causal == 0, float("-inf"))
+        w = F.softmax(scores, dim=-1)
+        w = self.attn_dropout(w)
+        out = w @ v  # [B, nh, T, hs]
+        out = rearrange(out, "b nh t hs -> b t (nh hs)")  # [B, T, E]
+        out = self.resid_dropout(self.proj(out))
+        return out, new_cache
 
 
 class FlashAttention(nn.Module):
@@ -158,7 +216,8 @@ class FlashAttention(nn.Module):
             is_causal=True,
         )  # [B, nh, T, hs]
         out = rearrange(out, "b nh t hs -> b t (nh hs)")  # [B, T, E]
-        return self.resid_dropout(self.proj(out))
+        out = self.resid_dropout(self.proj(out))
+        return out
 
 
 class FeedForward(nn.Module):
@@ -181,14 +240,24 @@ class Block(nn.Module):
         super().__init__()
         self.ln1 = nn.LayerNorm(n_embed)
         self.ln2 = nn.LayerNorm(n_embed)
-        self.attn = FlashAttention(n_embed, n_head, dropout)
+        self.attn = (
+            FlashAttention(n_embed, n_head, dropout)
+            if use_flash
+            else CausalSelfAttention(block_size, n_embed, n_head, dropout)
+        )
         self.ffwd = FeedForward(n_embed, dropout)
 
     @jaxtyped(typechecker=beartype)
-    def forward(self, x: Float[Tensor, "b t e"]) -> Float[Tensor, "b t e"]:
-        x = x + self.attn(self.ln1(x))
+    def forward(
+        self, x: Float[Tensor, "b t e"], kv_cache: KVCacheIn | None = None
+    ) -> tuple[Float[Tensor, "b t e"], KVCacheOut]:
+        attn_out, new_cache = self.attn(self.ln1(x), kv_cache)
+        x = x + attn_out
         x = x + self.ffwd(self.ln2(x))
-        return x  # [B, T, E]
+        return (
+            x,  # [B, T, E]
+            new_cache,
+        )
 
 
 class GPT(nn.Module):
@@ -197,8 +266,8 @@ class GPT(nn.Module):
         self.cfg = cfg
         self.token_embedding_table = nn.Embedding(cfg.vocab_size, cfg.n_embed)
         self.position_embedding_table = nn.Embedding(cfg.block_size, cfg.n_embed)
-        self.blocks = nn.Sequential(
-            *[
+        self.blocks = nn.ModuleList(
+            [
                 Block(cfg.block_size, cfg.n_embed, cfg.n_head, cfg.dropout)
                 for _ in range(cfg.n_layer)
             ]
@@ -211,13 +280,28 @@ class GPT(nn.Module):
         self,
         idx: Int[Tensor, "b t"],
         targets: Int[Tensor, "b t"] | None = None,
-    ) -> tuple[Float[Tensor, "b t v"], Float[Tensor, ""] | None]:
+        *,
+        use_cache: bool = False,
+        kv_caches: list[KVCacheIn] | None = None,
+    ) -> (
+        tuple[Float[Tensor, "b t v"], Float[Tensor, ""] | None]
+        | tuple[Float[Tensor, "b t v"], Float[Tensor, ""] | None, list[KVCacheOut]]
+    ):
         _, T = idx.shape
         tok_embed = self.token_embedding_table(idx)  # [B, T, E]
-        pos = torch.arange(T, device=idx.device)
+        if use_cache:
+            T_past = 0 if kv_caches is None else kv_caches[0][0].size(2)
+            assert T_past + T <= self.cfg.block_size
+            pos = torch.arange(T_past, T_past + T, device=idx.device)
+        else:
+            pos = torch.arange(T, device=idx.device)
         pos_embed = self.position_embedding_table(pos)  # [T, E]
         x = tok_embed + pos_embed  # [B, T, E]
-        x = self.blocks(x)  # [B, T, E]
+        new_caches = []
+        for i, block in enumerate(self.blocks):
+            layer_cache = kv_caches[i] if kv_caches is not None else None
+            x, new_cache = block(x, layer_cache)
+            new_caches.append(new_cache)
         x = self.ln_f(x)  # [B, T, E]
         logits = self.lm_head(x)  # [B, T, V]
         loss = None
@@ -226,6 +310,8 @@ class GPT(nn.Module):
                 rearrange(logits, "b t v -> (b t) v"),
                 rearrange(targets, "b t -> (b t)"),
             )
+        if use_cache:
+            return logits, loss, new_caches
         return logits, loss
 
     @torch.no_grad()
@@ -234,6 +320,7 @@ class GPT(nn.Module):
         self,
         idx: Int[Tensor, "b t"],
         max_new_tokens: int,
+        use_cache: bool = False,
         temperature: float = 1.0,  # 1.0 no-op | 0.0 greedy | 0.8 recommended
         top_k: int | None = None,  # None no-op | 1 greedy   | prefer top_p
         top_p: float | None = None,  # 1.0 no-op | 0.0 greedy  | 0.95 recommended
@@ -244,8 +331,27 @@ class GPT(nn.Module):
         assert top_k is None or top_k > 0
         assert top_p is None or 0.0 <= top_p <= 1.0
         assert min_p is None or 0.0 <= min_p <= 1.0
+        if use_cache:
+            fed = idx.size(1) + max_new_tokens - 1
+            assert fed <= self.cfg.block_size, (
+                f"use_cache needs prompt+max_new_tokens-1 ({idx.size(1)}+"
+                f"{max_new_tokens}-1={fed}) <= block_size ({self.cfg.block_size}); "
+                f"positions come from the position embedding table, which has only "
+                f"block_size rows. Use use_cache=False to crop+recompute."
+            )
+
+        kv_caches = None
         for _ in range(max_new_tokens):
-            logits, _ = self(idx[:, -self.cfg.block_size :])
+            if use_cache:
+                idx_cond = idx if kv_caches is None else idx[:, -1:]
+                logits, _, kv_caches = self(
+                    idx_cond,
+                    use_cache=True,
+                    kv_caches=kv_caches,
+                )
+            else:
+                idx_cond = idx[:, -self.cfg.block_size :]
+                logits, _ = self(idx_cond)
             logits = logits[:, -1, :]  # [B, V]
             if temperature == 0.0:
                 nxt = logits.argmax(dim=-1, keepdim=True)  # [B, 1]
@@ -423,7 +529,16 @@ def train(model: GPT, ckpt_path: Path):
 
 def generate_sample(model: GPT):
     start = torch.tensor([tok.encode("\n")], device=device)
-    sample = tok.decode(model.generate(start, max_new_tokens=100)[0].tolist())
+    sample = tok.decode(
+        model.generate(
+            start,
+            max_new_tokens=8,
+            use_cache=True,
+            # temperature=0.8,
+            # top_p=0.95,
+            top_k=1,
+        )[0].tolist()
+    )
     print(sample)
 
 
@@ -474,25 +589,25 @@ def set_seed(seed: int):
 
 
 if __name__ == "__main__":
-    cfg = temp_cfg
-    set_seed(cfg.seed)
-    model = GPT(cfg)
-    num_params = sum(p.numel() for p in model.parameters())
-    print(f"{num_params / 1e6:.1f}M params")
-    model.to(device)
-    ckpt_path = generate_ckpt_path(model.cfg.name)
-    train(model, ckpt_path)
-    # generate_sample(model)
-    ckpt = ckpt_path
-    # ckpt = CKPT_DIR / "big_2026-08-14_23-54-11.pt"
+    run_training = 0
+    if run_training:
+        cfg = small_cfg
+        set_seed(cfg.seed)
+        model = GPT(cfg)
+        num_params = sum(p.numel() for p in model.parameters())
+        print(f"{num_params / 1e6:.1f}M params")
+        model.to(device)
+        ckpt_path = generate_ckpt_path(model.cfg.name)
+        train(model, ckpt_path)
+        ckpt = ckpt_path
+    else:
+        ckpt = CKPT_DIR / "scratch.pt"
     saved = torch.load(ckpt, map_location=device)
     # rebuild the exact architecture from the saved config, then load the weights
     reloaded = GPT(GPTConfig(**saved["config"])).to(device)
     reloaded.load_state_dict(saved["model"])
-    loss = full_val_loss(reloaded)
     print(
         f"best checkpoint model at step: {saved['step']}, "
-        f"saved val_loss: {saved['val_loss']:.3f}, calculated val_loss: {loss:.3f}, "
-        f"saved bpc: {saved['bpc']:.3f}"
+        f"saved val_loss: {saved['val_loss']:.3f}, saved bpc: {saved['bpc']:.3f}"
     )
     generate_sample(reloaded)
