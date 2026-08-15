@@ -59,6 +59,7 @@ class GPTConfig:
     name: str
     grad_accum_steps: int
     seed: int = 1337
+    use_wandb: bool = True
 
 
 small_cfg = GPTConfig(
@@ -78,6 +79,7 @@ small_cfg = GPTConfig(
     use_compile=False,
     name="scratch",
     grad_accum_steps=1,
+    use_wandb=False,
 )
 
 scaled_cfg = GPTConfig(
@@ -97,14 +99,9 @@ scaled_cfg = GPTConfig(
     use_compile=True,
     name="scaled",
     grad_accum_steps=1,
+    use_wandb=True,
 )
-bench_cfg = replace(
-    scaled_cfg,
-    max_steps=100,
-    warmup_steps=2,
-    eval_interval=10**9,
-    name="bench",
-)
+
 big_cfg = replace(
     scaled_cfg,
     n_embed=512,
@@ -124,6 +121,7 @@ temp_cfg = replace(
     max_steps=200,
     eval_interval=100,
     name="temp",
+    use_wandb=False,
 )
 
 
@@ -453,6 +451,7 @@ def train(model: GPT, ckpt_path: Path):
         name=f"{cfg.name}_{timestamp()}",
         config=asdict(cfg),
         settings=wandb.Settings(silent=True),
+        mode=None if cfg.use_wandb else "disabled",
     )
     fwd = cast(GPT, torch.compile(model)) if cfg.use_compile else model
     opt = torch.optim.AdamW(model.parameters(), lr=cfg.lr)
@@ -554,11 +553,10 @@ def generate_sample(model: GPT):
     sample = tok.decode(
         model.generate(
             prompt,
-            max_new_tokens=8,
-            use_cache=True,
-            # temperature=0.8,
-            # top_p=0.95,
-            top_k=1,
+            max_new_tokens=100,
+            use_cache=False,
+            temperature=0.8,
+            top_p=0.95,
         )[0].tolist()
     )
     print(sample)
@@ -615,7 +613,7 @@ def test(model: GPT):
 
 
 if __name__ == "__main__":
-    run_training = 0
+    run_training = 1
     print(f"use_cuda: {use_cuda}")
     print(f"use_flash: {use_flash}")
     print(f"JAXTYPING_DISABLE: {os.getenv('JAXTYPING_DISABLE')}")
