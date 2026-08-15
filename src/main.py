@@ -19,7 +19,7 @@ import wandb
 from tokenizer import BPETokenizer
 from utils import repo_root
 
-use_cuda = False
+use_cuda = True
 use_flash = True
 
 ROOT = repo_root()
@@ -107,6 +107,8 @@ scaled_cfg = GPTConfig(
     grad_accum_steps=1,
     use_wandb=True,
     norm="rms",
+    ffn="gated",
+    activation="silu",
 )
 
 big_cfg = replace(
@@ -690,7 +692,7 @@ if __name__ == "__main__":
     print(f"JAXTYPING_DISABLE: {os.getenv('JAXTYPING_DISABLE')}")
     print(f"run_training: {run_training}")
     if run_training:
-        cfg = small_cfg
+        cfg = big_cfg
         set_seed(cfg.seed)
         model = GPT(cfg)
         print(f"model.cfg.name: {model.cfg.name}")
