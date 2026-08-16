@@ -36,3 +36,7 @@ After that
 
 Sampling controls (temperature, top-k, top-p), gradient accumulation for larger effective batches, then post-training: supervised finetuning on an instruction dataset, LoRA, and optionally DPO. That's the step where it stops being a text continuation engine and starts behaving like an assistant.
 
+Pending
+----------
+
+The one item still outstanding from early on is optimizer hygiene — you're running AdamW with default wd=0.01 applied to norms and embeddings alike, no gradient clipping, and betas (0.9, 0.999). Param groups with decay only on 2D params, clip_grad_norm_(1.0), betas (0.9, 0.95) is a single run and likely a real gain. It's the cheapest unclaimed win on the board.
