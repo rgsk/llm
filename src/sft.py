@@ -1,25 +1,22 @@
 from __future__ import annotations
 
-import json
 import re
 import time
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
+from itertools import islice
 from pathlib import Path
 from typing import Literal
 
 import numpy as np
 import torch
 import torch.nn.functional as F
-from beartype import beartype
 from einops import rearrange
-from huggingface_hub import hf_hub_download
-from jaxtyping import Int, jaxtyped
 from torch import Tensor
 
+import wandb
 from main import (
     CKPT_DIR,
     GPT,
-    ROOT,
     GPTConfig,
     device,
     get_lr,
@@ -27,142 +24,7 @@ from main import (
     timestamp,
     tok,
 )
-
-FIELDS = ("Random sentence:", "Features:", "Words:", "Summary:", "Story:")
-DATASET = "roneneldan/TinyStoriesInstruct"
-VALID_FILE = "TinyStories-Instruct-valid.txt"
-
-
-def parse(rec: str) -> dict[str, str]:
-    """One record's text -> {field name: value}, in source order."""
-    fields: dict[str, list[str]] = {}
-    cur = None
-    for line in rec.split("\n"):
-        hit = next((f for f in FIELDS if line.startswith(f)), None)
-        if hit:
-            cur = hit[:-1]
-            fields[cur] = [line[len(hit) :].strip()]
-        elif cur:
-            fields[cur].append(line.strip())
-    return {k: "\n".join(v).strip() for k, v in fields.items()}
-
-
-def load_records(split: str = "valid") -> list[dict[str, str]]:
-    path = hf_hub_download(DATASET, VALID_FILE, repo_type="dataset")
-    with open(path, encoding="utf-8") as f:
-        text = f.read()
-    recs = (parse(r.strip()) for r in text.split("<|endoftext|>") if r.strip())
-    # need a story to learn, and at least one field to condition on
-    return [f for f in recs if f.get("Story") and any(f[k] for k in f if k != "Story")]
-
-
-def render(f: dict[str, str]) -> tuple[str, str]:
-    """Fields -> (prompt, completion). Story is forced last; other fields keep
-    their source order, which varies per record on purpose."""
-    prompt = "".join(f"{k}: {f[k]}\n" for k in f if k != "Story") + "Story.\n\n"
-    return prompt, f["Story"] + "\n<|endoftext|>\n"
-
-
-def encode_example(f: dict[str, str]) -> tuple[list[int], list[bool]]:
-    """-> (token ids, is_completion flag per token). Tokenized separately so the
-    prompt/completion boundary is exact, not inferred."""
-    p, c = render(f)
-    ip, ic = tok.encode(p), tok.encode(c)
-    return ip + ic, [False] * len(ip) + [True] * len(ic)
-
-
-def _pack(
-    records: list[dict[str, str]], rng: np.random.Generator
-) -> tuple[np.ndarray, np.ndarray]:
-    """Records -> one contiguous token stream + its per-token completion mask.
-
-    Shuffled at the record level so packed neighbours aren't corpus-adjacent.
-    Examples run end to end with no separator: each already ends with
-    <|endoftext|>, which is exactly how documents abut in the pretraining stream.
-    """
-    ids: list[int] = []
-    is_c: list[bool] = []
-    for i in rng.permutation(len(records)):
-        a, b = encode_example(records[i])
-        ids += a
-        is_c += b
-    return np.array(ids, dtype=np.uint16), np.array(is_c, dtype=bool)
-
-
-def build_or_load(val_frac: float = 0.05, seed: int = 1337) -> dict[str, np.ndarray]:
-    """Tokenize + pack once, cache to disk, memmap thereafter.
-
-    The val slice is taken before packing, so no window straddles the split and
-    a val story never appears as context for a train one.
-    """
-    out = ROOT / "artifacts" / "data" / "tinystories_instruct"
-    meta_path = out / "meta.json"
-    names = {
-        f"{s}_{k}": out / f"{s}.{k}.bin"
-        for s in ("train", "val")
-        for k in ("ids", "mask")
-    }
-
-    if not (meta_path.exists() and all(p.exists() for p in names.values())):
-        out.mkdir(parents=True, exist_ok=True)
-        records = load_records()
-        n_val = int(len(records) * val_frac)
-        splits = {"train": records[:-n_val], "val": records[-n_val:]}
-        meta: dict = {"seed": seed, "val_frac": val_frac}
-        for split, recs in splits.items():
-            ids, mask = _pack(recs, np.random.default_rng(seed))
-            ids.tofile(names[f"{split}_ids"])
-            mask.tofile(names[f"{split}_mask"])
-            meta[split] = {
-                "n_records": len(recs),
-                "n_tokens": int(ids.size),
-                "completion_frac": float(mask.mean()),
-            }
-            print(split, meta[split])
-        meta_path.write_text(json.dumps(meta, indent=2))
-
-    packed: dict[str, np.ndarray] = {
-        k: np.memmap(p, dtype=np.uint16 if k.endswith("ids") else bool, mode="r")
-        for k, p in names.items()
-    }
-    for split in ("train", "val"):
-        # an example begins wherever the mask goes True -> False: a completion
-        # ended and the next prompt started. Derived at load rather than cached;
-        # it is one pass over the mask and keeps the on-disk format to two arrays.
-        m = packed[f"{split}_mask"]
-        packed[f"{split}_starts"] = np.concatenate(
-            [[0], np.flatnonzero((~m[1:]) & m[:-1]) + 1]
-        )
-    return packed
-
-
-@jaxtyped(typechecker=beartype)
-def get_batch(
-    packed: dict[str, np.ndarray],
-    split: Literal["train", "val"],
-    batch_size: int,
-    block_size: int,
-    rng: np.random.Generator,
-) -> tuple[Int[Tensor, "b t"], Int[Tensor, "b t"]]:
-    """Same shape as main.get_batch, with prompt positions set to -100.
-
-    The mask is indexed at i+1 alongside y, not at i: position t predicts token
-    t+1, so a target is kept iff the token being predicted is a completion token.
-    That is the prompt_len-1 offset, expressed so it survives packing.
-    """
-    ids, mask, starts = (packed[f"{split}_{k}"] for k in ("ids", "mask", "starts"))
-    # Sample example starts, not uniform offsets. A uniform offset opens
-    # mid-story 99% of the time, and 37% of kept targets then have their prompt
-    # outside the window -- training "continue this story" rather than "follow
-    # this instruction". Aligning also puts prompts at position 0, which is
-    # where they sit at inference.
-    ok = starts[starts <= len(ids) - block_size - 1]
-    ix = ok[rng.integers(len(ok), size=batch_size)]
-    x = np.stack([ids[i : i + block_size] for i in ix]).astype(np.int64)
-    y = np.stack([ids[i + 1 : i + 1 + block_size] for i in ix]).astype(np.int64)
-    keep = np.stack([mask[i + 1 : i + 1 + block_size] for i in ix])
-    y[~keep] = -100
-    return torch.from_numpy(x).to(device), torch.from_numpy(y).to(device)
+from sft_data import build_or_load, iter_records, render, source_path
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -172,17 +34,31 @@ class SFTConfig:
 
     base_ckpt: str
     name: str = "sft"
-    # 20k pretraining steps already happened; this LR is ~15x smaller so the run
-    # adapts the format without dissolving what the base model knows.
-    lr: float = 5e-5
-    min_lr: float = 5e-6
-    warmup_steps: int = 100
-    max_steps: int = 1600  # ~2 epochs at 6.5M train tokens, batch 16 x 512
-    batch_size: int = 16
-    grad_clip: float = 1.0
-    eval_interval: int = 100
+    # Pretraining ran at 3e-4 with batch 64; this is 2/3 of that at half the
+    # batch, roughly sqrt-scaling. 682M fresh instruct tokens is closer to
+    # continued pretraining than to a light format adaptation, so the old 5e-5 --
+    # sized for 6.5M tokens seen twice, where the risk was dissolving what the
+    # base model knew -- is far too timid when nothing repeats.
+    lr: float = 2e-4
+    min_lr: float = 2e-5
+    warmup_steps: int = 400  # 2% of max_steps, the convention big_cfg uses
+    # 682M train tokens = 41,611 steps per epoch at 32 x 512, so this is 48% of
+    # one pass. The old 1600 was ~2 epochs of the 25k-record valid file; here
+    # nothing repeats, so the number stopped meaning "to convergence" and started
+    # meaning "budget". Raise it until val_comp stops falling.
+    max_steps: int = 20_000
+    # 32 is where this GPU tops out: 4.07 GB peak, and 64 needs ~7.7 GB of 8.19.
+    # Going 16 -> 32 buys only ~5% throughput (105.7 -> 201.2 ms/step for twice
+    # the work), so the reason to take it is halved gradient noise, not speed.
+    batch_size: int = 32
+    # Above the ~1.25 gnorm settles at, so normal steps pass through untouched
+    # and this is an outlier guard again rather than a constant 0.8x rescale of
+    # every update -- which is what a 1.0 threshold silently was.
+    grad_clip: float = 2.0
+    eval_interval: int = 500
     eval_iters: int = 100
     seed: int = 1337
+    use_wandb: bool = True
 
 
 def load_ckpt(name: str | Path) -> GPT:
@@ -209,15 +85,27 @@ def _windows(
     block_size: int,
     rng: np.random.Generator,
 ) -> tuple[Tensor, Tensor, Tensor]:
-    """(x, y, keep) with y unmasked -- the raw form get_batch masks.
+    """(x, y, keep): a batch of windows plus a per-token completion flag.
 
-    Kept separate so eval can score masked and unmasked losses on the *same*
-    windows in one forward pass, which is the comparison this whole pipeline
-    exists to make.
+    Windows open at example starts, not at uniform offsets. A uniform offset
+    opens mid-story 99% of the time, and 37% of kept targets then have their
+    prompt outside the window -- training "continue this story" rather than
+    "follow this instruction". Aligning also puts prompts at position 0, which
+    is where they sit at inference.
+
+    `keep` is read at i+1 alongside y, not at i: position t predicts token t+1,
+    so a target is kept iff the token *being predicted* is a completion token.
+    That is the prompt_len-1 offset, expressed so it survives packing.
+
+    y comes back unmasked so eval can score masked and unmasked losses on the
+    *same* windows in one forward pass -- the comparison this pipeline exists to
+    make. train() masks it immediately.
     """
     ids, mask, starts = (packed[f"{split}_{k}"] for k in ("ids", "mask", "starts"))
-    ok = starts[starts <= len(ids) - block_size - 1]
-    ix = ok[rng.integers(len(ok), size=batch_size)]
+    # starts is sorted, so the cutoff is a binary search. The old boolean filter
+    # scanned and reallocated all 2.5M starts on every single batch.
+    n_ok = np.searchsorted(starts, len(ids) - block_size - 1, side="right")
+    ix = starts[rng.integers(n_ok, size=batch_size)]
     x = np.stack([ids[i : i + block_size] for i in ix]).astype(np.int64)
     y = np.stack([ids[i + 1 : i + 1 + block_size] for i in ix]).astype(np.int64)
     keep = np.stack([mask[i + 1 : i + 1 + block_size] for i in ix])
@@ -276,6 +164,21 @@ def train(model: GPT, packed: dict[str, np.ndarray], cfg: SFTConfig, ckpt_path: 
     eval_rng = np.random.default_rng(cfg.seed + 1)
     opt = torch.optim.AdamW(model.parameters(), lr=cfg.lr)
     best_val = float("inf")
+    torch.cuda.reset_peak_memory_stats()
+    # Run name is the checkpoint stem, so a run and the weights it produced are
+    # never ambiguous about which belongs to which.
+    wandb.init(
+        project="llm",
+        name=ckpt_path.stem,
+        config=asdict(cfg)
+        | {
+            "n_params": sum(p.numel() for p in model.parameters()),
+            "block_size": block_size,
+            "tokens_per_step": cfg.batch_size * block_size,
+        },
+        settings=wandb.Settings(silent=True),
+        mode=None if cfg.use_wandb else "disabled",
+    )
     t0 = time.perf_counter()
 
     for it in range(cfg.max_steps):
@@ -299,6 +202,12 @@ def train(model: GPT, packed: dict[str, np.ndarray], cfg: SFTConfig, ckpt_path: 
             g["lr"] = lr
         opt.step()
 
+        # Logged every step, not just at eval: the per-step loss and gnorm traces
+        # are what actually distinguish "LR too hot" from "needs more steps", and
+        # eval-interval sampling is too coarse to show it. The .item() syncs cost
+        # well under 1% of a 200 ms step.
+        log = {"train_batch_loss": loss.item(), "lr": lr, "gnorm": gnorm.item()}
+
         if it % cfg.eval_interval == 0 or it == cfg.max_steps - 1:
             m = estimate_loss(model, packed, cfg, block_size, eval_rng)
             if m["val_comp"] < best_val:
@@ -315,22 +224,42 @@ def train(model: GPT, packed: dict[str, np.ndarray], cfg: SFTConfig, ckpt_path: 
                     },
                     ckpt_path,
                 )
+            log |= m
             print(
                 f"step {it:>4} : train_comp {m['train_comp']:.3f}  "
                 f"val_comp {m['val_comp']:.3f}  val_prompt {m['val_prompt']:.3f}  "
-                f"val_all {m['val_all']:.3f}  lr {lr:.2e}  gnorm {gnorm.item():.2f}  "
+                f"val_all {m['val_all']:.3f}  lr {lr:.2e}  gnorm {log['gnorm']:.2f}  "
                 f"{time.perf_counter() - t0:.0f}s"
             )
 
+        wandb.log(log, step=it)
 
-def held_out(val_frac: float = 0.05) -> list[dict[str, str]]:
-    """The same tail slice build_or_load packs as "val", as records.
+    _finish_run(cfg, block_size, best_val, t0)
 
-    Re-parses the source file (~1s) rather than caching, because it is only
-    wanted for eyeballing generations.
+
+def _finish_run(cfg: SFTConfig, block_size: int, best_val: float, t0: float) -> None:
+    wandb.summary["best_val_comp"] = best_val
+    wandb.summary["train_time_s"] = time.perf_counter() - t0
+    wandb.summary["tokens_seen"] = cfg.max_steps * cfg.batch_size * block_size
+    wandb.summary["max_memory_allocated_gb"] = torch.cuda.max_memory_allocated() / 1e9
+    wandb.summary["max_memory_reserved_gb"] = torch.cuda.max_memory_reserved() / 1e9
+    print(
+        f"best val_comp {best_val:.4f}  "
+        f"{wandb.summary['train_time_s']:.0f}s  "
+        f"{wandb.summary['tokens_seen'] / 1e6:.0f}M tokens  "  # type: ignore
+        f"peak {wandb.summary['max_memory_allocated_gb']:.2f} GB"
+    )
+    wandb.finish()
+
+
+def held_out(n: int = 64) -> list[dict[str, str]]:
+    """The first n records of the val source file, as records.
+
+    These are genuinely unseen: val is now the dataset's own valid file, so
+    nothing here appears anywhere in the packed train stream. Streaming means
+    only n records are parsed, not the whole file.
     """
-    records = load_records()
-    return records[-int(len(records) * val_frac) :]
+    return list(islice(iter_records(source_path("valid")), n))
 
 
 @torch.no_grad()
@@ -409,8 +338,15 @@ def print_sample(model: GPT, records: list[dict[str, str]], idx=0):
 
 if __name__ == "__main__":
     run_training = 1
-    run_report_samples = 1
+    run_report_samples = 0
+    # 1 -> short A/B against the logged baseline: 2000 steps at lr 5e-5 with
+    # grad_clip 1.0 ended at train_comp 1.093 / val_comp 1.078, so the only
+    # question is whether 1.5e-4 with clip 2.0 beats that at the same step count.
+    # 0 -> the full 20k budget.
+    sanity = 1
     cfg = SFTConfig(base_ckpt="big_2026-08-16_06-45-06.pt", seed=90)
+    if sanity:
+        cfg = replace(cfg, max_steps=2000, warmup_steps=200, eval_interval=200)
     sft_ckpt = None  # None -> newest sft_*.pt; or a filename to pin one
     torch.manual_seed(cfg.seed)
     torch.cuda.manual_seed_all(cfg.seed)
@@ -423,11 +359,17 @@ if __name__ == "__main__":
         packed = build_or_load()
 
         ckpt_path = CKPT_DIR / f"{cfg.name}_{timestamp()}.pt"
-        print(f"\n=== finetuning -> {ckpt_path.name} ===")
+        print(
+            f"\n=== finetuning {cfg.max_steps} steps @ lr {cfg.lr:.1e}, "
+            f"clip {cfg.grad_clip} -> {ckpt_path.name} ==="
+        )
         train(model, packed, cfg, ckpt_path)
 
         print("\n=== after finetuning ===")
-        report_samples(model, samples)
+        # report_samples(model, samples)
+        saved_ckpt = latest_ckpt(cfg.name)
+        ckpt_model = load_ckpt(saved_ckpt)
+        report_samples(ckpt_model, samples)
     elif run_report_samples:
         model = load_ckpt(cfg.base_ckpt)
         print("\n=== base model, before finetuning ===")
@@ -436,7 +378,7 @@ if __name__ == "__main__":
         print("\n=== finetuned model ===")
         report_samples(sft_model, samples)
     else:
-        idx = 3
+        idx = 5
         model = load_ckpt(cfg.base_ckpt)
         print("\n=== base model, before finetuning ===")
         print_sample(model, samples, idx=idx)
