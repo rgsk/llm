@@ -673,6 +673,13 @@ def generate_ckpt_path(name: str):
     return CKPT_DIR / f"{name}_{timestamp()}.pt"
 
 
+def latest_ckpt(prefix: str) -> Path:
+    matches = sorted(CKPT_DIR.glob(f"{prefix}*.pt"))
+    if not matches:
+        raise FileNotFoundError(f"no checkpoint matching {prefix}*.pt in {CKPT_DIR}")
+    return matches[-1]
+
+
 def set_seed(seed: int):
     global train_rng, eval_rng
     torch.manual_seed(seed)
@@ -691,8 +698,11 @@ if __name__ == "__main__":
     print(f"use_flash: {use_flash}")
     print(f"JAXTYPING_DISABLE: {os.getenv('JAXTYPING_DISABLE')}")
     print(f"run_training: {run_training}")
+    cfg = big_cfg
+    # ckpt = CKPT_DIR / "big_2026-08-16_06-45-06.pt"
+    ckpt = None
     if run_training:
-        cfg = big_cfg
+        cfg = cfg
         set_seed(cfg.seed)
         model = GPT(cfg)
         print(f"model.cfg.name: {model.cfg.name}")
@@ -703,7 +713,8 @@ if __name__ == "__main__":
         train(model, ckpt_path)
         ckpt = ckpt_path
     else:
-        ckpt = CKPT_DIR / "big_2026-08-15_20-22-57.pt"
+        ckpt = ckpt or latest_ckpt(cfg.name)
+    print(f"loading model - {ckpt.name}")
     saved = torch.load(ckpt, map_location=device)
     # rebuild the exact architecture from the saved config, then load the weights
     reloaded = GPT(GPTConfig(**saved["config"])).to(device)
