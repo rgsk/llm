@@ -686,7 +686,7 @@ def test(model: GPT):
 
 
 if __name__ == "__main__":
-    run_training = 1
+    run_training = 0
     print(f"use_cuda: {use_cuda}")
     print(f"use_flash: {use_flash}")
     print(f"JAXTYPING_DISABLE: {os.getenv('JAXTYPING_DISABLE')}")
