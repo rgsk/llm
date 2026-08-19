@@ -158,12 +158,44 @@ def estimate_loss(
     return out
 
 
-def train(model: GPT, packed: dict[str, np.ndarray], cfg: SFTConfig, ckpt_path: Path):
+def train(
+    model: GPT,
+    packed: dict[str, np.ndarray],
+    cfg: SFTConfig,
+    ckpt_path: Path,
+    resume_from: Path | None = None,
+):
+    """resume_from: a checkpoint whose weights the caller has ALREADY loaded
+    into `model` (via load_ckpt / load_lora_ckpt); this only restores the
+    optimizer state, step counter, and best-val from the same file. Note the
+    LR schedule is computed from this cfg's warmup/max_steps -- resuming with a
+    larger max_steps reshapes the cosine rather than continuing the old one."""
     block_size = model.cfg.block_size
     train_rng = np.random.default_rng(cfg.seed)
     eval_rng = np.random.default_rng(cfg.seed + 1)
-    opt = torch.optim.AdamW(model.parameters(), lr=cfg.lr)
+    # Only params that require grad. Not a memory win -- optimizer state is
+    # allocated lazily, only for params that get grads -- but it makes the
+    # trainable set explicit and lets wandb log its true size under LoRA.
+    params = [p for p in model.parameters() if p.requires_grad]
+    opt = torch.optim.AdamW(params, lr=cfg.lr)
+    # What to checkpoint: everything when everything trains (full SFT), only
+    # the trainable keys when the model is partially frozen (LoRA) -- the
+    # frozen 98.6% is reconstructable from base_ckpt, so saving it would turn
+    # an ~800 KB adapter file into a 200 MB copy of the base.
+    trainable_keys = {n for n, p in model.named_parameters() if p.requires_grad}
+    save_all = trainable_keys == {n for n, _ in model.named_parameters()}
     best_val = float("inf")
+    start_step = 0
+    if resume_from is not None:
+        saved = torch.load(resume_from, map_location=device)
+        opt.load_state_dict(saved["opt"])
+        start_step = saved["step"] + 1
+        # so a worse-than-before eval doesn't overwrite the resumed ckpt's peer
+        best_val = saved["val_loss"]
+        print(
+            f"resuming from {resume_from.name}: step {start_step}, "
+            f"best val {best_val:.4f}"
+        )
     torch.cuda.reset_peak_memory_stats()
     # Run name is the checkpoint stem, so a run and the weights it produced are
     # never ambiguous about which belongs to which.
@@ -173,6 +205,7 @@ def train(model: GPT, packed: dict[str, np.ndarray], cfg: SFTConfig, ckpt_path: 
         config=asdict(cfg)
         | {
             "n_params": sum(p.numel() for p in model.parameters()),
+            "n_trainable": sum(p.numel() for p in params),
             "block_size": block_size,
             "tokens_per_step": cfg.batch_size * block_size,
         },
@@ -181,7 +214,7 @@ def train(model: GPT, packed: dict[str, np.ndarray], cfg: SFTConfig, ckpt_path: 
     )
     t0 = time.perf_counter()
 
-    for it in range(cfg.max_steps):
+    for it in range(start_step, cfg.max_steps):
         x, y, keep = _windows(packed, "train", cfg.batch_size, block_size, train_rng)
         y = y.masked_fill(~keep, -100)
         with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
@@ -212,9 +245,12 @@ def train(model: GPT, packed: dict[str, np.ndarray], cfg: SFTConfig, ckpt_path: 
             m = estimate_loss(model, packed, cfg, block_size, eval_rng)
             if m["val_comp"] < best_val:
                 best_val = m["val_comp"]
+                sd = model.state_dict()
                 torch.save(
                     {
-                        "model": model.state_dict(),
+                        "model": sd
+                        if save_all
+                        else {k: v for k, v in sd.items() if k in trainable_keys},
                         "opt": opt.state_dict(),
                         "config": asdict(model.cfg),
                         "sft_config": asdict(cfg),
@@ -234,13 +270,15 @@ def train(model: GPT, packed: dict[str, np.ndarray], cfg: SFTConfig, ckpt_path: 
 
         wandb.log(log, step=it)
 
-    _finish_run(cfg, block_size, best_val, t0)
+    _finish_run(cfg, block_size, best_val, t0, steps_run=cfg.max_steps - start_step)
 
 
-def _finish_run(cfg: SFTConfig, block_size: int, best_val: float, t0: float) -> None:
+def _finish_run(
+    cfg: SFTConfig, block_size: int, best_val: float, t0: float, steps_run: int
+) -> None:
     wandb.summary["best_val_comp"] = best_val
     wandb.summary["train_time_s"] = time.perf_counter() - t0
-    wandb.summary["tokens_seen"] = cfg.max_steps * cfg.batch_size * block_size
+    wandb.summary["tokens_seen"] = steps_run * cfg.batch_size * block_size
     wandb.summary["max_memory_allocated_gb"] = torch.cuda.max_memory_allocated() / 1e9
     wandb.summary["max_memory_reserved_gb"] = torch.cuda.max_memory_reserved() / 1e9
     print(
@@ -337,7 +375,7 @@ def print_sample(model: GPT, records: list[dict[str, str]], idx=0):
 
 
 if __name__ == "__main__":
-    run_training = 1
+    run_training = 0
     run_report_samples = 0
     # 1 -> short A/B against the logged baseline: 2000 steps at lr 5e-5 with
     # grad_clip 1.0 ended at train_comp 1.093 / val_comp 1.078, so the only
@@ -378,7 +416,7 @@ if __name__ == "__main__":
         print("\n=== finetuned model ===")
         report_samples(sft_model, samples)
     else:
-        idx = 5
+        idx = 9
         model = load_ckpt(cfg.base_ckpt)
         print("\n=== base model, before finetuning ===")
         print_sample(model, samples, idx=idx)
