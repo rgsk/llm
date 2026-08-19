@@ -146,6 +146,45 @@ def load_lora_ckpt(name: str | Path) -> nn.Module:
     return model
 
 
+@torch.no_grad()
+def merge_lora(model: nn.Module) -> nn.Module:
+    """Fold every adapter into its base weight (W += scale * B @ A) and put the
+    plain nn.Linear back -- zero inference overhead, and the result is a plain
+    GPT again. In-place; returns the model.
+
+    Not bit-exact vs the wrapped forward: x@(W + D).T in one matmul rounds
+    differently than x@W.T + (x@A.T)@B.T. Exact in the algebra; in fp32 the
+    gap is ~1e-6, but under TF32 (main.py sets matmul precision "high") it is
+    ~1e-2 -- TF32's 10-bit mantissa, not the merge. Behaviour (greedy argmax,
+    accuracy) survives either way; measured 100% reversal after merging."""
+    for module in model.modules():
+        for name, child in list(module.named_children()):
+            if isinstance(child, LoRALinear):
+                child.base.weight += child.scale * child.B @ child.A
+                setattr(module, name, child.base)
+    return model
+
+
+def load_adapter(model: nn.Module, name: str | Path) -> nn.Module:
+    """Hot-swap: overlay a saved adapter's A/B tensors onto an already-wrapped,
+    already-loaded model. No base rebuild, so switching behaviours is
+    milliseconds -- the "one base, many adapters" serving pattern. The saved
+    adapter must have been trained with the same r/targets (shape mismatches
+    raise); works with both adapter-only and old full-state-dict ckpts."""
+    from main import CKPT_DIR, device
+
+    path = name if isinstance(name, Path) else CKPT_DIR / name
+    saved = torch.load(path, map_location=device)
+    adapter_sd = {k: v for k, v in saved["model"].items() if k.endswith((".A", ".B"))}
+    expected = {n for n, p in model.named_parameters() if p.requires_grad}
+    assert set(adapter_sd) == expected, (
+        set(adapter_sd) ^ expected or "model has no adapters -- apply_lora first"
+    )
+    model.load_state_dict(adapter_sd, strict=False)
+    print(f"adapter <- {path.name}")
+    return model
+
+
 @dataclass(frozen=True, kw_only=True)
 class LoRAConfig(SFTConfig):
     """SFTConfig plus the adapter knobs. Inheriting means train() and wandb
@@ -285,7 +324,176 @@ def main_rev():
         print(f"l={l:>2} [{tag}] acc {acc:5.1%}   e.g. {samples[0]}")
 
 
+def build_joint(rev_frac_starts: float = 0.33) -> dict:
+    """Concatenate the instruct stream and a reverse stream into one packed
+    dict. Windows open at example starts, so the mix ratio is controlled by
+    start counts: rev examples are generated until they are rev_frac_starts of
+    all starts. Concatenated starts stay sorted, which _windows' binary search
+    requires."""
+    import numpy as np
+
+    from rev_data import build_reverse
+    from sft_data import build_or_load
+
+    sft_p = build_or_load()
+    n_sft = len(sft_p["train_starts"])
+    n_rev = int(n_sft * rev_frac_starts / (1 - rev_frac_starts))
+    rev_p = build_reverse(
+        n_train=n_rev, n_val=5_000, lmin=1, lmax=10, weights=[1.0] * 8 + [2.0, 2.0]
+    )
+    packed = {}
+    for split in ("train", "val"):
+        off = len(sft_p[f"{split}_ids"])
+        for k in ("ids", "mask"):
+            packed[f"{split}_{k}"] = np.concatenate(
+                [sft_p[f"{split}_{k}"], rev_p[f"{split}_{k}"]]
+            )
+        packed[f"{split}_starts"] = np.concatenate(
+            [sft_p[f"{split}_starts"], rev_p[f"{split}_starts"] + off]
+        )
+    return packed
+
+
+def main_joint():
+    """The stacking table's denominator: ONE rank-8 adapter trained on the
+    mixed instruct+reverse stream. If this holds ~1.11 story / ~100% reverse,
+    capacity was never the problem and post-hoc merging failed only because
+    the deltas never met during training; if it also trades off, rank 8
+    cannot hold both skills at once."""
+    from main import CKPT_DIR, latest_ckpt, timestamp
+    from rev_data import evaluate_reverse
+    from sft import held_out, load_ckpt, print_sample, train
+
+    run_training = 0
+    cfg = LoRAConfig(
+        base_ckpt="big_2026-08-16_06-45-06.pt",
+        name="joint",
+        seed=90,
+        # 3000 steps at a 67/33 window mix: ~2000 instruct-equivalent steps
+        # (the budget that reached 1.106) and ~1000 rev-equivalent (well past
+        # the ~600-step phase transition).
+        max_steps=3000,
+        warmup_steps=300,
+        eval_interval=300,
+    )
+    torch.manual_seed(cfg.seed)
+    torch.cuda.manual_seed_all(cfg.seed)
+
+    if run_training:
+        model = load_ckpt(cfg.base_ckpt)
+        apply_lora(model, cfg.r, cfg.alpha, cfg.targets)
+        packed = build_joint()
+        ckpt_path = CKPT_DIR / f"{cfg.name}_{timestamp()}.pt"
+        print(
+            f"\n=== joint adapter r={cfg.r}, {cfg.max_steps} steps "
+            f"@ lr {cfg.lr:.1e} -> {ckpt_path.name} ==="
+        )
+        train(model, packed, cfg, ckpt_path)
+        print("done -- run main_stack() for the full table incl. the joint row")
+    else:
+        joint_model = load_lora_ckpt(latest_ckpt(cfg.name))
+        print("\n=== finetuned model ===")
+        samples = held_out()
+        print("\n=== instruct task ===")
+        print_sample(joint_model, samples, idx=6)
+        print("\n=== reverse word task ===")
+
+        acc, samples = evaluate_reverse(joint_model, n=100, lmin=1, lmax=10)
+        print(f"acc {acc:5.1%}   e.g. {samples}")
+
+
+def main_stack():
+    """The 2x2 stacking table: two specialists over one base, evaluated on both
+    skills. Off-diagonal cells measure forgetting (what each adapter did to the
+    skill it wasn't trained on); the +both row asks whether two independently
+    trained deltas compose without ever having met during training. +both is
+    rev merged into the weights, instruct hot-loaded on top -- both deltas
+    active on every forward pass; any routing is implicit in the inputs."""
+    import random
+
+    import numpy as np
+
+    from main import get_batch
+    from rev_data import evaluate_reverse
+    from sft import estimate_loss, load_ckpt
+    from sft_data import build_or_load
+
+    base_ckpt = "big_2026-08-16_06-45-06.pt"
+    instruct = "lora_2026-08-19_01-55-50.pt"
+    rev = "rev110wr_2026-08-19_15-38-40.pt"
+    r, alpha = 8, 16.0
+
+    cfg = LoRAConfig(base_ckpt=base_ckpt, eval_iters=50)
+    packed = build_or_load()
+
+    @torch.no_grad()
+    def base_lm_loss(model) -> float:
+        """LM loss on the pretraining val stream -- the capability the base
+        ckpt was scored on (1.3784 at save). Movement here is what finetuning
+        did to the original skill, separate from instruct-format story loss."""
+        model.eval()
+        rng = np.random.default_rng(cfg.seed + 2)
+        losses = []
+        for _ in range(cfg.eval_iters):
+            x, y = get_batch("val", cfg.batch_size, model.cfg.block_size, rng)
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                _, loss = model(x, y)
+            losses.append(loss)
+        return torch.stack(losses).mean().item()
+
+    def story_loss(model) -> float:
+        rng = np.random.default_rng(cfg.seed + 1)  # same windows for every row
+        return estimate_loss(model, packed, cfg, model.cfg.block_size, rng)["val_comp"]
+
+    def rev_acc(model) -> float:
+        random.seed(0)  # same words for every row
+        acc, _ = evaluate_reverse(model, n=100, lmin=1, lmax=10)
+        return acc
+
+    def build(with_rev: bool, with_instruct: bool):
+        model = load_ckpt(base_ckpt)
+        if with_rev:
+            apply_lora(model, r, alpha)
+            load_adapter(model, rev)
+            merge_lora(model)
+        if with_instruct:
+            apply_lora(model, r, alpha)
+            load_adapter(model, instruct)
+        return model
+
+    def build_joint_row():
+        from main import latest_ckpt
+
+        model = load_ckpt(base_ckpt)
+        apply_lora(model, r, alpha)
+        load_adapter(model, latest_ckpt("joint"))
+        return model
+
+    rows = [
+        ("base", lambda: build(False, False)),
+        ("+instruct", lambda: build(False, True)),
+        ("+rev", lambda: build(True, False)),
+        ("+both", lambda: build(True, True)),
+        ("joint", build_joint_row),
+    ]
+    print(
+        f"\n{'model':<12} {'base val_lm':>11} {'story val_comp':>14} "
+        f"{'reverse acc':>12}"
+    )
+    for name, make in rows:
+        try:
+            model = make()
+        except FileNotFoundError:
+            continue  # no joint ckpt trained yet
+        print(
+            f"{name:<12} {base_lm_loss(model):>11.3f} "
+            f"{story_loss(model):>14.3f} {rev_acc(model):>11.0%}"
+        )
+
+
 if __name__ == "__main__":
     # test()
     # main()
-    main_rev()
+    # main_rev()
+    main_joint()
+    # main_stack()
