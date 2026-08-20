@@ -9,6 +9,7 @@ dependencies = [
     "datasets>=5.0.1",
     "einops>=0.8.2",
     "jaxtyping>=0.3.11",
+    "matplotlib>=3.11.1",
     "numpy>=2.5.2",
     "regex>=2026.7.19",
     "torch>=2.13.0",
