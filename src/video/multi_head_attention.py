@@ -2,6 +2,7 @@ import torch
 from linear import Linear
 from module import Module
 from module_list import ModuleList
+from residual_proj import ResidualProj
 from softmax import softmax
 from torch import Tensor
 
@@ -30,7 +31,7 @@ class MultiHeadAttention(Module):
         assert n_embed % n_head == 0, "n_embed must divide by n_head"
         head_size = n_embed // n_head
         self.heads = ModuleList([Head(n_embed, head_size) for _ in range(n_head)])
-        self.proj = Linear(n_embed, n_embed)
+        self.proj = ResidualProj(n_embed, n_embed)  # was Linear
 
     def forward(self, x: Tensor) -> Tensor:
         out = torch.cat([h(x) for h in self.heads], dim=-1)  # [B, T, E]

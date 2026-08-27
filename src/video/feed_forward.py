@@ -1,6 +1,7 @@
 from linear import Linear
 from module import Module
 from relu import ReLU
+from residual_proj import ResidualProj
 from sequential import Sequential
 from torch import Tensor
 
@@ -10,7 +11,7 @@ class FeedForward(Module):
         self.net = Sequential(
             Linear(n_embed, 4 * n_embed),
             ReLU(),
-            Linear(4 * n_embed, n_embed),
+            ResidualProj(4 * n_embed, n_embed),
         )
 
     def forward(self, x: Tensor) -> Tensor:

@@ -5,6 +5,7 @@ from layer_norm import LayerNorm
 from linear import Linear
 from module import Module
 from module_list import ModuleList
+from residual_proj import ResidualProj
 from torch import Tensor
 
 
@@ -18,6 +19,7 @@ class GPT(Module):
         n_layer: int,
     ):
         self.block_size = block_size
+        self.n_layer = n_layer
         self.token_embedding_table = Embedding(vocab_size, n_embed)
         self.position_embedding_table = Embedding(block_size, n_embed)
         self.blocks = ModuleList([Block(n_embed, n_head) for _ in range(n_layer)])
@@ -30,7 +32,13 @@ class GPT(Module):
     def _init_weights(self, module: Module) -> None:
         with torch.no_grad():
             if isinstance(module, Linear):
-                module.weight.normal_(mean=0.0, std=0.02)
+                std = 0.02
+                # each block adds to the residual stream twice (attn + ffwd), so
+                # over n_layer blocks the variance grows ~linearly with the number
+                # of adds. shrink each contributing projection to keep it flat.
+                if isinstance(module, ResidualProj):
+                    std *= (2 * self.n_layer) ** -0.5
+                module.weight.normal_(mean=0.0, std=std)
                 if module.bias is not None:
                     module.bias.zero_()
             elif isinstance(module, Embedding):
@@ -168,5 +176,33 @@ if __name__ == "__main__":
     with torch.no_grad():
         two.position_embedding_table.weight.zero_()
     assert (two(ctx)[:, -1] - two(shuffled)[:, -1]).abs().max() > 1e-3
+
+    # 9. ResidualProj is scaled by 1/sqrt(2*n_layer); plain Linears are not
+    exp = 0.02 * (2 * NL) ** -0.5
+    assert abs(m.blocks[0].attn.proj.weight.std().item() - exp) < 0.1 * exp
+    assert abs(m.blocks[0].ffwd.net[2].weight.std().item() - exp) < 0.1 * exp
+    assert abs(m.blocks[0].ffwd.net[0].weight.std().item() - 0.02) < 0.002
+    assert abs(m.blocks[0].attn.heads[0].query.weight.std().item() - 0.02) < 0.002
+    assert abs(m.lm_head.weight.std().item() - 0.02) < 0.002
+
+    # and the point of it: residual stream growth stops depending on depth
+    def stream_growth(n_layer):
+        torch.manual_seed(1337)
+        mm = GPT(V, BS, E, NH, n_layer)
+        ids = torch.randint(0, V, (4, 16))
+        h = mm.token_embedding_table(ids) + mm.position_embedding_table(
+            torch.arange(16)
+        )
+        start = h.std().item()
+        for b in mm.blocks:
+            h = b(h)
+        return h.std().item() / start
+
+    growths = [stream_growth(n) for n in (1, 3, 8, 24)]
+    print("stream growth at depth 1/3/8/24:", [f"{g:.2f}x" for g in growths])
+    # - stream growth at depth 1/3/8/24: ['1.38x', '1.34x', '1.40x', '1.39x']
+    # without ResidualProj:
+    # - stream growth at depth 1/3/8/24: ['1.67x', '2.39x', '4.09x', '6.93x']
+    assert max(growths) - min(growths) < 0.2  # flat in depth
 
     print("ok")
