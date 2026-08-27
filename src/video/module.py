@@ -74,6 +74,12 @@ class Module:
                 )
                 p.copy_(sd[name])
 
+    def apply(self, fn) -> "Module":
+        for child in self.children():
+            child.apply(fn)
+        fn(self)  # children first, then self -- same order as torch
+        return self
+
 
 if __name__ == "__main__":
     from torch import nn
