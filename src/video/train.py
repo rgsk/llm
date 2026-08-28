@@ -4,6 +4,7 @@ from pathlib import Path
 
 import torch
 from adamw import AdamW, decay_groups
+from checkpoint import save_checkpoint
 from clip_grad_norm import clip_grad_norm
 from cross_entropy import cross_entropy
 from evaluate import bits_per_char, estimate_loss, full_loss
@@ -64,16 +65,7 @@ def train(
         )
         if va < best_val and ckpt_path is not None:
             best_val = va
-            torch.save(
-                {
-                    "model": model.state_dict(),
-                    "config": asdict(gpt_cfg),
-                    "step": it,
-                    "val_loss": va,
-                    "bpc": bpc,
-                },
-                ckpt_path,
-            )
+            save_checkpoint(ckpt_path, model, gpt_cfg, step=it, val_loss=va, bpc=bpc)
 
     for it in range(cfg.max_steps):
         lr = get_lr(

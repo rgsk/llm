@@ -67,11 +67,18 @@ class Module:
         own = dict(self.named_parameters(remove_duplicate=False))
         assert not (missing := own.keys() - sd.keys()), f"missing: {sorted(missing)}"
         assert not (extra := sd.keys() - own.keys()), f"unexpected: {sorted(extra)}"
+        seen: dict[int, str] = {}  # a tied Parameter arrives under several names
         with torch.no_grad():
             for name, p in own.items():
                 assert p.shape == sd[name].shape, (
                     f"{name}: have {tuple(p.shape)}, got {tuple(sd[name].shape)}"
                 )
+                # this model ties them, so one copy_ overwrites the other -- a
+                # checkpoint that disagrees would be half-discarded in silence
+                if (first := seen.setdefault(id(p), name)) != name:
+                    assert torch.equal(sd[first], sd[name]), (
+                        f"{first} and {name} are tied here but differ in the checkpoint"
+                    )
                 p.copy_(sd[name])
 
     def apply(self, fn) -> "Module":
@@ -82,6 +89,9 @@ class Module:
 
 
 if __name__ == "__main__":
+    import tempfile
+    from pathlib import Path
+
     from torch import nn
 
     class MyLin(Module):
@@ -181,10 +191,12 @@ if __name__ == "__main__":
     ref.load_state_dict(Net().state_dict())
 
     # round-trip through disk
-    torch.save(net.state_dict(), "temp/sd.pt")
-    fresh = Net()
-    fresh.load_state_dict(torch.load("temp/sd.pt"))
-    # assert (fresh(x) - out_m).abs().max() == 0
+    with tempfile.TemporaryDirectory() as d:
+        path = Path(d) / "sd.pt"
+        torch.save(net.state_dict(), path)
+        fresh = Net()
+        fresh.load_state_dict(torch.load(path))
+        assert (fresh(x) - out_m).abs().max() == 0
 
     # tied: deduped in named_parameters, both names in state_dict
     class Tied(Module):
@@ -205,6 +217,15 @@ if __name__ == "__main__":
     assert t.state_dict().keys() == rt.state_dict().keys()
     t.load_state_dict(rt.state_dict())
     assert t.a.w is t.b.w  # still one object after loading
+
+    # a checkpoint whose two tied names disagree cannot be half-loaded in silence
+    conflict = rt.state_dict()
+    conflict["b.w"] = torch.zeros_like(conflict["b.w"])
+    try:
+        t.load_state_dict(conflict)
+        raise SystemExit("should have failed")
+    except AssertionError as e:
+        assert "tied here but differ" in str(e)
 
     # bad loads are caught
     try:
