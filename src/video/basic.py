@@ -6,13 +6,13 @@ from dataclasses import asdict
 
 import torch
 from checkpoint import generate_ckpt_path, latest_ckpt, load_checkpoint
-from dataset import BinDataset, meta
+from dataset import BinDataset
 from generate import generate
 from gpt import GPT
-from gpt_config import GPTConfig
+from gpt_config import big_cfg, small_cfg  # noqa: F401
 from paths import ROOT
 from train import train
-from train_config import TrainConfig
+from train_config import big_train, small_train  # noqa: F401
 
 sys.path.append(str(ROOT / "src"))  # BPE is its own topic -- reuse the tokenizer
 from tokenizer import BPETokenizer
@@ -22,25 +22,30 @@ tok = BPETokenizer.load(str(ROOT / "artifacts" / "tokenizer" / "bpe_ts_4096.json
 # TF32 tensor cores for fp32 matmuls: ~1.26x on this model, measured.
 torch.set_float32_matmul_precision("high")
 
-gpt_cfg = GPTConfig(
-    vocab_size=meta["vocab_size"],
-    block_size=128,
-    n_embed=192,
-    n_head=6,
-    n_layer=4,
-    attention="sdpa",
-)
-train_cfg = TrainConfig(
-    batch_size=32,
-    max_steps=1500,
-    lr=1e-3,
-    min_lr=1e-4,
-    warmup_steps=100,
-    eval_interval=250,
-    eval_iters=50,
-    name="scratch",
-    use_compile=True,
-)
+# gpt_cfg = GPTConfig(
+#     vocab_size=meta["vocab_size"],
+#     block_size=128,
+#     n_embed=192,
+#     n_head=6,
+#     n_layer=4,
+#     attention="sdpa",
+# )
+
+gpt_cfg = big_cfg
+
+# train_cfg = TrainConfig(
+#     batch_size=32,
+#     max_steps=1500,
+#     lr=1e-3,
+#     min_lr=1e-4,
+#     warmup_steps=100,
+#     eval_interval=250,
+#     eval_iters=50,
+#     name="scratch",
+#     use_compile=True,
+# )
+
+train_cfg = big_train
 
 
 def sample(model: GPT, prompt: str = "\n", max_new_tokens: int = 300, **kw) -> str:
@@ -79,7 +84,7 @@ if __name__ == "__main__":
     # always sample from the file, never the in-memory model: if the checkpoint
     # is wrong, this is where it shows
     print(f"\nloading {ckpt.name}")
-    model, m = load_checkpoint(ckpt, device, attention="fused")
+    model, m = load_checkpoint(ckpt, device)
     print(f"best step {m['step']}   val {m['val_loss']:.4f}   bpc {m['bpc']:.3f}")
 
     print("\n--- greedy ---")

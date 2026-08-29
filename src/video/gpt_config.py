@@ -28,7 +28,17 @@ class GPTConfig:
 
 
 small_cfg = GPTConfig(vocab_size=4096, block_size=32, n_embed=64, n_head=4, n_layer=3)
-big_cfg = GPTConfig(vocab_size=4096, block_size=512, n_embed=512, n_head=8, n_layer=8)
+
+big_cfg = GPTConfig(
+    vocab_size=4096,
+    block_size=512,
+    n_embed=512,
+    n_head=8,
+    n_layer=8,
+    attention="sdpa",
+    norm="rms",
+    ffn="gated",
+)
 
 
 if __name__ == "__main__":
@@ -73,7 +83,8 @@ if __name__ == "__main__":
         "use_wandb": True,
     }
     cfg = GPTConfig.from_dict(saved)
-    assert cfg == replace(big_cfg, norm="rms", ffn="gated")
+    assert "attention" not in saved
+    assert cfg == replace(big_cfg, attention="mha")
 
     try:
         GPTConfig(**saved)

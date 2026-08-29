@@ -31,7 +31,8 @@ small_train = TrainConfig(
 )
 
 big_train = TrainConfig(
-    batch_size=64,
+    batch_size=32,
+    grad_accum_steps=2,
     max_steps=20000,
     lr=3e-4,
     min_lr=3e-5,
