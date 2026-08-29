@@ -7,13 +7,12 @@ from adamw import AdamW, decay_groups
 from checkpoint import save_checkpoint
 from clip_grad_norm import clip_grad_norm
 from cross_entropy import cross_entropy
+from dataset import BinDataset, get_batch, meta
 from evaluate import bits_per_char, estimate_loss, full_loss
 from gpt import GPT
 from gpt_config import GPTConfig
 from lr_schedule import get_lr
 from train_config import TrainConfig
-
-from data import BinDataset, get_batch, meta
 
 
 def train(

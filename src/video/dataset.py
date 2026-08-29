@@ -1,11 +1,25 @@
 import json
 import mmap
+from typing import TypedDict
 
 import torch
 from paths import DATA_DIR
 from torch import Tensor
 
-meta = json.loads((DATA_DIR / "meta.json").read_text())
+
+class SplitMeta(TypedDict):
+    n_chars: int
+    n_tokens: int
+    chars_per_token: float
+
+
+class Meta(TypedDict):
+    vocab_size: int
+    train: SplitMeta
+    val: SplitMeta
+
+
+meta: Meta = json.loads((DATA_DIR / "meta.json").read_text())
 
 
 class BinDataset:

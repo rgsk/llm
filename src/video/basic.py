@@ -6,14 +6,13 @@ from dataclasses import asdict
 
 import torch
 from checkpoint import generate_ckpt_path, latest_ckpt, load_checkpoint
+from dataset import BinDataset, meta
 from generate import generate
 from gpt import GPT
 from gpt_config import GPTConfig
 from paths import ROOT
 from train import train
 from train_config import TrainConfig
-
-from data import BinDataset, meta
 
 sys.path.append(str(ROOT / "src"))  # BPE is its own topic -- reuse the tokenizer
 from tokenizer import BPETokenizer

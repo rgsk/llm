@@ -2,9 +2,8 @@ import math
 
 import torch
 from cross_entropy import cross_entropy
+from dataset import BinDataset, get_batch, meta
 from gpt import GPT
-
-from data import BinDataset, get_batch, meta
 
 
 @torch.no_grad()
