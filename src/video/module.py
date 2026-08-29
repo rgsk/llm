@@ -1,6 +1,7 @@
 from collections.abc import Iterator
 
 import torch
+from buffer import Buffer
 from parameter import Parameter
 from torch import Tensor
 
@@ -19,23 +20,37 @@ class Module:
             if isinstance(v, Module):
                 yield v
 
-    def _walk(self, prefix: str = "") -> Iterator[tuple[str, Parameter]]:
+    def _walk(self, kind: type, prefix: str = "") -> Iterator[tuple[str, Tensor]]:
+        """Every attribute of type `kind`, with torch-style dotted names."""
         for name, v in self.__dict__.items():
             path = f"{prefix}{name}"
-            if isinstance(v, Parameter):
+            if isinstance(v, kind):
                 yield path, v
             elif isinstance(v, Module):
-                yield from v._walk(f"{path}.")
+                yield from v._walk(kind, f"{path}.")
 
-    def named_parameters(
-        self, prefix: str = "", remove_duplicate: bool = True
-    ) -> Iterator[tuple[str, Parameter]]:
+    def _named(self, kind, prefix="", remove_duplicate=True):
         seen: set[int] = set()
-        for path, p in self._walk(prefix):
-            if remove_duplicate and id(p) in seen:
-                continue  # a tied weight is reachable under two names
-            seen.add(id(p))
-            yield path, p
+        for path, v in self._walk(kind, prefix):
+            if remove_duplicate and id(v) in seen:
+                continue
+            seen.add(id(v))
+            yield path, v
+
+    def named_buffers(self, prefix="", remove_duplicate=True):
+        yield from self._named(Buffer, prefix, remove_duplicate)
+
+    def buffers(self) -> Iterator[Buffer]:
+        for _, b in self.named_buffers():
+            yield b
+
+    def register_buffer(self, name: str, tensor: Tensor, persistent: bool = True):
+        """State that travels with the module but is never trained. persistent=False
+        keeps it out of state_dict -- right for anything __init__ can rebuild."""
+        setattr(self, name, Buffer(tensor, persistent))
+
+    def named_parameters(self, prefix="", remove_duplicate=True):
+        yield from self._named(Parameter, prefix, remove_duplicate)
 
     def parameters(self) -> Iterator[Parameter]:
         for _, p in self.named_parameters():
@@ -53,6 +68,13 @@ class Module:
     def to(self, *args, **kwargs) -> "Module":
         for p in self.parameters():
             p.data = p.data.to(*args, **kwargs)  # rebind in place: ties survive
+
+        for b in self.buffers():
+            # a dtype change must not touch a bool mask, or masked_fill breaks --
+            # but a device move applies to everything. Same rule torch uses.
+            moved = b.data.to(*args, **kwargs)
+            b.data = moved if b.data.is_floating_point() else b.data.to(moved.device)
+
         return self
 
     def zero_grad(self) -> None:
@@ -61,10 +83,25 @@ class Module:
 
     def state_dict(self) -> dict[str, Tensor]:
         # every name, including both halves of a tied pair -- matches torch
-        return {n: p.data for n, p in self.named_parameters(remove_duplicate=False)}
+        sd = {n: p.data for n, p in self.named_parameters(remove_duplicate=False)}
+        sd.update(
+            {
+                n: b.data
+                for n, b in self.named_buffers(remove_duplicate=False)
+                if b.persistent
+            }
+        )
+        return sd
 
     def load_state_dict(self, sd: dict[str, Tensor]) -> None:
         own = dict(self.named_parameters(remove_duplicate=False))
+        own.update(
+            {
+                n: b
+                for n, b in self.named_buffers(remove_duplicate=False)
+                if b.persistent
+            }
+        )
         assert not (missing := own.keys() - sd.keys()), f"missing: {sorted(missing)}"
         assert not (extra := sd.keys() - own.keys()), f"unexpected: {sorted(extra)}"
         seen: dict[int, str] = {}  # a tied Parameter arrives under several names
@@ -259,5 +296,61 @@ if __name__ == "__main__":
     untied = Two(tie=False)
     untied.load_state_dict(Two(tie=True).state_dict())
     assert untied.a.w.data_ptr() != untied.c.w.data_ptr()
+
+    # ---- buffers ----
+    class WithBuf(Module):
+        def __init__(self):
+            self.lin = MyLin(4, 4)
+            self.register_buffer("tril", torch.ones(4, 4, dtype=torch.bool).tril())
+            self.register_buffer("running", torch.zeros(4))
+            self.register_buffer("scratch", torch.zeros(4), persistent=False)
+
+        def forward(self, x):
+            return self.lin(x).masked_fill(~self.tril, 0.0) + self.running
+
+    class RefBuf(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.lin = RefLin(4, 4)
+            self.register_buffer("tril", torch.ones(4, 4, dtype=torch.bool).tril())
+            self.register_buffer("running", torch.zeros(4))
+            self.register_buffer("scratch", torch.zeros(4), persistent=False)
+
+    wb, rb = WithBuf(), RefBuf()
+
+    # buffers are state, not parameters: the optimizer never sees them
+    assert [n for n, _ in wb.named_parameters()] == ["lin.w", "lin.b"]
+    assert [n for n, _ in wb.named_buffers()] == ["tril", "running", "scratch"]
+    assert all(not b.requires_grad for b in wb.buffers())
+
+    # ... but they ARE in state_dict, except the non-persistent one -- same as torch
+    assert wb.state_dict().keys() == rb.state_dict().keys()
+    assert "scratch" not in wb.state_dict()
+    assert "tril" in wb.state_dict() and "running" in wb.state_dict()
+
+    # a checkpoint round trip carries them
+    wb2 = WithBuf()
+    with torch.no_grad():
+        wb.running.fill_(7.0)
+    wb2.load_state_dict(wb.state_dict())
+    assert (wb2.running == 7.0).all()
+
+    # .to(dtype) must NOT cast a bool mask, or masked_fill stops working;
+    # .to(device) moves everything. torch does exactly this
+    wb.to(torch.float64)
+    rb.to(torch.float64)
+    assert wb.tril.dtype == rb.tril.dtype == torch.bool
+    assert wb.running.dtype == rb.running.dtype == torch.float64
+    assert wb.lin.w.dtype == torch.float64
+    assert wb(torch.randn(4, 4, dtype=torch.float64)).shape == (4, 4)
+
+    # a non-persistent buffer still moves and still works -- it is just not saved
+    assert wb.scratch.dtype == torch.float64
+
+    # buffers take no gradient even when they take part in the forward
+    wb.to(torch.float32)
+    out = wb(torch.randn(4, 4))
+    out.sum().backward()
+    assert all(b.grad is None for b in wb.buffers())
 
     print("ok")

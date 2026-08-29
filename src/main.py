@@ -177,7 +177,9 @@ class CausalSelfAttention(nn.Module):
         self.qkv = nn.Linear(cfg.n_embed, 3 * cfg.n_embed, bias=False)
         self.proj = ResidualProj(cfg.n_embed, cfg.n_embed)
         self.register_buffer(
-            "tril", torch.tril(torch.ones(cfg.block_size, cfg.block_size))
+            "tril",
+            torch.tril(torch.ones(cfg.block_size, cfg.block_size)),
+            persistent=False,
         )
         self.attn_dropout = nn.Dropout(cfg.dropout)
         self.resid_dropout = nn.Dropout(cfg.dropout)

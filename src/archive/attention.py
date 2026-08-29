@@ -15,7 +15,11 @@ class Head(nn.Module):
         self.key = nn.Linear(n_embed, head_size, bias=False)
         self.query = nn.Linear(n_embed, head_size, bias=False)
         self.value = nn.Linear(n_embed, head_size, bias=False)
-        self.register_buffer("tril", torch.tril(torch.ones(block_size, block_size)))
+        self.register_buffer(
+            "tril",
+            torch.tril(torch.ones(block_size, block_size)),
+            persistent=False,
+        )
         self.dropout = nn.Dropout(dropout)
 
     @jaxtyped(typechecker=beartype)
@@ -62,7 +66,11 @@ class CausalSelfAttention(nn.Module):
         self.head_size = n_embed // n_head
         self.qkv = nn.Linear(n_embed, 3 * n_embed, bias=False)
         self.proj = nn.Linear(n_embed, n_embed)
-        self.register_buffer("tril", torch.tril(torch.ones(block_size, block_size)))
+        self.register_buffer(
+            "tril",
+            torch.tril(torch.ones(block_size, block_size)),
+            persistent=False,
+        )
         self.attn_dropout = nn.Dropout(dropout)
         self.resid_dropout = nn.Dropout(dropout)
 
@@ -126,7 +134,11 @@ class CausalSelfAttentionKV(nn.Module):
         self.head_size = n_embed // n_head
         self.qkv = nn.Linear(n_embed, 3 * n_embed, bias=False)
         self.proj = nn.Linear(n_embed, n_embed)
-        self.register_buffer("tril", torch.tril(torch.ones(block_size, block_size)))
+        self.register_buffer(
+            "tril",
+            torch.tril(torch.ones(block_size, block_size)),
+            persistent=False,
+        )
         self.attn_dropout = nn.Dropout(dropout)
         self.resid_dropout = nn.Dropout(dropout)
 
