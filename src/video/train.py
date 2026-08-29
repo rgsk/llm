@@ -79,13 +79,14 @@ def train(
         if it % cfg.eval_interval == 0:
             evaluate(it, lr)  # model state after exactly `it` updates
 
-        x, y = get_batch(train_ds, cfg.batch_size, T, train_gen)
-        x, y = x.to(device), y.to(device)
-
         opt.zero_grad()
-        logits = model(x)
-        loss = cross_entropy(logits.reshape(-1, V), y.reshape(-1))
-        loss.backward()
+        for _ in range(cfg.grad_accum_steps):
+            x, y = get_batch(train_ds, cfg.batch_size, T, train_gen)
+            x, y = x.to(device), y.to(device)
+            logits = model(x)
+            loss = cross_entropy(logits.reshape(-1, V), y.reshape(-1))
+            loss = loss / cfg.grad_accum_steps
+            loss.backward()
         gnorm = clip_grad_norm(model.parameters(), grad_clip)
         opt.step()
 

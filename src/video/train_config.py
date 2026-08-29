@@ -12,6 +12,7 @@ class TrainConfig:
     warmup_steps: int  # ~2% of max_steps
     eval_interval: int
     eval_iters: int
+    grad_accum_steps: int = 1
     seed: int = 1337
     name: str = "video"
 
