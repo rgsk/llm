@@ -66,6 +66,8 @@ if __name__ == "__main__":
     print(f"device {device}   run_training {run_training}")
 
     if run_training:
+        print(gpt_cfg)
+        print(train_cfg)
         torch.manual_seed(train_cfg.seed)
         model = GPT(**asdict(gpt_cfg)).to(device)
         n_params = sum(p.numel() for p in model.parameters())
