@@ -22,12 +22,19 @@ class FusedQKVAttention(Module):
     one the checkpoints on disk assume.
     """
 
-    def __init__(self, n_embed: int, n_head: int, dropout: float = 0.0):
+    def __init__(
+        self, n_embed: int, n_head: int, block_size: int, dropout: float = 0.0
+    ):
         assert n_embed % n_head == 0, "n_embed must divide by n_head"
         self.n_head = n_head
         self.head_size = n_embed // n_head
         self.qkv = Linear(n_embed, 3 * n_embed, bias=False)
         self.proj = ResidualProj(n_embed, n_embed)
+        self.register_buffer(
+            "tril",
+            torch.ones(block_size, block_size, dtype=torch.bool).tril(),
+            persistent=False,
+        )
         self.attn_dropout = Dropout(dropout)
         self.resid_dropout = Dropout(dropout)
 
@@ -44,8 +51,7 @@ class FusedQKVAttention(Module):
         v = v.view(B, T, nh, hs).transpose(1, 2)
 
         scores = q @ k.transpose(-2, -1) * hs**-0.5  # [B, nh, T, T]
-        causal = torch.ones(T, T, dtype=torch.bool, device=x.device).tril()
-        scores = scores.masked_fill(~causal, float("-inf"))
+        scores = scores.masked_fill(~self.tril[:T, :T], float("-inf"))
         w = softmax(scores, dim=-1)
         w = self.attn_dropout(w)
         out = w @ v  # [B, nh, T, hs]
@@ -64,11 +70,11 @@ if __name__ == "__main__":
     B, T, E, NH = 2, 8, 32, 4
     HS = E // NH
     x = torch.randn(B, T, E)
-    fused = FusedQKVAttention(E, NH)
+    fused = FusedQKVAttention(E, NH, T)
 
     # 1. same shape and same parameter count as the unfused version -- fusing
     #    rearranges weights, it does not add or remove any
-    mha = MultiHeadAttention(E, NH)
+    mha = MultiHeadAttention(E, NH, T)
     assert fused(x).shape == (B, T, E)
     n_fused = sum(p.numel() for p in fused.parameters())
     n_mha = sum(p.numel() for p in mha.parameters())
@@ -94,6 +100,21 @@ if __name__ == "__main__":
         fused.proj.bias.copy_(mha.proj.bias)
     print("fused vs unfused:", (fused(x) - mha(x)).abs().max().item())
     assert (fused(x) - mha(x)).abs().max() < 1e-6
+
+    # 3. the causal mask is state, not a parameter -- and not a checkpoint key
+    assert [n for n, _ in fused.named_buffers()] == ["tril"]
+    assert [n for n, _ in fused.named_parameters()] == [
+        "qkv.weight",
+        "proj.weight",
+        "proj.bias",
+    ]
+    assert "tril" not in fused.state_dict()  # persistent=False
+    assert fused.tril.dtype == torch.bool and not fused.tril.requires_grad
+    assert fused.tril.shape == (T, T)
+    # one mask serves every length up to block_size -- forward just slices it
+    assert fused(x[:, :3]).shape == (B, 3, E)
+    # and .to() moves it without casting it, so masked_fill still works
+    assert FusedQKVAttention(E, NH, T).to(torch.float64)(x.double()).shape == (B, T, E)
 
     # 4. ... and the gradients agree, so it is a drop-in replacement
     xf = x.clone().requires_grad_(True)
@@ -126,7 +147,7 @@ if __name__ == "__main__":
 
     # 8. heads still do not mix before proj: zeroing head 0's value rows blanks
     #    exactly the first hs columns of the concatenated output, nothing else
-    probe = FusedQKVAttention(E, NH)
+    probe = FusedQKVAttention(E, NH, T)
     with torch.no_grad():
         probe.proj.weight.copy_(torch.eye(E))
         probe.proj.bias.zero_()
@@ -174,8 +195,8 @@ if __name__ == "__main__":
     Eb, NHb, Tb = 512, 8, 256
     xb = torch.randn(8, Tb, Eb, device=dev)
     big = {
-        "unfused": MultiHeadAttention(Eb, NHb).to(dev),
-        "fused": FusedQKVAttention(Eb, NHb).to(dev),
+        "unfused": MultiHeadAttention(Eb, NHb, Tb).to(dev),
+        "fused": FusedQKVAttention(Eb, NHb, Tb).to(dev),
     }
     t = {}
     for name, f in big.items():

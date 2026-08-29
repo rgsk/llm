@@ -24,7 +24,7 @@ class GPT(Module):
         self.token_embedding_table = Embedding(vocab_size, n_embed)
         self.position_embedding_table = Embedding(block_size, n_embed)
         self.blocks = ModuleList(
-            [Block(n_embed, n_head, dropout) for _ in range(n_layer)]
+            [Block(n_embed, n_head, block_size, dropout) for _ in range(n_layer)]
         )
         self.ln_f = LayerNorm(n_embed)
         self.lm_head = Linear(n_embed, vocab_size, bias=False)

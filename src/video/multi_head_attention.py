@@ -9,11 +9,18 @@ from torch import Tensor
 
 
 class Head(Module):
-    def __init__(self, n_embed: int, head_size: int, dropout: float = 0.0):
+    def __init__(
+        self, n_embed: int, head_size: int, block_size: int, dropout: float = 0.0
+    ):
         self.head_size = head_size
         self.query = Linear(n_embed, head_size, bias=False)
         self.key = Linear(n_embed, head_size, bias=False)
         self.value = Linear(n_embed, head_size, bias=False)
+        self.register_buffer(
+            "tril",
+            torch.ones(block_size, block_size, dtype=torch.bool).tril(),
+            persistent=False,
+        )
         self.attn_dropout = Dropout(dropout)
 
     def forward(self, x: Tensor) -> Tensor:
@@ -22,19 +29,20 @@ class Head(Module):
         k = self.key(x)  # [B, T, hs]
         v = self.value(x)  # [B, T, hs]
         scores = q @ k.transpose(-2, -1) * self.head_size**-0.5  # [B, T, T]
-        causal = torch.ones(T, T, dtype=torch.bool, device=x.device).tril()
-        scores = scores.masked_fill(~causal, float("-inf"))
+        scores = scores.masked_fill(~self.tril[:T, :T], float("-inf"))
         w = softmax(scores, dim=-1)  # [B, T, T]
         w = self.attn_dropout(w)  # drop whole connections, not activations
         return w @ v  # [B, T, hs]
 
 
 class MultiHeadAttention(Module):
-    def __init__(self, n_embed: int, n_head: int, dropout: float = 0.0):
+    def __init__(
+        self, n_embed: int, n_head: int, block_size: int, dropout: float = 0.0
+    ):
         assert n_embed % n_head == 0, "n_embed must divide by n_head"
         head_size = n_embed // n_head
         self.heads = ModuleList(
-            [Head(n_embed, head_size, dropout) for _ in range(n_head)]
+            [Head(n_embed, head_size, block_size, dropout) for _ in range(n_head)]
         )
         self.proj = ResidualProj(n_embed, n_embed)  # was Linear
         self.resid_dropout = Dropout(dropout)
@@ -53,14 +61,14 @@ if __name__ == "__main__":
     x = torch.randn(B, T, E)
 
     # 1. one head == F.scaled_dot_product_attention(is_causal=True) on the same q,k,v
-    h = Head(E, HS)
+    h = Head(E, HS, T)
     q, k, v = h.query(x), h.key(x), h.value(x)
     assert (
         h(x) - F.scaled_dot_product_attention(q, k, v, is_causal=True)
     ).abs().max() < 1e-6
 
     # 2. shapes and param names
-    mha = MultiHeadAttention(E, NH)
+    mha = MultiHeadAttention(E, NH, T)
     assert mha(x).shape == (B, T, E)
     names = [n for n, _ in mha.named_parameters()]
     assert names[:3] == [
@@ -70,6 +78,15 @@ if __name__ == "__main__":
     ]
     assert names[-2:] == ["proj.weight", "proj.bias"]
     assert sum(p.numel() for p in mha.parameters()) == 3 * E * E + E * E + E
+
+    # 2. every head carries its own copy of the same mask -- the same
+    #    duplication as the per-head Linears, and none of it is saved
+    mha_b = MultiHeadAttention(E, NH, T)
+    assert [n for n, _ in mha_b.named_buffers()] == [
+        f"heads.{i}.tril" for i in range(NH)
+    ]
+    assert mha_b.state_dict().keys() == {n for n, _ in mha_b.named_parameters()}
+    assert all(torch.equal(b, mha_b.heads[0].tril) for b in mha_b.buffers())
 
     # 3. causality: perturbing token t cannot change outputs before t
     out = mha(x)

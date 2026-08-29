@@ -65,7 +65,7 @@ if __name__ == "__main__":
     torch.manual_seed(0)
     B, T, E, NH = 2, 8, 32, 4
     x = torch.randn(B, T, E)
-    sdpa, fused = SDPAttention(E, NH), FusedQKVAttention(E, NH)
+    sdpa, fused = SDPAttention(E, NH), FusedQKVAttention(E, NH, T)
 
     # 1. a drop-in replacement: same parameters, same names, same shapes
     assert sdpa.state_dict().keys() == fused.state_dict().keys()
@@ -120,7 +120,7 @@ if __name__ == "__main__":
         xb = torch.randn(4, Tb, 512, device="cuda")
         peak = {}
         for name, m in (
-            ("fused", FusedQKVAttention(512, 8).to("cuda")),
+            ("fused", FusedQKVAttention(512, 8, Tb).to("cuda")),
             ("sdpa", SDPAttention(512, 8).to("cuda")),
         ):
             m(xb)  # warm up allocator
@@ -143,7 +143,7 @@ if __name__ == "__main__":
     xb = torch.randn(4, 1024, 512, device="cuda")
     t = {}
     for name, m in (
-        ("fused", FusedQKVAttention(512, 8).to("cuda")),
+        ("fused", FusedQKVAttention(512, 8, Tb).to("cuda")),
         ("sdpa", SDPAttention(512, 8).to("cuda")),
     ):
         for _ in range(3):

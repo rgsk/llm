@@ -6,10 +6,12 @@ from torch import Tensor
 
 
 class Block(Module):
-    def __init__(self, n_embed: int, n_head: int, dropout: float = 0.0):
+    def __init__(
+        self, n_embed: int, n_head: int, block_size: int, dropout: float = 0.0
+    ):
         self.ln1 = LayerNorm(n_embed)
         self.ln2 = LayerNorm(n_embed)
-        self.attn = MultiHeadAttention(n_embed, n_head, dropout)
+        self.attn = MultiHeadAttention(n_embed, n_head, block_size, dropout)
         self.ffwd = FeedForward(n_embed, dropout)
 
     def forward(self, x: Tensor) -> Tensor:
@@ -23,7 +25,7 @@ if __name__ == "__main__":
 
     B, T, E, NH = 2, 8, 32, 4
     x = torch.randn(B, T, E)
-    blk = Block(E, NH)
+    blk = Block(E, NH, T)
 
     # 1. shape preserved -- blocks are stackable
     assert blk(x).shape == (B, T, E)
@@ -50,7 +52,7 @@ if __name__ == "__main__":
     print("zeroed sublayers -> block is exactly identity")
 
     # 4. causality survives the block
-    blk = Block(E, NH)
+    blk = Block(E, NH, T)
     out = blk(x)
     for t in range(1, T):
         x2 = x.clone()
