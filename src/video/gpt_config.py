@@ -1,5 +1,7 @@
 from dataclasses import dataclass, fields
 
+from block import FFN, Attention, Norm
+
 
 @dataclass(frozen=True, kw_only=True)
 class GPTConfig:
@@ -11,6 +13,9 @@ class GPTConfig:
     n_head: int  # nh
     n_layer: int
     dropout: float = 0.0  # 0 disables it entirely; 0.1-0.2 for a model that overfits
+    attention: Attention = "mha"  # "fused" and "sdpa" share one set of keys
+    norm: Norm = "layer"
+    ffn: FFN = "dense"
 
     def __post_init__(self):
         assert self.n_embed % self.n_head == 0, "n_embed must divide by n_head"
@@ -67,7 +72,9 @@ if __name__ == "__main__":
         "activation": "silu",
         "use_wandb": True,
     }
-    assert GPTConfig.from_dict(saved) == big_cfg
+    cfg = GPTConfig.from_dict(saved)
+    assert cfg == replace(big_cfg, norm="rms", ffn="gated")
+
     try:
         GPTConfig(**saved)
         raise SystemExit("should have failed")

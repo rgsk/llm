@@ -1,4 +1,4 @@
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from datetime import datetime
 from pathlib import Path
 
@@ -36,11 +36,15 @@ def save_checkpoint(path: Path, model: GPT, cfg: GPTConfig, **meta) -> None:
     torch.save({"model": model.state_dict(), "config": asdict(cfg), **meta}, path)
 
 
-def load_checkpoint(path: Path, device: str = "cpu") -> tuple[GPT, dict]:
+def load_checkpoint(path: Path, device: str = "cpu", **overrides) -> tuple[GPT, dict]:
     """Rebuild the exact architecture from the saved config, then fill in the weights.
-    The caller does not need to know the shape in advance -- the file says it."""
+    The caller does not need to know the shape in advance -- the file says it.
+
+    overrides patch the config before the model is built. main.py chose its
+    attention from a module-level flag and never wrote it down, so its
+    checkpoints need attention="fused" supplied by hand."""
     saved = torch.load(path, map_location=device)
-    cfg = GPTConfig.from_dict(saved["config"])
+    cfg = replace(GPTConfig.from_dict(saved["config"]), **overrides)
     model = GPT(**asdict(cfg)).to(device)
     model.load_state_dict(saved["model"])
     return model, {k: v for k, v in saved.items() if k != "model"}

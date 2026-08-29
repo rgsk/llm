@@ -1,7 +1,6 @@
 import torch
-from block import Block
+from block import FFN, Attention, Block, Norm, make_norm
 from embedding import Embedding
-from layer_norm import LayerNorm
 from linear import Linear
 from module import Module
 from module_list import ModuleList
@@ -18,15 +17,21 @@ class GPT(Module):
         n_head: int,
         n_layer: int,
         dropout: float = 0.0,
+        attention: Attention = "mha",
+        norm: Norm = "layer",
+        ffn: FFN = "dense",
     ):
         self.block_size = block_size
         self.n_layer = n_layer
         self.token_embedding_table = Embedding(vocab_size, n_embed)
         self.position_embedding_table = Embedding(block_size, n_embed)
         self.blocks = ModuleList(
-            [Block(n_embed, n_head, block_size, dropout) for _ in range(n_layer)]
+            [
+                Block(n_embed, n_head, block_size, dropout, attention, norm, ffn)
+                for _ in range(n_layer)
+            ]
         )
-        self.ln_f = LayerNorm(n_embed)
+        self.ln_f = make_norm(norm, n_embed)
         self.lm_head = Linear(n_embed, vocab_size, bias=False)
 
         self.apply(self._init_weights)

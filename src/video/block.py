@@ -1,18 +1,72 @@
+from typing import Literal
+
 from feed_forward import FeedForward
+from fused_qkv_attention import FusedQKVAttention
+from gated_feed_forward import GatedFeedForward
 from layer_norm import LayerNorm
 from module import Module
 from multi_head_attention import MultiHeadAttention
+from rms_norm import RMSNorm
+from sdpa_attention import SDPAttention
 from torch import Tensor
+
+Attention = Literal["mha", "fused", "sdpa"]
+Norm = Literal["layer", "rms"]
+FFN = Literal["dense", "gated"]
+
+
+def make_attention(
+    kind: Attention, n_embed: int, n_head: int, block_size: int, dropout: float
+) -> Module:
+    """All three write the same residual stream; only "mha" has different keys."""
+    match kind:
+        case "mha":
+            return MultiHeadAttention(n_embed, n_head, block_size, dropout)
+        case "fused":
+            return FusedQKVAttention(n_embed, n_head, block_size, dropout)
+        case "sdpa":
+            return SDPAttention(n_embed, n_head, dropout)  # builds its own mask
+        case _:
+            raise ValueError(f"unknown attention: {kind}")
+
+
+def make_norm(kind: Norm, n_embed: int) -> Module:
+    match kind:
+        case "layer":
+            return LayerNorm(n_embed, eps=1e-5)
+        case "rms":
+            return RMSNorm(n_embed, eps=1e-5)
+        case _:
+            raise ValueError(f"unknown norm: {kind}")
+
+
+def make_ffwd(kind: FFN, n_embed: int, dropout: float) -> Module:
+    """dense is ReLU, gated is SwiGLU -- the activation is not a separate knob
+    here, since a gated FFN with ReLU is not a thing anyone ships."""
+    match kind:
+        case "dense":
+            return FeedForward(n_embed, dropout)
+        case "gated":
+            return GatedFeedForward(n_embed, dropout)
+        case _:
+            raise ValueError(f"unknown ffn: {kind}")
 
 
 class Block(Module):
     def __init__(
-        self, n_embed: int, n_head: int, block_size: int, dropout: float = 0.0
+        self,
+        n_embed: int,
+        n_head: int,
+        block_size: int,
+        dropout: float = 0.0,
+        attention: Attention = "mha",
+        norm: Norm = "layer",
+        ffn: FFN = "dense",
     ):
-        self.ln1 = LayerNorm(n_embed)
-        self.ln2 = LayerNorm(n_embed)
-        self.attn = MultiHeadAttention(n_embed, n_head, block_size, dropout)
-        self.ffwd = FeedForward(n_embed, dropout)
+        self.ln1 = make_norm(norm, n_embed)
+        self.ln2 = make_norm(norm, n_embed)
+        self.attn = make_attention(attention, n_embed, n_head, block_size, dropout)
+        self.ffwd = make_ffwd(ffn, n_embed, dropout)
 
     def forward(self, x: Tensor) -> Tensor:
         x = x + self.attn(self.ln1(x))  # communicate

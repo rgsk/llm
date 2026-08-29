@@ -10,7 +10,7 @@ from dataset import BinDataset, meta
 from generate import generate
 from gpt import GPT
 from gpt_config import GPTConfig
-from paths import ROOT
+from paths import CKPT_DIR, ROOT
 from train import train
 from train_config import TrainConfig
 
@@ -46,7 +46,12 @@ def sample(model: GPT, prompt: str = "\n", max_new_tokens: int = 300, **kw) -> s
 
 
 if __name__ == "__main__":
-    run_training = True
+    run_training = False
+    # a specific file, or None to take the newest run named train_cfg.name.
+    # main.py's own checkpoints load here now -- they only need `attention`
+    # named, since main.py never stored it
+    ckpt = CKPT_DIR / "big_2026-08-16_06-45-06.pt"
+    # ckpt = None
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"device {device}   run_training {run_training}")
 
@@ -64,12 +69,12 @@ if __name__ == "__main__":
         train_ds.close()
         val_ds.close()
     else:
-        ckpt = latest_ckpt(train_cfg.name)
+        ckpt = ckpt or latest_ckpt(train_cfg.name)
 
     # always sample from the file, never the in-memory model: if the checkpoint
     # is wrong, this is where it shows
     print(f"\nloading {ckpt.name}")
-    model, m = load_checkpoint(ckpt, device)
+    model, m = load_checkpoint(ckpt, device, attention="fused")
     print(f"best step {m['step']}   val {m['val_loss']:.4f}   bpc {m['bpc']:.3f}")
 
     print("\n--- greedy ---")
