@@ -17,6 +17,7 @@ class TrainConfig:
     use_compile: bool = True
     seed: int = 1337
     name: str = "video"
+    use_wandb: bool = False
 
 
 small_train = TrainConfig(
@@ -28,6 +29,7 @@ small_train = TrainConfig(
     eval_interval=100,
     eval_iters=100,
     name="scratch",
+    use_wandb=True,
 )
 
 big_train = TrainConfig(
@@ -40,6 +42,7 @@ big_train = TrainConfig(
     eval_interval=1000,
     eval_iters=100,
     name="big",
+    use_wandb=True,
 )
 
 

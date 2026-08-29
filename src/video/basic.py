@@ -31,7 +31,7 @@ torch.set_float32_matmul_precision("high")
 #     attention="sdpa",
 # )
 
-gpt_cfg = big_cfg
+gpt_cfg = small_cfg
 
 # train_cfg = TrainConfig(
 #     batch_size=32,
@@ -45,7 +45,7 @@ gpt_cfg = big_cfg
 #     use_compile=True,
 # )
 
-train_cfg = big_train
+train_cfg = small_train
 
 
 def sample(model: GPT, prompt: str = "\n", max_new_tokens: int = 300, **kw) -> str:

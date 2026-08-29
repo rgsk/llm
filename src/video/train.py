@@ -12,6 +12,7 @@ from dataset import BinDataset, get_batch, meta
 from evaluate import bits_per_char, estimate_loss, full_loss
 from gpt import GPT
 from gpt_config import GPTConfig
+from logger import Run
 from lr_schedule import get_lr
 from train_config import TrainConfig
 
@@ -28,6 +29,7 @@ def train(
     grad_clip: float = 1.0,
 ) -> list[dict]:
     torch.manual_seed(cfg.seed)
+    run = Run(cfg.name, asdict(cfg) | asdict(gpt_cfg), enabled=cfg.use_wandb)
     train_gen = torch.Generator().manual_seed(cfg.seed)
     eval_gen = torch.Generator().manual_seed(cfg.seed + 1)
 
@@ -63,6 +65,7 @@ def train(
             f"step {it:>5}  train {tr:.4f}  val {va:.4f}  bpc {bpc:.3f}  "
             f"lr {lr:.2e}  |g| {gnorm:6.2f}  {time.perf_counter() - t0:6.1f}s"
         )
+        run.log(history[-1], step=it)
         if va < best_val and ckpt_path is not None:
             best_val = va
             save_checkpoint(ckpt_path, model, gpt_cfg, step=it, val_loss=va, bpc=bpc)
@@ -99,6 +102,16 @@ def train(
 
     evaluate(cfg.max_steps, opt.lr)  # final model, after every update
 
+    run.summary(
+        best_val=best_val,
+        total_time_s=time.perf_counter() - t0,
+        peak_memory_gb=(
+            torch.cuda.max_memory_allocated() / 1e9
+            if device.startswith("cuda")
+            else 0.0
+        ),
+    )
+    run.finish()
     return history
 
 
