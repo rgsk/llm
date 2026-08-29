@@ -1,7 +1,6 @@
 from collections.abc import Iterator
 
 import torch
-from buffer import Buffer
 from parameter import Parameter
 from torch import Tensor
 
@@ -20,37 +19,57 @@ class Module:
             if isinstance(v, Module):
                 yield v
 
-    def _walk(self, kind: type, prefix: str = "") -> Iterator[tuple[str, Tensor]]:
-        """Every attribute of type `kind`, with torch-style dotted names."""
+    def _walk(self, prefix: str = "") -> Iterator[tuple[str, Parameter]]:
+        """Every Parameter under this module, with torch-style dotted names."""
         for name, v in self.__dict__.items():
             path = f"{prefix}{name}"
-            if isinstance(v, kind):
+            if isinstance(v, Parameter):
                 yield path, v
             elif isinstance(v, Module):
-                yield from v._walk(kind, f"{path}.")
-
-    def _named(self, kind, prefix="", remove_duplicate=True):
-        seen: set[int] = set()
-        for path, v in self._walk(kind, prefix):
-            if remove_duplicate and id(v) in seen:
-                continue
-            seen.add(id(v))
-            yield path, v
-
-    def named_buffers(self, prefix="", remove_duplicate=True):
-        yield from self._named(Buffer, prefix, remove_duplicate)
-
-    def buffers(self) -> Iterator[Buffer]:
-        for _, b in self.named_buffers():
-            yield b
+                yield from v._walk(f"{path}.")
 
     def register_buffer(self, name: str, tensor: Tensor, persistent: bool = True):
         """State that travels with the module but is never trained. persistent=False
-        keeps it out of state_dict -- right for anything __init__ can rebuild."""
-        setattr(self, name, Buffer(tensor, persistent))
+        keeps it out of state_dict -- right for anything __init__ can rebuild.
+
+        The tensor is stored as-is, and the NAME is what marks it a buffer. A
+        Tensor subclass would have been tidier, but torch.compile refuses to
+        trace an arbitrary one: dynamo special-cases nn.Parameter and nn.Buffer
+        and routes anything else through machinery that cannot handle it.
+        """
+        self.__dict__.setdefault("_buffer_names", {})[name] = persistent
+        setattr(self, name, tensor.detach())
+
+    def _walk_buffers(self, prefix: str = "") -> Iterator[tuple[str, Tensor, bool]]:
+        registered = self.__dict__.get("_buffer_names", {})
+        for name, v in self.__dict__.items():
+            path = f"{prefix}{name}"
+            if name in registered:
+                yield path, v, registered[name]
+            elif isinstance(v, Module):
+                yield from v._walk_buffers(f"{path}.")
+
+    def named_buffers(self, prefix="", remove_duplicate=True, persistent_only=False):
+        seen: set[int] = set()
+        for path, b, persistent in self._walk_buffers(prefix):
+            if persistent_only and not persistent:
+                continue
+            if remove_duplicate and id(b) in seen:
+                continue
+            seen.add(id(b))
+            yield path, b
+
+    def buffers(self) -> Iterator[Tensor]:
+        for _, b in self.named_buffers():
+            yield b
 
     def named_parameters(self, prefix="", remove_duplicate=True):
-        yield from self._named(Parameter, prefix, remove_duplicate)
+        seen: set[int] = set()
+        for path, p in self._walk(prefix):
+            if remove_duplicate and id(p) in seen:
+                continue
+            seen.add(id(p))
+            yield path, p
 
     def parameters(self) -> Iterator[Parameter]:
         for _, p in self.named_parameters():
@@ -87,8 +106,9 @@ class Module:
         sd.update(
             {
                 n: b.data
-                for n, b in self.named_buffers(remove_duplicate=False)
-                if b.persistent
+                for n, b in self.named_buffers(
+                    remove_duplicate=False, persistent_only=True
+                )
             }
         )
         return sd
@@ -98,8 +118,9 @@ class Module:
         own.update(
             {
                 n: b
-                for n, b in self.named_buffers(remove_duplicate=False)
-                if b.persistent
+                for n, b in self.named_buffers(
+                    remove_duplicate=False, persistent_only=True
+                )
             }
         )
         assert not (missing := own.keys() - sd.keys()), f"missing: {sorted(missing)}"

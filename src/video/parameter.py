@@ -3,6 +3,8 @@ from torch import nn
 
 Parameter = nn.Parameter
 
+# torch.compile required removing custom implementation
+
 # class Parameter(Tensor):
 #     """A Tensor marked as trainable. Modules collect these; the optimizer updates them."""
 
