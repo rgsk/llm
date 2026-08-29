@@ -14,6 +14,7 @@ class TrainConfig:
     eval_iters: int
     grad_accum_steps: int = 1
     amp: bool = True  # bf16 autocast on cuda; ~1.7x here, and no accuracy cost
+    use_compile: bool = True
     seed: int = 1337
     name: str = "video"
 

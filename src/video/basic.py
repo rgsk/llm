@@ -28,6 +28,7 @@ gpt_cfg = GPTConfig(
     n_embed=192,
     n_head=6,
     n_layer=4,
+    attention="sdpa",
 )
 train_cfg = TrainConfig(
     batch_size=32,
@@ -38,6 +39,7 @@ train_cfg = TrainConfig(
     eval_interval=250,
     eval_iters=50,
     name="scratch",
+    use_compile=True,
 )
 
 

@@ -1,15 +1,16 @@
 import torch
-from torch import Tensor
+from torch import nn
 
+Parameter = nn.Parameter
 
-class Parameter(Tensor):
-    """A Tensor marked as trainable. Modules collect these; the optimizer updates them."""
+# class Parameter(Tensor):
+#     """A Tensor marked as trainable. Modules collect these; the optimizer updates them."""
 
-    __torch_function__ = torch._C._disabled_torch_function_impl
+#     __torch_function__ = torch._C._disabled_torch_function_impl
 
-    @staticmethod
-    def __new__(cls, data: Tensor) -> "Parameter":
-        return data.detach().as_subclass(cls).requires_grad_(True)
+#     @staticmethod
+#     def __new__(cls, data: Tensor) -> "Parameter":
+#         return data.detach().as_subclass(cls).requires_grad_(True)
 
 
 if __name__ == "__main__":
