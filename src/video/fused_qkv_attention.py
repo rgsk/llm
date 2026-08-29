@@ -1,4 +1,5 @@
 import torch
+from dropout import Dropout
 from linear import Linear
 from module import Module
 from residual_proj import ResidualProj
@@ -21,12 +22,14 @@ class FusedQKVAttention(Module):
     one the checkpoints on disk assume.
     """
 
-    def __init__(self, n_embed: int, n_head: int):
+    def __init__(self, n_embed: int, n_head: int, dropout: float = 0.0):
         assert n_embed % n_head == 0, "n_embed must divide by n_head"
         self.n_head = n_head
         self.head_size = n_embed // n_head
         self.qkv = Linear(n_embed, 3 * n_embed, bias=False)
         self.proj = ResidualProj(n_embed, n_embed)
+        self.attn_dropout = Dropout(dropout)
+        self.resid_dropout = Dropout(dropout)
 
     def forward(self, x: Tensor) -> Tensor:
         B, T, E = x.shape
@@ -44,10 +47,10 @@ class FusedQKVAttention(Module):
         causal = torch.ones(T, T, dtype=torch.bool, device=x.device).tril()
         scores = scores.masked_fill(~causal, float("-inf"))
         w = softmax(scores, dim=-1)
-
+        w = self.attn_dropout(w)
         out = w @ v  # [B, nh, T, hs]
         out = out.transpose(1, 2).reshape(B, T, E)  # heads back side by side
-        return self.proj(out)
+        return self.resid_dropout(self.proj(out))
 
 
 if __name__ == "__main__":

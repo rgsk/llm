@@ -19,7 +19,13 @@ class Dropout(Module):
         self.p = p
 
     def forward(self, x: Tensor) -> Tensor:
-        if not self.training:
+        if not self.training or self.p == 0.0:
+            # self.p == 0.0 guard is worth keeping, even if torch.rand_like(x) >= self.p
+            # already handles 0.0 case
+            # without it, p=0.0
+            # still allocates rand_like(x), and on the [B, nh, T, T] attention weights
+            # to produce identical output
+            # that is hundreds of MB of pure waste per forward
             return x
         keep = torch.rand_like(x) >= self.p  # a fresh mask on every call
         return x * keep / (1.0 - self.p)

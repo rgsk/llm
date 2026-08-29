@@ -1,3 +1,4 @@
+from dropout import Dropout
 from linear import Linear
 from module import Module
 from relu import ReLU
@@ -7,11 +8,12 @@ from torch import Tensor
 
 
 class FeedForward(Module):
-    def __init__(self, n_embed: int):
+    def __init__(self, n_embed: int, dropout: float = 0.0):
         self.net = Sequential(
             Linear(n_embed, 4 * n_embed),
             ReLU(),
             ResidualProj(4 * n_embed, n_embed),
+            Dropout(dropout),
         )
 
     def forward(self, x: Tensor) -> Tensor:

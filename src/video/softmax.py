@@ -11,6 +11,8 @@ def softmax(x: Tensor, dim: int = -1) -> Tensor:
 if __name__ == "__main__":
     import torch.nn.functional as F
 
+    torch.manual_seed(0)
+
     def naive(x, dim=-1):
         e = x.exp()
         return e / e.sum(dim=dim, keepdim=True)

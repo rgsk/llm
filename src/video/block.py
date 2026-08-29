@@ -6,11 +6,11 @@ from torch import Tensor
 
 
 class Block(Module):
-    def __init__(self, n_embed: int, n_head: int):
+    def __init__(self, n_embed: int, n_head: int, dropout: float = 0.0):
         self.ln1 = LayerNorm(n_embed)
         self.ln2 = LayerNorm(n_embed)
-        self.attn = MultiHeadAttention(n_embed, n_head)
-        self.ffwd = FeedForward(n_embed)
+        self.attn = MultiHeadAttention(n_embed, n_head, dropout)
+        self.ffwd = FeedForward(n_embed, dropout)
 
     def forward(self, x: Tensor) -> Tensor:
         x = x + self.attn(self.ln1(x))  # communicate

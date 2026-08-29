@@ -6,3 +6,7 @@ class ResidualProj(Linear):
 
     Purely a marker -- forward is Linear's. GPT._init_weights looks for the type.
     """
+
+
+if __name__ == "__main__":
+    print("ok")

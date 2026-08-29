@@ -17,12 +17,15 @@ class GPT(Module):
         n_embed: int,
         n_head: int,
         n_layer: int,
+        dropout: float = 0.0,
     ):
         self.block_size = block_size
         self.n_layer = n_layer
         self.token_embedding_table = Embedding(vocab_size, n_embed)
         self.position_embedding_table = Embedding(block_size, n_embed)
-        self.blocks = ModuleList([Block(n_embed, n_head) for _ in range(n_layer)])
+        self.blocks = ModuleList(
+            [Block(n_embed, n_head, dropout) for _ in range(n_layer)]
+        )
         self.ln_f = LayerNorm(n_embed)
         self.lm_head = Linear(n_embed, vocab_size, bias=False)
 

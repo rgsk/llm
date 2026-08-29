@@ -10,6 +10,7 @@ class GPTConfig:
     n_embed: int  # E
     n_head: int  # nh
     n_layer: int
+    dropout: float = 0.0  # 0 disables it entirely; 0.1-0.2 for a model that overfits
 
     def __post_init__(self):
         assert self.n_embed % self.n_head == 0, "n_embed must divide by n_head"

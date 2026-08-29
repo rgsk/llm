@@ -1,4 +1,5 @@
 import torch
+from dropout import Dropout
 from linear import Linear
 from module import Module
 from module_list import ModuleList
@@ -8,11 +9,12 @@ from torch import Tensor
 
 
 class Head(Module):
-    def __init__(self, n_embed: int, head_size: int):
+    def __init__(self, n_embed: int, head_size: int, dropout: float = 0.0):
         self.head_size = head_size
         self.query = Linear(n_embed, head_size, bias=False)
         self.key = Linear(n_embed, head_size, bias=False)
         self.value = Linear(n_embed, head_size, bias=False)
+        self.attn_dropout = Dropout(dropout)
 
     def forward(self, x: Tensor) -> Tensor:
         _, T, _ = x.shape
@@ -23,19 +25,23 @@ class Head(Module):
         causal = torch.ones(T, T, dtype=torch.bool, device=x.device).tril()
         scores = scores.masked_fill(~causal, float("-inf"))
         w = softmax(scores, dim=-1)  # [B, T, T]
+        w = self.attn_dropout(w)  # drop whole connections, not activations
         return w @ v  # [B, T, hs]
 
 
 class MultiHeadAttention(Module):
-    def __init__(self, n_embed: int, n_head: int):
+    def __init__(self, n_embed: int, n_head: int, dropout: float = 0.0):
         assert n_embed % n_head == 0, "n_embed must divide by n_head"
         head_size = n_embed // n_head
-        self.heads = ModuleList([Head(n_embed, head_size) for _ in range(n_head)])
+        self.heads = ModuleList(
+            [Head(n_embed, head_size, dropout) for _ in range(n_head)]
+        )
         self.proj = ResidualProj(n_embed, n_embed)  # was Linear
+        self.resid_dropout = Dropout(dropout)
 
     def forward(self, x: Tensor) -> Tensor:
         out = torch.cat([h(x) for h in self.heads], dim=-1)  # [B, T, E]
-        return self.proj(out)  # [B, T, E]
+        return self.resid_dropout(self.proj(out))  # [B, T, E]
 
 
 if __name__ == "__main__":
