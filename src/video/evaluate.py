@@ -1,16 +1,19 @@
 import math
 
 import torch
+from amp import autocast
 from cross_entropy import cross_entropy
 from dataset import BinDataset, get_batch, meta
 from gpt import GPT
 
 
-@torch.no_grad()
-def batch_loss(model: GPT, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+def batch_loss(
+    model: GPT, x: torch.Tensor, y: torch.Tensor, amp: bool = True
+) -> torch.Tensor:
     B, T = x.shape
-    logits = model(x)  # [B, T, V]
-    return cross_entropy(logits.reshape(B * T, -1), y.reshape(B * T))
+    with autocast(str(x.device), amp):
+        logits = model(x)  # [B, T, V]
+        return cross_entropy(logits.reshape(B * T, -1), y.reshape(B * T))
 
 
 @torch.no_grad()

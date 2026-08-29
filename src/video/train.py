@@ -4,6 +4,7 @@ from pathlib import Path
 
 import torch
 from adamw import AdamW, decay_groups
+from amp import autocast
 from checkpoint import save_checkpoint
 from clip_grad_norm import clip_grad_norm
 from cross_entropy import cross_entropy
@@ -83,8 +84,9 @@ def train(
         for _ in range(cfg.grad_accum_steps):
             x, y = get_batch(train_ds, cfg.batch_size, T, train_gen)
             x, y = x.to(device), y.to(device)
-            logits = model(x)
-            loss = cross_entropy(logits.reshape(-1, V), y.reshape(-1))
+            with autocast(device, cfg.amp):
+                logits = model(x)
+                loss = cross_entropy(logits.reshape(-1, V), y.reshape(-1))
             loss = loss / cfg.grad_accum_steps
             loss.backward()
         gnorm = clip_grad_norm(model.parameters(), grad_clip)
