@@ -27,7 +27,7 @@ def train(
     ckpt_path: Path | None = None,
     weight_decay: float = 0.1,
     grad_clip: float = 1.0,
-    resume_from: Path | None = None,
+    resume: dict | None = None,
 ) -> list[dict]:
     torch.manual_seed(cfg.seed)
     run = Run(cfg.name, asdict(cfg) | asdict(gpt_cfg), enabled=cfg.use_wandb)
@@ -45,20 +45,22 @@ def train(
     gnorm = torch.tensor(float("nan"))  # no gradient exists before the first step
 
     start_step = 0
-    if resume_from is not None:
-        saved = torch.load(resume_from, map_location=device)
-        opt.load_state_dict(saved["opt"])
-        train_gen.set_state(saved["train_gen"].cpu())
-        eval_gen.set_state(saved["eval_gen"].cpu())
-        best_val = saved["val_loss"]
-        start_step = saved["step"]
-        print(f"resuming {resume_from.name} at step {start_step}, val {best_val:.4f}")
+    if resume is not None:
+        # load_checkpoint's metadata: the weights are already in `model`, this is
+        # everything else the loop carries
+        need = {"opt", "train_gen", "eval_gen", "step", "val_loss"}
+        assert need <= resume.keys(), f"not resumable: no {need - resume.keys()}"
+        opt.load_state_dict(resume["opt"])
+        train_gen.set_state(resume["train_gen"].cpu())  # map_location put them on gpu
+        eval_gen.set_state(resume["eval_gen"].cpu())
+        best_val = resume["val_loss"]
+        # not step + 1: evaluate() saves before the update at that step
+        start_step = resume["step"]
+        print(f"resuming at step {start_step}, val {best_val:.4f}")
 
     def evaluate(it: int, lr: float) -> None:
         nonlocal best_val
-        # captured before the draws below, so a resume replays THIS eval rather
-        # than starting from wherever it ended
-        eval_state = eval_gen.get_state()
+        eval_state = eval_gen.get_state()  # before the draws, so a resume replays them
         tr = estimate_loss(
             model, train_ds, cfg.batch_size, T, cfg.eval_iters, eval_gen, device
         )
@@ -271,8 +273,8 @@ if __name__ == "__main__":
             pass
         get_batch = real_get_batch
 
-        # pick the wreckage back up: weights from the file, everything else too
-        c, m = load_checkpoint(d / "b.pt", device=device)
+        # pick the wreckage back up -- one read gives the model and its state
+        c, _, m = load_checkpoint(d / "b.pt", device=device)
         assert m["step"] == 40
         hist_c = train(
             c,
@@ -282,7 +284,7 @@ if __name__ == "__main__":
             val_ds,
             device=device,
             ckpt_path=d / "c.pt",
-            resume_from=d / "b.pt",
+            resume=m,
         )
 
         # the resumed leg reproduces the uninterrupted run's tail row for row,
@@ -299,7 +301,7 @@ if __name__ == "__main__":
         )
 
         # the control: weights alone, no moments and no RNG, ends up somewhere else
-        n, _ = load_checkpoint(d / "b.pt", device=device)
+        n, _, _ = load_checkpoint(d / "b.pt", device=device)
         train(
             n, r_cfg, r_gpt_cfg, train_ds, val_ds, device=device, ckpt_path=d / "n.pt"
         )

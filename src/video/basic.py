@@ -86,7 +86,7 @@ if __name__ == "__main__":
     # always sample from the file, never the in-memory model: if the checkpoint
     # is wrong, this is where it shows
     print(f"\nloading {ckpt.name}")
-    model, m = load_checkpoint(ckpt, device)
+    model, _, m = load_checkpoint(ckpt, device)
     print(f"best step {m['step']}   val {m['val_loss']:.4f}   bpc {m['bpc']:.3f}")
 
     print("\n--- greedy ---")
