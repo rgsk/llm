@@ -63,6 +63,31 @@ class AdamW:
             for p in group["params"]:
                 p.grad = None
 
+    def state_dict(self) -> dict:
+        """m, v and t -- everything carried between steps. Keyed by POSITION,
+        not by id(p): an id is this process's memory address, and means nothing
+        in the next one."""
+        return {
+            "t": self.t,
+            "state": [
+                [self.state.get(id(p)) for p in g["params"]] for g in self.groups
+            ],
+        }
+
+    def load_state_dict(self, sd: dict) -> None:
+        """Rebind the saved moments onto THIS process's parameters, matched up
+        group by group in the order state_dict wrote them."""
+        assert len(sd["state"]) == len(self.groups), "group count changed"
+        self.t = sd["t"]
+        self.state = {}
+        for group, saved in zip(self.groups, sd["state"]):
+            assert len(saved) == len(group["params"]), "parameter count changed"
+            for p, mv in zip(group["params"], saved):
+                if mv is not None:
+                    m, v = mv
+                    assert m.shape == p.shape, "parameter shape changed"
+                    self.state[id(p)] = (m.to(p.device), v.to(p.device))
+
 
 def decay_groups(model: Module, weight_decay: float) -> list[dict]:
     """Decay matmul weights only. Biases and norm gains are 1D -- decaying those
@@ -184,5 +209,39 @@ if __name__ == "__main__":
 
     g = decay_groups(GPT(4096, 32, 64, 4, 3), 0.1)
     assert len(g[0]["params"]) == 47 and len(g[1]["params"]) == 23
+
+    # 4. a saved optimizer resumes bit-exactly: 5 + 5 steps == 10 steps
+    def make():
+        torch.manual_seed(0)
+        m = Sequential(Linear(8, 16), ReLU(), Linear(16, 4))
+        return m, AdamW(decay_groups(m, 0.1), lr=1e-2)
+
+    def run(model, opt, n):
+        for _ in range(n):
+            opt.zero_grad()
+            (model(x) - y).square().mean().backward()
+            opt.step()
+
+    a, opt_a = make()
+    run(a, opt_a, 10)
+
+    b, opt_b = make()
+    run(b, opt_b, 5)
+    blob = {"model": b.state_dict(), "opt": opt_b.state_dict()}
+
+    c, opt_c = make()
+    c.load_state_dict(blob["model"])
+    opt_c.load_state_dict(blob["opt"])
+    run(c, opt_c, 5)
+    assert opt_c.t == 10
+    assert all((p - q).abs().max() == 0 for p, q in zip(a.parameters(), c.parameters()))
+
+    # and the state is not decoration -- weights alone land somewhere else
+    d, opt_d = make()
+    d.load_state_dict(blob["model"])
+    run(d, opt_d, 5)
+    assert (
+        max((p - q).abs().max() for p, q in zip(a.parameters(), d.parameters())) > 1e-4
+    )
 
     print("ok")

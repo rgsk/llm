@@ -104,4 +104,33 @@ if __name__ == "__main__":
         except FileNotFoundError as e:
             assert "nothing*.pt" in str(e)
 
+        # 8. the resume payload rides along in **meta: optimizer moments and the
+        #    position of the batch stream, back out of load_checkpoint untouched
+        from adamw import AdamW, decay_groups
+
+        opt = AdamW(decay_groups(model, 0.1), lr=1e-3)
+        model(x).sum().backward()
+        opt.step()
+        gen = torch.Generator().manual_seed(1337)
+        torch.randint(0, 10, (5,), generator=gen)
+
+        rpath = generate_ckpt_path("resume", d)
+        save_checkpoint(
+            rpath, model, cfg, step=7, opt=opt.state_dict(), train_gen=gen.get_state()
+        )
+        loaded, meta = load_checkpoint(rpath)
+
+        opt2 = AdamW(decay_groups(loaded, 0.1), lr=1e-3)
+        opt2.load_state_dict(meta["opt"])
+        assert opt2.t == opt.t == 1
+        assert len(opt2.state) == len(opt.state)
+
+        # the generator picks up mid-stream, rather than restarting at seed 1337
+        g2 = torch.Generator()
+        g2.set_state(meta["train_gen"])
+        assert torch.equal(
+            torch.randint(0, 10, (5,), generator=g2),
+            torch.randint(0, 10, (5,), generator=gen),
+        )
+
     print("ok")

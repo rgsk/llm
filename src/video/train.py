@@ -27,6 +27,7 @@ def train(
     ckpt_path: Path | None = None,
     weight_decay: float = 0.1,
     grad_clip: float = 1.0,
+    resume_from: Path | None = None,
 ) -> list[dict]:
     torch.manual_seed(cfg.seed)
     run = Run(cfg.name, asdict(cfg) | asdict(gpt_cfg), enabled=cfg.use_wandb)
@@ -43,8 +44,21 @@ def train(
     t0 = time.perf_counter()
     gnorm = torch.tensor(float("nan"))  # no gradient exists before the first step
 
+    start_step = 0
+    if resume_from is not None:
+        saved = torch.load(resume_from, map_location=device)
+        opt.load_state_dict(saved["opt"])
+        train_gen.set_state(saved["train_gen"].cpu())
+        eval_gen.set_state(saved["eval_gen"].cpu())
+        best_val = saved["val_loss"]
+        start_step = saved["step"]
+        print(f"resuming {resume_from.name} at step {start_step}, val {best_val:.4f}")
+
     def evaluate(it: int, lr: float) -> None:
         nonlocal best_val
+        # captured before the draws below, so a resume replays THIS eval rather
+        # than starting from wherever it ended
+        eval_state = eval_gen.get_state()
         tr = estimate_loss(
             model, train_ds, cfg.batch_size, T, cfg.eval_iters, eval_gen, device
         )
@@ -68,14 +82,24 @@ def train(
         run.log(history[-1], step=it)
         if va < best_val and ckpt_path is not None:
             best_val = va
-            save_checkpoint(ckpt_path, model, gpt_cfg, step=it, val_loss=va, bpc=bpc)
+            save_checkpoint(
+                ckpt_path,
+                model,
+                gpt_cfg,
+                step=it,
+                val_loss=va,
+                bpc=bpc,
+                opt=opt.state_dict(),
+                train_gen=train_gen.get_state(),
+                eval_gen=eval_state,
+            )
 
     # compile the forward, but keep `model` for everything else: zero_grad,
     # clipping and state_dict all want the real module, and the wrapper shares
     # its parameters anyway
     fwd = torch.compile(model) if cfg.use_compile else model
 
-    for it in range(cfg.max_steps):
+    for it in range(start_step, cfg.max_steps):
         lr = get_lr(
             it,
             warmup_steps=cfg.warmup_steps,
@@ -192,6 +216,97 @@ if __name__ == "__main__":
     # the last step is max_steps - 1, and the cosine only hits min_lr at
     # max_steps exactly -- so we land just above it, never on it
     assert cfg.min_lr < history[-1]["lr"] < cfg.min_lr * 1.01
+
+    # 6. a run that dies mid-step resumes into exactly the run it would have been
+    from dataclasses import replace
+
+    from checkpoint import load_checkpoint
+
+    r_gpt_cfg = replace(gpt_cfg, block_size=64, n_embed=96, n_head=4, n_layer=2)
+    r_cfg = replace(
+        cfg,
+        batch_size=16,
+        max_steps=60,
+        eval_interval=20,
+        eval_iters=5,
+        name="resume",
+        use_compile=False,
+    )
+
+    def fresh_model():
+        torch.manual_seed(0)
+        return GPT(**asdict(r_gpt_cfg)).to(device)
+
+    with tempfile.TemporaryDirectory() as d:
+        d = Path(d)
+        a = fresh_model()
+        hist_a = train(
+            a, r_cfg, r_gpt_cfg, train_ds, val_ds, device=device, ckpt_path=d / "a.pt"
+        )
+
+        # the same run, killed at the start of step 40 -- just after evaluate(40)
+        # wrote its checkpoint, which is therefore all that survives
+        real_get_batch, calls = get_batch, [0]
+
+        def flaky(*args, **kw):
+            calls[0] += 1
+            if calls[0] > 40:
+                raise RuntimeError("simulated crash")
+            return real_get_batch(*args, **kw)
+
+        get_batch = flaky
+        b = fresh_model()
+        try:
+            train(
+                b,
+                r_cfg,
+                r_gpt_cfg,
+                train_ds,
+                val_ds,
+                device=device,
+                ckpt_path=d / "b.pt",
+            )
+            raise SystemExit("should have crashed")
+        except RuntimeError:
+            pass
+        get_batch = real_get_batch
+
+        # pick the wreckage back up: weights from the file, everything else too
+        c, m = load_checkpoint(d / "b.pt", device=device)
+        assert m["step"] == 40
+        hist_c = train(
+            c,
+            r_cfg,
+            r_gpt_cfg,
+            train_ds,
+            val_ds,
+            device=device,
+            ckpt_path=d / "c.pt",
+            resume_from=d / "b.pt",
+        )
+
+        # the resumed leg reproduces the uninterrupted run's tail row for row,
+        # starting by re-running eval 40 on the very same windows
+        tail = [h for h in hist_a if h["step"] >= 40]
+        assert [h["step"] for h in tail] == [h["step"] for h in hist_c]
+        for ra, rc in zip(tail, hist_c):
+            for k in ("train", "val", "bpc", "lr"):
+                assert ra[k] == rc[k], (rc["step"], k, ra[k], rc[k])
+
+        # ... and lands on the same weights, bit for bit
+        assert all(
+            (p - q).abs().max() == 0 for p, q in zip(a.parameters(), c.parameters())
+        )
+
+        # the control: weights alone, no moments and no RNG, ends up somewhere else
+        n, _ = load_checkpoint(d / "b.pt", device=device)
+        train(
+            n, r_cfg, r_gpt_cfg, train_ds, val_ds, device=device, ckpt_path=d / "n.pt"
+        )
+        assert (
+            max((p - q).abs().max() for p, q in zip(a.parameters(), n.parameters()))
+            > 1e-4
+        )
 
     train_ds.close()
     val_ds.close()
