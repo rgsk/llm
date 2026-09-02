@@ -1,4 +1,6 @@
+import torch
 import torch.nn.functional as F
+from common import KVCache
 from dropout import Dropout
 from linear import Linear
 from module import Module
@@ -21,6 +23,12 @@ class SDPAttention(Module):
     dispatcher: it picks a backend that fits the inputs, and the flash kernel
     needs fp16/bf16. Ask for it in fp32 and you get the memory-efficient backend
     instead, silently.
+
+    The KV cache costs one thing here that it did not cost the hand-written
+    version: is_causal stops being usable the moment there is a past. The flag
+    aligns its triangle to the top-left corner, which is only the causal mask
+    when the queries start at position 0. With a cache they do not, so the layer
+    has to say which of the two situations it is in -- see forward.
     """
 
     def __init__(self, n_embed: int, n_head: int, dropout: float = 0.0):
@@ -32,7 +40,12 @@ class SDPAttention(Module):
         self.dropout_p = dropout
         self.resid_dropout = Dropout(dropout)
 
-    def forward(self, x: Tensor) -> Tensor:
+    def forward(
+        self,
+        x: Tensor,
+        kv_cache: KVCache | None = None,
+        use_cache: bool = False,
+    ) -> Tensor | tuple[Tensor, KVCache]:
         B, T, E = x.shape
         nh, hs = self.n_head, self.head_size
         q, k, v = self.qkv(x).split(E, dim=-1)
@@ -41,25 +54,49 @@ class SDPAttention(Module):
         k = k.view(B, T, nh, hs).transpose(1, 2)
         v = v.view(B, T, nh, hs).transpose(1, 2)
 
-        # is_causal builds the same lower-triangular mask, inside the kernel.
+        if kv_cache is not None:
+            past_k, past_v = kv_cache
+            k = torch.cat([past_k, k], dim=2)  # [B, nh, T_kv, hs]
+            v = torch.cat([past_v, v], dim=2)
+        new_cache = (k, v)
+
+        T_kv = k.size(2)
+        T_past = T_kv - T
+        if kv_cache is None:
+            # no past: the triangle the kernel builds is exactly ours
+            is_causal, attn_mask = True, None
+        elif T == 1:
+            # one new token, and it may attend to every cached position. the
+            # whole row is visible, so there is nothing to mask at all
+            is_causal, attn_mask = False, None
+        else:
+            # T > 1 on top of a cache, and here is_causal is quietly WRONG.
+            # the kernel aligns its triangle top-left -- it assumes query i sits
+            # at position i. ours sit at T_past + i, so the band has to shift.
+            # this is the one case the flag cannot express; hand it a mask.
+            i = torch.arange(T_past, T_kv, device=x.device).unsqueeze(1)
+            j = torch.arange(T_kv, device=x.device)
+            is_causal, attn_mask = False, j <= i  # [T, T_kv], True = visible
+
         # dropout_p must be zeroed by hand at eval: the kernel is a function,
         # it cannot see that the Module around it is in eval mode
         out = F.scaled_dot_product_attention(
             q,
             k,
             v,
-            is_causal=True,
+            attn_mask=attn_mask,
+            is_causal=is_causal,
             dropout_p=self.dropout_p if self.training else 0.0,
         )
 
         out = out.transpose(1, 2).reshape(B, T, E)
-        return self.resid_dropout(self.proj(out))
+        out = self.resid_dropout(self.proj(out))
+        return (out, new_cache) if use_cache else out
 
 
 if __name__ == "__main__":
     import time
 
-    import torch
     from fused_qkv_attention import FusedQKVAttention
 
     torch.manual_seed(0)
@@ -106,11 +143,58 @@ if __name__ == "__main__":
     d.eval()
     assert torch.equal(d(x), d(x))
 
+    # 5. the KV cache, and it must agree with the hand-written one step for step
+    full_s, full_f = sdpa(x), fused(x)
+    cache_s = cache_f = None
+    steps_s, steps_f = [], []
+    for t in range(T):
+        out_s, cache_s = sdpa(x[:, t : t + 1], cache_s, use_cache=True)
+        out_f, cache_f = fused(x[:, t : t + 1], cache_f, use_cache=True)
+        steps_s.append(out_s)
+        steps_f.append(out_f)
+    assert (torch.cat(steps_s, dim=1) - full_s).abs().max() < 1e-6
+    assert (torch.cat(steps_s, dim=1) - torch.cat(steps_f, dim=1)).abs().max() < 1e-6
+    print("sdpa decodes incrementally, and agrees with the hand-written cache")
+
+    # 6. the case is_causal cannot express: several new tokens on top of a
+    #    cache. prefill 3, then hand it 5 more at once
+    pre_s, cs = sdpa(x[:, :3], use_cache=True)
+    rest_s, cs = sdpa(x[:, 3:], cs, use_cache=True)
+    assert (torch.cat([pre_s, rest_s], dim=1) - full_s).abs().max() < 1e-6
+
+    #    and this is what is_causal=True would have given instead -- the kernel
+    #    puts its triangle top-left, so query 0 of the continuation is allowed
+    #    to see only cached position 0, when it should see all 4 before it
+    q_, k_, v_ = (
+        t_.view(B, T, NH, E // NH).transpose(1, 2)
+        for t_ in sdpa.qkv(x).split(E, dim=-1)
+    )
+    T_past, T_kv = 3, T
+
+    def attend(**kw) -> Tensor:
+        o = F.scaled_dot_product_attention(q_[:, :, T_past:], k_, v_, **kw)
+        return sdpa.proj(o.transpose(1, 2).reshape(B, T - T_past, E))
+
+    wrong = attend(is_causal=True)
+    assert (wrong - rest_s).abs().max() > 1e-2
+    print("is_causal on a cached step is wrong by", (wrong - rest_s).abs().max().item())
+
+    #    and this is the proof that top-left is exactly what it does: build that
+    #    mask by hand -- rows 0..T-1 instead of T_past..T_kv-1 -- and the kernel
+    #    reproduces its own wrong answer to the bit. the flag is not doing
+    #    something subtle, it is indexing our queries from the wrong origin
+    j = torch.arange(T_kv)
+    top_left = attend(attn_mask=j <= torch.arange(0, T_kv - T_past).unsqueeze(1))
+    shifted = attend(attn_mask=j <= torch.arange(T_past, T_kv).unsqueeze(1))
+    assert (top_left - wrong).abs().max() == 0  # is_causal IS the top-left band
+    assert (shifted - rest_s).abs().max() < 1e-6  # the band forward builds
+    print("is_causal == hand-built top-left mask, exactly")
+
     if not torch.cuda.is_available():
         print("ok (cpu -- skipped the memory and backend tests)")
         raise SystemExit
 
-    # 5. the point of the whole file: memory. Ours allocates [B, nh, T, T] and
+    # 7. the point of the whole file: memory. Ours allocates [B, nh, T, T] and
     #    several copies of it; SDPA allocates none, so it scales with T not T^2
     print(
         f"\npeak memory for one forward, B=4 nh=8 E=512  ({torch.cuda.get_device_name(0)})"
@@ -135,10 +219,10 @@ if __name__ == "__main__":
         )
         assert peak["sdpa"] < peak["fused"]
     """
-    Test 5 is the table to hold on screen. Doubling T roughly quadruples the hand-written column (133 → 458 → 1689 MB) and exactly doubles SDPA's (24 → 48 → 96 MB). That's T² versus T, measured, not asserted. The last column shows why: one copy of the score matrix at T=2048 is 512 MB, and we hold several at once — scores, the masked version, the softmax output. At T=2048 this layer alone is 1.7 GB on an 8 GB card, which is the actual reason long-context models were impossible before this kernel.
+    Test 7 is the table to hold on screen. Doubling T roughly quadruples the hand-written column (133 → 458 → 1689 MB) and exactly doubles SDPA's (24 → 48 → 96 MB). That's T² versus T, measured, not asserted. The last column shows why: one copy of the score matrix at T=2048 is 512 MB, and we hold several at once — scores, the masked version, the softmax output. At T=2048 this layer alone is 1.7 GB on an 8 GB card, which is the actual reason long-context models were impossible before this kernel.
     """
 
-    # 6. and it is faster, which is a consequence of the same thing -- fewer
+    # 8. and it is faster, which is a consequence of the same thing -- fewer
     #    round trips to HBM, not fewer floating point operations
     xb = torch.randn(4, 1024, 512, device="cuda")
     t = {}

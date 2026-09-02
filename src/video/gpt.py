@@ -1,5 +1,6 @@
 import torch
 from block import FFN, Attention, Block, Norm, make_norm
+from common import KVCache
 from embedding import Embedding
 from linear import Linear
 from module import Module
@@ -52,16 +53,40 @@ class GPT(Module):
             elif isinstance(module, Embedding):
                 module.weight.normal_(mean=0.0, std=0.02)
 
-    def forward(self, idx: Tensor) -> Tensor:
+    def forward(
+        self,
+        idx: Tensor,
+        kv_caches: list[KVCache] | None = None,
+        use_cache: bool = False,
+    ) -> Tensor | tuple[Tensor, list[KVCache]]:
+        """One cache per block, in layer order -- blocks share nothing.
+
+        The thing that is easy to get wrong is here, not in the attention: with a
+        cache, idx holds only the new tokens, but they are NOT at positions
+        0..T-1. Their positions continue from what the cache already holds, so
+        pos starts at T_past. Get this wrong and generation still runs and still
+        returns plausible-looking logits -- every token just believes it is at
+        the start of the sequence.
+        """
         _, T = idx.shape
-        assert T <= self.block_size, f"sequence of {T} > block_size {self.block_size}"
-        pos = torch.arange(T, device=idx.device)
+        T_past = 0 if kv_caches is None else kv_caches[0][0].size(2)
+        assert T_past + T <= self.block_size, (
+            f"sequence of {T_past + T} > block_size {self.block_size}"
+        )
+        pos = torch.arange(T_past, T_past + T, device=idx.device)
         x = self.token_embedding_table(idx) + self.position_embedding_table(pos)
-        for block in self.blocks:
-            x = block(x)
+
+        new_caches: list[KVCache] = []
+        for i, block in enumerate(self.blocks):
+            if use_cache:
+                layer_cache = kv_caches[i] if kv_caches is not None else None
+                x, new_cache = block(x, layer_cache, use_cache=True)
+                new_caches.append(new_cache)
+            else:
+                x = block(x)
         x = self.ln_f(x)
         logits = self.lm_head(x)  # [B, T, V]
-        return logits
+        return (logits, new_caches) if use_cache else logits
 
 
 if __name__ == "__main__":
@@ -212,5 +237,52 @@ if __name__ == "__main__":
     # without ResidualProj:
     # - stream growth at depth 1/3/8/24: ['1.67x', '2.39x', '4.09x', '6.93x']
     assert max(growths) - min(growths) < 0.2  # flat in depth
+
+    # ---------------------------------------------------------------- KV cache
+
+    cm = GPT(V, BS, E, NH, NL, attention="fused")
+    ids = torch.randint(0, V, (B, T))
+    full = cm(ids)
+
+    # 10. end to end: prefill the prompt, then step one token at a time. the
+    #     logits are the same ones the full forward produces
+    prompt, rest = ids[:, :5], ids[:, 5:]
+    out, caches = cm(prompt, use_cache=True)
+    assert (out - full[:, :5]).abs().max() < 1e-5
+    for t in range(rest.size(1)):
+        out, caches = cm(rest[:, t : t + 1], caches, use_cache=True)
+        assert (out[:, -1] - full[:, 5 + t]).abs().max() < 1e-5
+    print("cached prefill + decode matches full forward")
+
+    # 11. one cache per block, none shared, each grown to the full length
+    assert len(caches) == NL
+    assert all(k.shape == v.shape == (B, NH, T, E // NH) for k, v in caches)
+    assert caches[0][0].data_ptr() != caches[1][0].data_ptr()
+
+    # 12. THE bug this design exists to avoid: the cached token must be told
+    #     where it is. Feeding it as a fresh sequence puts it at position 0, and
+    #     nothing errors -- the logits are just quietly wrong
+    _, c5 = cm(ids[:, :5], use_cache=True)
+    cached_step, _ = cm(ids[:, 5:6], c5, use_cache=True)  # position 5
+    naive_step = cm(ids[:, 5:6])  # position 0
+    assert (cached_step - full[:, 5:6]).abs().max() < 1e-5
+    assert (naive_step - full[:, 5:6]).abs().max() > 1e-3
+
+    # 13. block_size counts the cache too, not just idx
+    try:
+        big = [
+            (torch.zeros(1, NH, BS, E // NH), torch.zeros(1, NH, BS, E // NH))
+            for _ in range(NL)
+        ]
+        cm(torch.randint(0, V, (1, 1)), big, use_cache=True)
+        raise SystemExit("should have failed")
+    except AssertionError as e:
+        assert "block_size" in str(e)
+
+    # 14. use_cache=False is untouched: still a bare Tensor, still trains
+    assert isinstance(cm(ids), Tensor)
+    cm.zero_grad()
+    cross_entropy(cm(ids).reshape(B * T, V), targets.reshape(B * T)).backward()
+    assert cm.blocks[0].attn.qkv.weight.grad.abs().max() > 0
 
     print("ok")

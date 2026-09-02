@@ -21,13 +21,37 @@ def generate_ckpt_path(name: str, ckpt_dir: Path = CKPT_DIR) -> Path:
     return ckpt_dir / f"{name}_{timestamp()}.pt"
 
 
-def latest_ckpt(prefix: str, ckpt_dir: Path = CKPT_DIR) -> Path:
+def latest_ckpt(
+    prefix: str, ckpt_dir: Path = CKPT_DIR, max_val_loss: float | None = None
+) -> Path:
     """The newest checkpoint starting with prefix. %Y-%m-%d_%H-%M-%S is fixed-width
-    and big-endian, so lexicographic order == chronological order."""
+    and big-endian, so lexicographic order == chronological order.
+
+    max_val_loss walks newest -> oldest and takes the first checkpoint at or
+    below it, so an aborted run sitting at the init loss does not win just by
+    being newest. Anything that will not open, or that never recorded a
+    val_loss, is skipped rather than raising -- a half-written file is exactly
+    the case this is here to step over.
+
+    Reading val_loss means opening the file, but mmap=True leaves the weights on
+    disk and pages in only the pickled metadata: ~2 ms against ~32 ms for a real
+    load of a 100 MB checkpoint.
+    """
     matches = sorted(ckpt_dir.glob(f"{prefix}*.pt"))
     if not matches:
         raise FileNotFoundError(f"no checkpoint matching {prefix}*.pt in {ckpt_dir}")
-    return matches[-1]
+    if max_val_loss is None:
+        return matches[-1]
+    for path in reversed(matches):
+        try:
+            val_loss = torch.load(path, map_location="cpu", mmap=True).get("val_loss")
+        except (RuntimeError, OSError):  # empty, truncated, not a checkpoint
+            continue
+        if val_loss is not None and val_loss <= max_val_loss:
+            return path
+    raise FileNotFoundError(
+        f"no {prefix}*.pt in {ckpt_dir} with val_loss <= {max_val_loss}"
+    )
 
 
 def save_checkpoint(path: Path, model: GPT, cfg: GPTConfig, **meta) -> None:
@@ -104,7 +128,41 @@ if __name__ == "__main__":
         except FileNotFoundError as e:
             assert "nothing*.pt" in str(e)
 
-        # 8. the resume payload rides along in **meta: optimizer moments and the
+        # 8. max_val_loss: newest wins only among checkpoints that trained.
+        #    "run" writes three -- a good one, then a better one, then a fresh
+        #    start that aborted at the init loss
+        for stamp, vl in [
+            ("2026-05-01_00-00-00", 4.0),
+            ("2026-05-02_00-00-00", 3.1),
+            ("2026-05-03_00-00-00", 8.3),  # aborted, and the newest
+        ]:
+            save_checkpoint(d / f"run_{stamp}.pt", model, cfg, step=1, val_loss=vl)
+        assert latest_ckpt("run", d).name == "run_2026-05-03_00-00-00.pt"  # newest
+        assert latest_ckpt("run", d, 6.0).name == "run_2026-05-02_00-00-00.pt"
+        assert latest_ckpt("run", d, 3.5).name == "run_2026-05-02_00-00-00.pt"
+        assert latest_ckpt("run", d, 4.0).name == "run_2026-05-02_00-00-00.pt"
+
+        #    the threshold can exclude everything, and that is not silent
+        try:
+            latest_ckpt("run", d, 1.0)
+            raise SystemExit("should have failed")
+        except FileNotFoundError as e:
+            assert "val_loss <= 1.0" in str(e)
+
+        #    files that will not open are stepped over, not fatal: test 6 left
+        #    three empty big_*.pt behind, so a real one has to be found past them
+        save_checkpoint(d / "big_2026-01-02_00-00-00.pt", model, cfg, val_loss=2.0)
+        assert latest_ckpt("big", d, 5.0).name == "big_2026-01-02_00-00-00.pt"
+
+        #    and so is a checkpoint that never recorded one
+        save_checkpoint(d / "noloss_2026-01-01_00-00-00.pt", model, cfg, step=1)
+        try:
+            latest_ckpt("noloss", d, 5.0)
+            raise SystemExit("should have failed")
+        except FileNotFoundError as e:
+            assert "val_loss" in str(e)
+
+        # 9. the resume payload rides along in **meta: optimizer moments and the
         #    position of the batch stream, back out of load_checkpoint untouched
         from adamw import AdamW, decay_groups
 

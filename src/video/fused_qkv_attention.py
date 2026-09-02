@@ -1,4 +1,5 @@
 import torch
+from common import KVCache
 from dropout import Dropout
 from linear import Linear
 from module import Module
@@ -20,6 +21,17 @@ class FusedQKVAttention(Module):
     The 3E axis is laid out as (3, n_head, head_size) -- q for every head, then
     k for every head, then v. That ordering is pure convention, and it is the
     one the checkpoints on disk assume.
+
+    This is also the first layer with a KV cache. Generation feeds the model one
+    token at a time, and row t of the score matrix only ever needs k and v for
+    positions <= t. Those are a function of x alone -- past keys and values do
+    not change when a new token arrives -- so recomputing them every step is
+    pure waste. Hand the layer the previous (k, v) and it projects only the new
+    token, concatenates, and attends: one row of scores instead of T.
+
+    Cost per token goes from O(T^2 E) to O(T E), in exchange for holding
+    2 * n_layer * B * T * E cache values in memory. That trade is why decoding
+    is memory-bandwidth-bound and training is compute-bound.
     """
 
     def __init__(
@@ -38,7 +50,18 @@ class FusedQKVAttention(Module):
         self.attn_dropout = Dropout(dropout)
         self.resid_dropout = Dropout(dropout)
 
-    def forward(self, x: Tensor) -> Tensor:
+    def forward(
+        self,
+        x: Tensor,
+        kv_cache: KVCache | None = None,
+        use_cache: bool = False,
+    ) -> Tensor | tuple[Tensor, KVCache]:
+        """x is only the NEW tokens. kv_cache carries everything before them.
+
+        use_cache picks the return type: a plain Tensor (what Block adds to the
+        residual stream) or (out, new_cache). Keeping it a flag is what lets
+        this file gain a cache without every caller learning about one.
+        """
         B, T, E = x.shape
         nh, hs = self.n_head, self.head_size
         # one matmul, then split into q, k, v each [B, T, E]
@@ -50,13 +73,29 @@ class FusedQKVAttention(Module):
         k = k.view(B, T, nh, hs).transpose(1, 2)
         v = v.view(B, T, nh, hs).transpose(1, 2)
 
-        scores = q @ k.transpose(-2, -1) * hs**-0.5  # [B, nh, T, T]
-        scores = scores.masked_fill(~self.tril[:T, :T], float("-inf"))
+        if kv_cache is not None:
+            past_k, past_v = kv_cache
+            # [B, nh, T_past, hs] ++ [B, nh, T, hs] -> [B, nh, T_kv, hs]
+            k = torch.cat([past_k, k], dim=2)
+            v = torch.cat([past_v, v], dim=2)
+        new_cache = (k, v)
+
+        T_kv = k.size(2)
+        T_past = T_kv - T
+        assert T_kv <= self.tril.size(0), "sequence outgrew block_size"
+
+        scores = q @ k.transpose(-2, -1) * hs**-0.5  # [B, nh, T, T_kv]
+        # q rows are positions T_past .. T_kv-1, so the mask is that row band of
+        # tril, not its top-left corner. With T == 1 the band is a single row of
+        # all True: the newest token may look at every cached position.
+        causal = self.tril[T_past:T_kv, :T_kv]  # [T, T_kv]
+        scores = scores.masked_fill(~causal, float("-inf"))
         w = softmax(scores, dim=-1)
         w = self.attn_dropout(w)
         out = w @ v  # [B, nh, T, hs]
         out = out.transpose(1, 2).reshape(B, T, E)  # heads back side by side
-        return self.resid_dropout(self.proj(out))
+        out = self.resid_dropout(self.proj(out))
+        return (out, new_cache) if use_cache else out
 
 
 if __name__ == "__main__":
@@ -213,6 +252,74 @@ if __name__ == "__main__":
     print(
         f"{dev}  [8,{Tb},{Eb}] nh={NHb} -- unfused {t['unfused']:.2f} ms   "
         f"fused {t['fused']:.2f} ms   ratio {t['unfused'] / t['fused']:.2f}x"
+    )
+
+    # ---------------------------------------------------------------- KV cache
+
+    dec = FusedQKVAttention(E, NH, T)
+    full = dec(x)  # [B, T, E], every position at once
+
+    # 11. THE test: decoding one token at a time through the cache reproduces
+    #     the full forward exactly. Same weights, same arithmetic, fewer matmuls
+    cache = None
+    steps = []
+    for t_ in range(T):
+        out_t, cache = dec(x[:, t_ : t_ + 1], cache, use_cache=True)
+        steps.append(out_t)
+    assert (torch.cat(steps, dim=1) - full).abs().max() < 1e-6
+    print("incremental decode matches full forward")
+
+    # 12. and any prefill/decode split does too -- prefill T-1 tokens in one
+    #     call, then step the last one. This is what generate() actually does
+    prefix, new_cache = dec(x[:, :-1], use_cache=True)
+    last, new_cache = dec(x[:, -1:], new_cache, use_cache=True)
+    assert (torch.cat([prefix, last], dim=1) - full).abs().max() < 1e-6
+
+    # 13. the cache is exactly the k and v a full forward would have computed --
+    #     nothing is approximated, past keys simply never change
+    k_full, v_full = dec.qkv(x).split(E, dim=-1)[1:]
+    k_full = k_full.view(B, T, NH, HS).transpose(1, 2)
+    v_full = v_full.view(B, T, NH, HS).transpose(1, 2)
+    ck, cv = cache
+    assert ck.shape == cv.shape == (B, NH, T, HS)
+    assert (ck - k_full).abs().max() < 1e-6 and (cv - v_full).abs().max() < 1e-6
+
+    # 14. use_cache is the only thing that changes the return type -- Block still
+    #     gets a bare Tensor, and the cached path is differentiable like any other
+    assert isinstance(dec(x), Tensor)
+    assert isinstance(dec(x, use_cache=True), tuple)
+    xc = x.clone().requires_grad_(True)
+    o, _ = dec(xc[:, :4], use_cache=True)
+    o.square().sum().backward()
+    assert xc.grad is not None and (xc.grad[:, 4:] == 0).all()
+
+    # 15. what it buys: decoding T tokens by recomputing the whole prefix every
+    #     step, against feeding one token into the cache. The gap is the point
+    Td = 256
+    xd = torch.randn(1, Td, Eb, device=dev)
+    gen = FusedQKVAttention(Eb, NHb, Td).to(dev)
+
+    def decode(use_cache: bool) -> float:
+        with torch.no_grad():
+            for _ in range(2):
+                gen(xd[:, :8])
+            if dev == "cuda":
+                torch.cuda.synchronize()
+            t0 = time.perf_counter()
+            cache = None
+            for t_ in range(Td):
+                if use_cache:
+                    _, cache = gen(xd[:, t_ : t_ + 1], cache, use_cache=True)
+                else:
+                    gen(xd[:, : t_ + 1])  # recompute the whole prefix
+            if dev == "cuda":
+                torch.cuda.synchronize()
+        return (time.perf_counter() - t0) * 1e3
+
+    recompute, cached = decode(False), decode(True)
+    print(
+        f"{dev}  decode {Td} tokens, E={Eb} -- recompute {recompute:.1f} ms   "
+        f"cached {cached:.1f} ms   ratio {recompute / cached:.2f}x"
     )
 
     print("ok")

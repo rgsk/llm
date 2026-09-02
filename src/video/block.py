@@ -1,5 +1,6 @@
 from typing import Literal
 
+from common import KVCache
 from feed_forward import FeedForward
 from fused_qkv_attention import FusedQKVAttention
 from gated_feed_forward import GatedFeedForward
@@ -68,10 +69,25 @@ class Block(Module):
         self.attn = make_attention(attention, n_embed, n_head, block_size, dropout)
         self.ffwd = make_ffwd(ffn, n_embed, dropout)
 
-    def forward(self, x: Tensor) -> Tensor:
-        x = x + self.attn(self.ln1(x))  # communicate
+    def forward(
+        self,
+        x: Tensor,
+        kv_cache: KVCache | None = None,
+        use_cache: bool = False,
+    ) -> Tensor | tuple[Tensor, KVCache]:
+        """The cache belongs to attn -- ln1, ffwd and the two residual adds are
+        per-position, so they neither read it nor need one of their own. A block
+        just carries it in and hands the new one back.
+
+        use_cache needs attention="fused" or "sdpa"; "mha" takes x only.
+        """
+        if use_cache:
+            attn_out, new_cache = self.attn(self.ln1(x), kv_cache, use_cache=True)
+        else:
+            attn_out = self.attn(self.ln1(x))
+        x = x + attn_out  # communicate
         x = x + self.ffwd(self.ln2(x))  # compute
-        return x  # [B, T, E]
+        return (x, new_cache) if use_cache else x  # [B, T, E]
 
 
 if __name__ == "__main__":
@@ -112,5 +128,29 @@ if __name__ == "__main__":
         x2 = x.clone()
         x2[:, t] += 10.0
         assert (blk(x2)[:, :t] - out[:, :t]).abs().max() < 1e-5, f"leak at t={t}"
+
+    # 5. the cache survives the ffwd and the residual adds: decoding one token
+    #    at a time through a fused block reproduces its full forward exactly
+    dec = Block(E, NH, T, attention="fused")
+    full = dec(x)
+    cache, steps = None, []
+    for t in range(T):
+        out_t, cache = dec(x[:, t : t + 1], cache, use_cache=True)
+        steps.append(out_t)
+    assert (torch.cat(steps, dim=1) - full).abs().max() < 1e-6
+    assert cache[0].shape == (B, NH, T, E // NH)
+    print("block decodes incrementally")
+
+    # 6. the same holds for sdpa, whose cache takes a different route to it
+    dec = Block(E, NH, T, attention="sdpa")
+    full = dec(x)
+    cache, steps = None, []
+    for t in range(T):
+        out_t, cache = dec(x[:, t : t + 1], cache, use_cache=True)
+        steps.append(out_t)
+    assert (torch.cat(steps, dim=1) - full).abs().max() < 1e-6
+
+    # 7. use_cache is opt-in, so mha -- which has no cache -- still works
+    assert Block(E, NH, T, attention="mha")(x).shape == (B, T, E)
 
     print("ok")

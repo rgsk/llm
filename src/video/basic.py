@@ -5,7 +5,12 @@ import sys
 from dataclasses import asdict
 
 import torch
-from checkpoint import generate_ckpt_path, latest_ckpt, load_checkpoint
+from checkpoint import (
+    CKPT_DIR,
+    generate_ckpt_path,
+    latest_ckpt,
+    load_checkpoint,
+)
 from dataset import BinDataset
 from generate import generate
 from gpt import GPT
@@ -56,12 +61,12 @@ def sample(model: GPT, prompt: str = "\n", max_new_tokens: int = 300, **kw) -> s
 
 
 if __name__ == "__main__":
-    run_training = True
+    run_training = False
     # a specific file, or None to take the newest run named train_cfg.name.
     # main.py's own checkpoints load here now -- they only need `attention`
     # named, since main.py never stored it
-    # ckpt = CKPT_DIR / "big_2026-08-16_06-45-06.pt"
-    ckpt = None
+    ckpt = CKPT_DIR / "big_2026-08-30_09-09-16.pt"
+    # ckpt = None
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"device {device}   run_training {run_training}")
 
@@ -90,6 +95,6 @@ if __name__ == "__main__":
     print(f"best step {m['step']}   val {m['val_loss']:.4f}   bpc {m['bpc']:.3f}")
 
     print("\n--- greedy ---")
-    print(sample(model, temperature=0.0))
+    print(sample(model, temperature=0.0, use_cache=True))
     print("\n--- temperature 0.8, top_p 0.95 ---")
-    print(sample(model, temperature=0.8, top_p=0.95))
+    print(sample(model, temperature=0.8, top_p=0.95, use_cache=True))
