@@ -1,50 +1,127 @@
-Here's the map after those two steps.
+# Roadmap
 
-## Immediately after scaling — training hygiene
+Updated 2026-09-02, after the KV cache landed.
 
-The 10M-param run takes real minutes on your 4060, which changes what you need:
+## Done
 
-- **Checkpointing** — `torch.save` model + optimizer state periodically. A 40-minute run you can't resume is a bad time.
-- **Mixed precision** — `torch.autocast` with `bfloat16`. Your 4060 supports it natively; roughly 2x faster and halves memory. Nearly free.
-- **`torch.compile(model)`** — one line, another sizable speedup.
-- **LR warmup + cosine decay**, and **gradient clipping** at 1.0. At `n_embed=384` a constant LR leaves performance on the table and occasionally blows up.
-- **A config dataclass.** You'll have ~12 globals by then. This is the point where they stop being manageable.
+Everything below is built from scratch in `src/video/` — one file per topic, each
+with its own `__main__` that tests it against a torch oracle.
 
-Expect **~1.48 val loss** on Shakespeare at that size. Output becomes recognizably English-shaped — real words, plausible dialogue structure, no meaning.
+**Model.** Linear, Embedding, LayerNorm, RMSNorm, ReLU, SiLU, softmax, dropout,
+cross-entropy, multinomial. Attention three ways: per-head `MultiHeadAttention`,
+`FusedQKVAttention` (one `[E -> 3E]` matmul, the checkpoint layout), and
+`SDPAttention`. Dense and gated (SwiGLU) FFNs. Block, GPT, weight tying,
+`1/sqrt(2·n_layer)` residual init.
 
-## Then the three genuinely big remaining pieces
+**Training.** AdamW with decay groups (2D only) and betas (0.9, 0.95),
+`clip_grad_norm` at 1.0, warmup + cosine decay, gradient accumulation,
+`torch.compile`, bf16 autocast, memmapped `uint16` shards, checkpoint/resume,
+wandb logging.
 
-**1\. BPE tokenizer, from scratch.** This is the other half of "how LLMs are built" and you haven't touched it. Byte-level, count adjacent pairs, merge the most frequent, repeat. ~150 lines. Take vocab to ~4096 and sequences get ~4x shorter, so the same `block_size` covers 4x more text. It's also where you'll finally understand tokenization pathologies — why models can't count letters in a word.
+**Inference.** Temperature, top-k, top-p, min-p. KV cache through the whole
+stack — attention, block, GPT, generate. Measured 5.2x on 12L/768E over 768
+tokens, 2.5x on the trained 8L/512E checkpoint over 512.
 
-**2\. Real data.** TinyStories or a FineWeb-Edu sample. Shakespeare is 1MB; you'll be memorizing it. This brings a new set of problems that are their own lesson: data doesn't fit in RAM, so you need `np.memmap` over pre-tokenized `uint16` shards, and a separate tokenize-once script.
+The old "three genuinely big remaining pieces" list is closed except for data:
+SDPA, RMSNorm, SwiGLU, weight tying, and the KV cache all shipped. Optimizer
+hygiene — the item that sat pending longest — is done too.
 
-**3\. Modern architecture.** Your model is 2017 GPT. What actually changed since:
+## Next, in order
 
-- `F.scaled_dot_product_attention` — flash attention, one call replacing your whole `Head.forward`, much faster and less memory
-- **RoPE** instead of learned position embeddings — relative positions, extrapolates past training length
-- **RMSNorm** instead of LayerNorm — cheaper, works as well
-- **SwiGLU** instead of ReLU MLP
-- **Weight tying** between the token embedding and `lm_head`
-- **KV cache** — your `generate` currently recomputes all previous tokens every step; caching makes it linear instead of quadratic
+**1. Sinusoidal positions.** One short file, and it exists to earn one idea:
+positions as frequencies. It is the bridge to RoPE, not a destination.
 
-Each is a small, independent swap. Do them one at a time and measure.
+**2. RoPE.** Do this now, while the cache is fresh. RoPE does not just replace
+learned positions — it changes what the cache holds. Rotated keys go in, and
+scores come to depend on `i - j`, which is what makes *cropping* the cache
+correct. Sliding-window attention and attention sinks become reachable in the
+same breath. Deferred, this costs a re-explanation of the whole cache.
 
-## After that
+Payoff test is already written: the reverse-string probe below.
 
-Sampling controls (temperature, top-k, top-p), gradient accumulation for larger effective batches, then post-training: supervised finetuning on an instruction dataset, LoRA, and optionally DPO. That's the step where it stops being a text continuation engine and starts behaving like an assistant.
+**3. GQA / MQA.** The sequel to the cache, and the highest-value item that was
+not on the original list. The cache costs `2 · n_layer · B · T · E` in memory;
+sharing k/v across query heads cuts it 4-8x. Small diff to the two attention
+files. Only lands as a lesson *after* someone has felt the memory cost, which is
+why it goes here and not earlier.
 
-## Pending
+**4. BPE tokenizer + FineWeb-Edu.** `src/tokenizer.py` works; port and clean it
+into `video/`. Byte-level, count pairs, merge, repeat. This is also where the
+chat special tokens get minted, so it has to precede SFT. Then real data at a
+size that does not fit in RAM.
 
-### optimizer hygiene
+**5. Padding and attention masks.** *Currently missing everywhere in
+`src/video/`* — checked, not assumed. Fine for pretraining on contiguous shards,
+a blocker for everything after it: SFT needs the loss masked over prompt tokens
+(`ignore_index`), and batched generation needs left-padding plus a real mask,
+since `generate` assumes every row shares a prompt length. Small file. It has to
+land before SFT, not during.
 
-The one item still outstanding from early on is optimizer hygiene — you're running AdamW with default wd=0.01 applied to norms and embeddings alike, no gradient clipping, and betas (0.9, 0.999). Param groups with decay only on 2D params, clip*grad_norm*(1.0), betas (0.9, 0.95) is a single run and likely a real gain. It's the cheapest unclaimed win on the board.
+**6. SFT + LoRA.** Cleaner versions of `src/sft.py` and `src/lora.py`. Chat
+template, loss masking, then LoRA as the parameter-efficient variant. This is
+where it stops being a continuation engine.
 
-### RoPE length-extrapolation test
+**7. RL.** **DPO first** — a loss function over a frozen reference model, no
+reward model, no rollouts, no value head, which fits the file-plus-test format.
+PPO/GRPO after, and budget three episodes: sampling loop, advantage estimation,
+KL control. It is the first thing in the series that can silently fail to learn.
 
-`sft.ipynb` has a reverse-string task (`hello>olleh`) that measures length generalization directly. Trained on word lengths 3–8 with `block_size` sized for 10, the learned-position model scores **1.0 on `evaluate()` and 0.0 on `evaluate(lmin=9, lmax=10)`** — it emits correct chunks of the reversal at the wrong offsets.
+## Worth covering, unscheduled
 
-Why it fails: position `t` must attend to `2l-1-t`, a *reflection*, so the required offset `2l-2t-1` depends on both `t` and `l` — no single rule covers it. But valid `(l, t)` pairs for l∈3–8 number only 33, small enough for a 32k-param model to memorize as a lookup. Lengths 9–10 add 19 pairs with no table entry, and the model is wrong from the very first output character.
+- **Chat templates and special tokens** — cheap, high payoff, pairs with SFT.
+  The difference between a continuer and an assistant is mostly a format contract.
+- **Speculative decoding** — the finale of the inference thread (cache → GQA →
+  spec decode). Draft proposes k, target verifies in one forward. Lossless, which
+  is the surprising part.
+- **Quantization (int8/int4)** — weight-only is ~100 lines, and it is the answer
+  to "how does this scale to a 7B on a 4060".
+- **Online softmax / flash internals** — `sdpa_attention.py` currently says eager
+  ops cannot express the tiling and leaves it there. Deriving the streaming
+  recurrence closes the one place the series says "trust the kernel".
+- **MoE** — routing, top-k experts, load-balancing loss. Self-contained.
+- **An eval beyond val loss** — bpc is there; something task-shaped makes the SFT
+  and RL episodes legible.
+- **YaRN / NTK context extension** — only as a RoPE sequel, if RoPE lands well.
 
-Measured, not assumed: position rows 0–15 all train normally; only rows 16–19 stay at init with exactly zero gradient (last kept target is `t=2l-1=15` at `l=8`, and causality stops later rows from ever reaching a kept position). So dead rows are a minor secondary effect — they only touch the tail of `l=9,10`. The missing lookup entries are the real cause.
+## Skip
 
-Re-run both after swapping in RoPE. RoPE removes the untrained-absolute-rows problem and makes scores depend on `t-p`, so the held-out number may improve — but it does not hand the model a reflection, and length generalization on reverse-and-copy is known-hard for positional encoding alone. **Treat a flat 0.0 as a fact about the task, not proof the RoPE code is broken.** Verify RoPE separately on val loss; use this as a bonus probe.
+**DDP / multi-GPU.** One 4060. All-reduce can be explained in three minutes
+inside the gradient-accumulation episode without a setup that cannot be run.
+
+## Pending probes
+
+### RoPE length extrapolation
+
+`sft.ipynb` has a reverse-string task (`hello>olleh`) that measures length
+generalization directly. Trained on word lengths 3-8 with `block_size` sized for
+10, the learned-position model scores **1.0 on `evaluate()` and 0.0 on
+`evaluate(lmin=9, lmax=10)`** — it emits correct chunks of the reversal at the
+wrong offsets.
+
+Why it fails: position `t` must attend to `2l-1-t`, a *reflection*, so the
+required offset `2l-2t-1` depends on both `t` and `l` — no single rule covers it.
+But valid `(l, t)` pairs for l∈3-8 number only 33, small enough for a 32k-param
+model to memorize as a lookup. Lengths 9-10 add 19 pairs with no table entry, and
+the model is wrong from the very first output character.
+
+Measured, not assumed: position rows 0-15 all train normally; only rows 16-19
+stay at init with exactly zero gradient (last kept target is `t=2l-1=15` at
+`l=8`, and causality stops later rows from ever reaching a kept position). So
+dead rows are a minor secondary effect — they only touch the tail of `l=9,10`.
+The missing lookup entries are the real cause.
+
+Re-run both after swapping in RoPE. RoPE removes the untrained-absolute-rows
+problem and makes scores depend on `t-p`, so the held-out number may improve —
+but it does not hand the model a reflection, and length generalization on
+reverse-and-copy is known-hard for positional encoding alone. **Treat a flat 0.0
+as a fact about the task, not proof the RoPE code is broken.** Verify RoPE
+separately on val loss; use this as a bonus probe.
+
+### Cropping the KV cache
+
+Not in the files, deliberately. Cropping the cache runs, never errors, and
+returns quietly wrong logits: cached k/v are baked with their absolute positions
+at write time, so a crop leaves survivors mis-numbered and colliding with the new
+token. The uncached path is correct only because it crops *ids* and recomputes.
+Revisit as a demo once RoPE makes it legitimate — that transition is the whole
+point of sliding-window attention.
