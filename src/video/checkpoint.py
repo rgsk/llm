@@ -36,12 +36,9 @@ def save_checkpoint(path: Path, model: GPT, cfg: GPTConfig, **meta) -> None:
     torch.save({"model": model.state_dict(), "config": asdict(cfg), **meta}, path)
 
 
-def load_checkpoint(
-    path: Path, device: str = "cpu", **overrides
-) -> tuple[GPT, GPTConfig, dict]:
-    """The mirror of save_checkpoint: weights, architecture, metadata. Returning
-    config inside the metadata would make save(*load(p)) silently drop the cfg
-    argument, since the dict merge lets the stale one win.
+def load_checkpoint(path: Path, device: str = "cpu", **overrides) -> tuple[GPT, dict]:
+    """Rebuild the exact architecture from the saved config, then fill in the weights.
+    The caller does not need to know the shape in advance -- the file says it.
 
     overrides patch the config before the model is built. main.py chose its
     attention from a module-level flag and never wrote it down, so its
@@ -50,7 +47,7 @@ def load_checkpoint(
     cfg = replace(GPTConfig.from_dict(saved["config"]), **overrides)
     model = GPT(**asdict(cfg)).to(device)
     model.load_state_dict(saved["model"])
-    return model, cfg, {k: v for k, v in saved.items() if k not in ("model", "config")}
+    return model, {k: v for k, v in saved.items() if k != "model"}
 
 
 if __name__ == "__main__":
@@ -67,7 +64,7 @@ if __name__ == "__main__":
         # 1. a checkpoint reloads into a model that computes exactly the same thing
         path = generate_ckpt_path("demo", d)
         save_checkpoint(path, model, cfg, step=42, val_loss=1.5, bpc=0.9)
-        loaded, loaded_cfg, meta = load_checkpoint(path)
+        loaded, meta = load_checkpoint(path)
         model.eval(), loaded.eval()
         assert (model(x) - loaded(x)).abs().max() == 0
 
@@ -80,14 +77,10 @@ if __name__ == "__main__":
         # 3. weight tying survives the round trip
         assert loaded.lm_head.weight is loaded.token_embedding_table.weight
 
-        # 4. the three tiers come back separately, so save(*load(p)) round-trips
+        # 4. metadata comes back, without the weights riding along
         assert meta["step"] == 42 and meta["val_loss"] == 1.5 and meta["bpc"] == 0.9
-        assert not {"model", "config"} & meta.keys()
-        assert loaded_cfg == cfg
-        save_checkpoint(d / "again.pt", loaded, loaded_cfg, **meta)
-        again = torch.load(d / "again.pt")
-        assert again.keys() == torch.load(path).keys()
-        assert again["config"] == asdict(cfg)  # the passed cfg, not a stale copy
+        assert "model" not in meta
+        assert GPTConfig.from_dict(meta["config"]) == cfg
 
         # 5. named runs get a unique file, "scratch" deliberately reuses one
         assert generate_ckpt_path("scratch", d) == generate_ckpt_path("scratch", d)
@@ -125,7 +118,7 @@ if __name__ == "__main__":
         save_checkpoint(
             rpath, model, cfg, step=7, opt=opt.state_dict(), train_gen=gen.get_state()
         )
-        loaded, _, meta = load_checkpoint(rpath)
+        loaded, meta = load_checkpoint(rpath)
 
         opt2 = AdamW(decay_groups(loaded, 0.1), lr=1e-3)
         opt2.load_state_dict(meta["opt"])

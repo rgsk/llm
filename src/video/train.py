@@ -274,7 +274,7 @@ if __name__ == "__main__":
         get_batch = real_get_batch
 
         # pick the wreckage back up -- one read gives the model and its state
-        c, _, m = load_checkpoint(d / "b.pt", device=device)
+        c, m = load_checkpoint(d / "b.pt", device=device)
         assert m["step"] == 40
         hist_c = train(
             c,
@@ -301,7 +301,7 @@ if __name__ == "__main__":
         )
 
         # the control: weights alone, no moments and no RNG, ends up somewhere else
-        n, _, _ = load_checkpoint(d / "b.pt", device=device)
+        n, _ = load_checkpoint(d / "b.pt", device=device)
         train(
             n, r_cfg, r_gpt_cfg, train_ds, val_ds, device=device, ckpt_path=d / "n.pt"
         )
