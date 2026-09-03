@@ -1,6 +1,6 @@
 # Roadmap
 
-Updated 2026-09-02, after the KV cache landed.
+Updated 2026-09-03, after GQA and the KV cache buffer landed.
 
 ## Done
 
@@ -22,14 +22,57 @@ wandb logging.
 stack — attention, block, GPT, generate. Measured 5.2x on 12L/768E over 768
 tokens, 2.5x on the trained 8L/512E checkpoint over 512.
 
+**GQA / MQA.** `gqa_attention.py` is the one to build on (SDPA plus
+`enable_gqa`); `fused_gqa_attention.py` is the eager artifact, kept because the
+grouping is only legible when you can see the scores. `n_kv_head` runs through
+`Block`, `GPT` and `GPTConfig`, and `"gqa"` is a first-class attention.
+`fused_qkv_attention.py` was deliberately left at its pre-GQA state.
+
+**Preallocated KV cache.** `kv_cache.py` — `KVCache` with two modes: grow by
+copying (what the old `type KVCache = tuple[Tensor, Tensor]` did) and a
+preallocated buffer written at a cursor. It kept the tuple's interface, so the
+older attention files needed no edits at all. Buffers allocate on first write,
+so device and dtype follow the data.
+
 The old "three genuinely big remaining pieces" list is closed except for data:
 SDPA, RMSNorm, SwiGLU, weight tying, and the KV cache all shipped. Optimizer
 hygiene — the item that sat pending longest — is done too.
+
+## Measured, so it does not get re-derived
+
+- **Fold q, do not widen k/v.** With `n_kv_head < n_head` the obvious move is
+  `repeat_interleave` on k and v up to `n_head`. It is correct and it rebuilds,
+  once per layer per token, the tensor the small cache exists not to store.
+  Folding the group into q instead — scores become `[B, nkv, n_rep*T, T_kv]` —
+  is **3.2x faster at decode** (0.56 vs 1.77 ms, B=16, T_kv=2048). Widening
+  keeps the storage win and hands back the entire latency win: it lands within
+  noise of the MHA it was supposed to beat. `enable_gqa=True` does the same
+  thing inside the kernel. `fused_gqa_attention.py` tests 8 and 9.
+
+- **Preallocation is a shape change, not a speedup.** The copy alone is
+  **26x** (`kv_cache.py` test 8). End to end through `generate` at B=1 with
+  `n_kv_head=2` it is **1.00x**. The copy is a few percent of a decode step, and
+  it does not grow relative to one — attention reads the cache once per step
+  too, so context scales both sides. Do it for the cursor (ring buffer, sliding
+  window, paged attention) and for not churning the allocator.
+
+- **GQA and preallocation attack the same cost**, so each shrinks the other's
+  payoff. Preallocation is worth 1.10x at `n_kv_head=8` and 1.00x at
+  `n_kv_head=2`, B=1. Measured up to 1.37x only at B=4 with an MHA-width cache —
+  i.e. in the configuration GQA just removed.
+
+- **Microbenchmarks of a cache flatter it.** Three times this session an
+  isolated measurement overstated: widen-vs-MHA was 2.3x on the bare attention
+  op and 1.1x in the layer; preallocation was 26x on the copy and 1.00x in
+  `generate`. Isolate any component of a decode step and it looks like the
+  bottleneck.
 
 ## Next, in order
 
 **1. Sinusoidal positions.** One short file, and it exists to earn one idea:
 positions as frequencies. It is the bridge to RoPE, not a destination.
+`sinusoidal.py` exists but is a generated draft that was never worked through —
+treat the file as unwritten.
 
 **2. RoPE.** Do this now, while the cache is fresh. RoPE does not just replace
 learned positions — it changes what the cache holds. Rotated keys go in, and
@@ -39,11 +82,13 @@ same breath. Deferred, this costs a re-explanation of the whole cache.
 
 Payoff test is already written: the reverse-string probe below.
 
-**3. GQA / MQA.** The sequel to the cache, and the highest-value item that was
-not on the original list. The cache costs `2 · n_layer · B · T · E` in memory;
-sharing k/v across query heads cuts it 4-8x. Small diff to the two attention
-files. Only lands as a lesson *after* someone has felt the memory cost, which is
-why it goes here and not earlier.
+**3. Ring buffer, sliding window, attention sinks.** The half of preallocation
+that actually pays. `kv_cache.py` has the cursor but never wraps: capacity is
+`block_size` and a run still has to fit. Evicting the oldest entries and reusing
+their slots is only correct once scores depend on `i - j`, so this waits on RoPE
+and on nothing else. StreamingLLM's wrinkle belongs here too — it re-indexes
+positions *within the cache*, which needs keys rotated at read time rather than
+baked at write time.
 
 **4. BPE tokenizer + FineWeb-Edu.** `src/tokenizer.py` works; port and clean it
 into `video/`. Byte-level, count pairs, merge, repeat. This is also where the
@@ -54,8 +99,9 @@ size that does not fit in RAM.
 `src/video/`* — checked, not assumed. Fine for pretraining on contiguous shards,
 a blocker for everything after it: SFT needs the loss masked over prompt tokens
 (`ignore_index`), and batched generation needs left-padding plus a real mask,
-since `generate` assumes every row shares a prompt length. Small file. It has to
-land before SFT, not during.
+since `generate` assumes every row shares a prompt length. That makes this gate
+RL as well as SFT — rollouts are batched generation. Small file. It has to land
+before SFT, not during.
 
 **6. SFT + LoRA.** Cleaner versions of `src/sft.py` and `src/lora.py`. Chat
 template, loss masking, then LoRA as the parameter-efficient variant. This is
