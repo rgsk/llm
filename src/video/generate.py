@@ -184,11 +184,89 @@ if __name__ == "__main__":
     # the uncached path still runs well past block_size, by forgetting
     assert generate(cm, p5, 40, temperature=0.0).shape == (2, 45)
 
-    # 9. and what it was all for -- measured on the real model, not a toy.
-    #    the uncached loop re-reads the whole prefix every step, so its cost
-    #    grows with what it has already written; the cached one does constant
-    #    work per token. the gap widens with the length of the sample
+    # 9. the two ways a cache can be stored, end to end. Same model, same
+    #    weights, same tokens -- the only difference is whether each layer's
+    #    KVCache preallocates [B, n_kv, block_size, hs] and writes at a cursor,
+    #    or torch.cats a whole new cache into existence every step.
+    #
+    #    kv_cache.py test 8 times that copy on its own and reports 26x. Read
+    #    the table below before believing it
     import time
+
+    dev = "cuda" if torch.cuda.is_available() else "cpu"
+    big = {
+        "vocab_size": 4096,
+        "block_size": 512,
+        "n_embed": 512,
+        "n_head": 8,
+        "n_layer": 8,
+    }
+    small = {
+        "vocab_size": 256,
+        "block_size": 128,
+        "n_embed": 128,
+        "n_head": 4,
+        "n_layer": 2,
+    }
+    gm = GPT(
+        **(big if dev == "cuda" else small),
+        attention="gqa",
+        n_kv_head=2,
+        norm="rms",
+        ffn="gated",
+    ).to(dev)
+    GN = gm.block_size  # prompt is 1 token, so this is the most the cache holds
+
+    def cache_mode(preallocate: bool) -> None:
+        """block_size is what sizes the buffer; None falls back to growing."""
+        for blk in gm.blocks:
+            blk.attn.block_size = gm.block_size if preallocate else None
+
+    def timed_gen(batch: int) -> tuple[float, Tensor]:
+        start = torch.zeros(batch, 1, dtype=torch.long, device=dev)
+        generate(gm, start, 4, temperature=0.0, use_cache=True)  # warm up
+        if dev == "cuda":
+            torch.cuda.synchronize()
+        t0 = time.perf_counter()
+        out = generate(gm, start, GN, temperature=0.0, use_cache=True)
+        if dev == "cuda":
+            torch.cuda.synchronize()
+        return time.perf_counter() - t0, out
+
+    print(f"\n  {GN} tokens, {gm.n_layer}L gqa n_kv_head=2, {dev}")
+    print(f"  {'batch':>5}  {'cache':>9}  {'grow':>7}  {'buffer':>7}  {'gain':>5}")
+    for batch in (1, 32) if dev == "cuda" else (1,):
+        cache_mode(False)
+        grow_s, grow_out = timed_gen(batch)
+        cache_mode(True)
+        buf_s, buf_out = timed_gen(batch)
+        assert torch.equal(grow_out, buf_out)  # identical tokens, greedy
+        held = 2 * gm.n_layer * batch * 2 * GN * (gm.blocks[0].attn.head_size) * 4
+        print(
+            f"  {batch:>5}  {held / 2**20:>6.0f} MB  {grow_s:>6.2f}s  "
+            f"{buf_s:>6.2f}s  {grow_s / buf_s:>4.2f}x"
+        )
+    #    no assert on the timings, because at batch 1 there is nothing to assert
+    """
+    This is the honest number, and it is 1.01x at batch 1 -- rising to about
+    1.15x at batch 64, where the cache is 256 MB. The 26x in kv_cache.py is
+    real and it is also irrelevant here: that test times the copy alone, and a
+    decode step is 8 layers of matmuls, an lm_head over the whole vocab, and
+    sampling, next to which copying 4 MB is nothing. Isolate any component of a
+    step and it will look like the bottleneck.
+
+    So preallocation is not a speed optimisation at this scale. Do it anyway,
+    for the two things it does buy: the allocator stops churning a fresh
+    multi-megabyte tensor per layer per token, and the cache gains a cursor --
+    which is what a ring buffer, a sliding window, and paged attention are all
+    built on. It earns its place as the shape the cache has to have, not as a
+    number on a chart. The number arrives later, with batch and context.
+    """
+
+    # 10. and what the cache itself was for -- measured on the real model, not
+    #     a toy. the uncached loop re-reads the whole prefix every step, so its
+    #     cost grows with what it has already written; the cached one does
+    #     constant work per token. the gap widens with the length of the sample
 
     from checkpoint import latest_ckpt, load_checkpoint
 

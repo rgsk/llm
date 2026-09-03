@@ -4,6 +4,7 @@ from common import KVCache
 from feed_forward import FeedForward
 from fused_qkv_attention import FusedQKVAttention
 from gated_feed_forward import GatedFeedForward
+from gqa_attention import GQAttention
 from layer_norm import LayerNorm
 from module import Module
 from multi_head_attention import MultiHeadAttention
@@ -11,15 +12,25 @@ from rms_norm import RMSNorm
 from sdpa_attention import SDPAttention
 from torch import Tensor
 
-Attention = Literal["mha", "fused", "sdpa"]
+Attention = Literal["mha", "fused", "sdpa", "gqa"]
 Norm = Literal["layer", "rms"]
 FFN = Literal["dense", "gated"]
 
 
 def make_attention(
-    kind: Attention, n_embed: int, n_head: int, block_size: int, dropout: float
+    kind: Attention,
+    n_embed: int,
+    n_head: int,
+    block_size: int,
+    dropout: float,
+    n_kv_head: int | None = None,
 ) -> Module:
-    """All three write the same residual stream; only "mha" has different keys."""
+    """All four write the same residual stream; only "mha" has different keys.
+
+    n_kv_head is "gqa" only -- the others project one k and v per query head, so
+    there is nothing to set. "gqa" with n_kv_head=None is MHA arithmetic in the
+    gqa layout, which is how the two get compared.
+    """
     match kind:
         case "mha":
             return MultiHeadAttention(n_embed, n_head, block_size, dropout)
@@ -27,6 +38,10 @@ def make_attention(
             return FusedQKVAttention(n_embed, n_head, block_size, dropout)
         case "sdpa":
             return SDPAttention(n_embed, n_head, dropout)  # builds its own mask
+        case "gqa":
+            # block_size is passed for the cache buffer, not for a mask: this is
+            # the only attention that preallocates instead of growing by copying
+            return GQAttention(n_embed, n_head, n_kv_head, dropout, block_size)
         case _:
             raise ValueError(f"unknown attention: {kind}")
 
@@ -63,10 +78,13 @@ class Block(Module):
         attention: Attention = "mha",
         norm: Norm = "layer",
         ffn: FFN = "dense",
+        n_kv_head: int | None = None,
     ):
         self.ln1 = make_norm(norm, n_embed)
         self.ln2 = make_norm(norm, n_embed)
-        self.attn = make_attention(attention, n_embed, n_head, block_size, dropout)
+        self.attn = make_attention(
+            attention, n_embed, n_head, block_size, dropout, n_kv_head
+        )
         self.ffwd = make_ffwd(ffn, n_embed, dropout)
 
     def forward(
@@ -79,7 +97,7 @@ class Block(Module):
         per-position, so they neither read it nor need one of their own. A block
         just carries it in and hands the new one back.
 
-        use_cache needs attention="fused" or "sdpa"; "mha" takes x only.
+        use_cache needs attention="fused", "sdpa" or "gqa"; "mha" takes x only.
         """
         if use_cache:
             attn_out, new_cache = self.attn(self.ln1(x), kv_cache, use_cache=True)

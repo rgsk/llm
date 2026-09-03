@@ -14,11 +14,17 @@ class GPTConfig:
     n_layer: int
     dropout: float = 0.0  # 0 disables it entirely; 0.1-0.2 for a model that overfits
     attention: Attention = "mha"  # "fused" and "sdpa" share one set of keys
+    n_kv_head: int | None = None  # "gqa" only; None means one k/v per query head
     norm: Norm = "layer"
     ffn: FFN = "dense"
 
     def __post_init__(self):
         assert self.n_embed % self.n_head == 0, "n_embed must divide by n_head"
+        if self.n_kv_head is not None:
+            assert self.attention == "gqa", "n_kv_head needs attention='gqa'"
+            assert self.n_head % self.n_kv_head == 0, (
+                "n_kv_head must divide n_head: every kv head serves the same group"
+            )
 
     @classmethod
     def from_dict(cls, d: dict) -> "GPTConfig":

@@ -21,6 +21,7 @@ class GPT(Module):
         attention: Attention = "mha",
         norm: Norm = "layer",
         ffn: FFN = "dense",
+        n_kv_head: int | None = None,
     ):
         self.block_size = block_size
         self.n_layer = n_layer
@@ -28,7 +29,16 @@ class GPT(Module):
         self.position_embedding_table = Embedding(block_size, n_embed)
         self.blocks = ModuleList(
             [
-                Block(n_embed, n_head, block_size, dropout, attention, norm, ffn)
+                Block(
+                    n_embed,
+                    n_head,
+                    block_size,
+                    dropout,
+                    attention,
+                    norm,
+                    ffn,
+                    n_kv_head,
+                )
                 for _ in range(n_layer)
             ]
         )
