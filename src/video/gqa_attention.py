@@ -2,8 +2,8 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor
 
-from common import KVCache
 from dropout import Dropout
+from kv_cache import KVCache
 from linear import Linear
 from module import Module
 from residual_proj import ResidualProj
@@ -51,6 +51,7 @@ class GQAttention(Module):
         n_head: int,
         n_kv_head: int | None = None,
         dropout: float = 0.0,
+        block_size: int | None = None,
     ):
         assert n_embed % n_head == 0, "n_embed must divide by n_head"
         n_kv_head = n_head if n_kv_head is None else n_kv_head
@@ -67,6 +68,9 @@ class GQAttention(Module):
         self.proj = ResidualProj(n_embed, n_embed)
         self.dropout_p = dropout
         self.resid_dropout = Dropout(dropout)
+        # only needed to size a preallocated cache. None keeps the old
+        # grow-by-copying behaviour, which is what training uses anyway
+        self.block_size = block_size
 
     def forward(
         self,
@@ -83,12 +87,16 @@ class GQAttention(Module):
         k = k.view(B, T, nkv, hs).transpose(1, 2)  # [B, nkv, T, hs]
         v = v.view(B, T, nkv, hs).transpose(1, 2)
 
+        if use_cache and kv_cache is None:
+            # the layer allocates it because only the layer knows n_kv_head and
+            # head_size; B, device and dtype come from the data on first write.
+            # capacity is block_size, and without one this falls back to the
+            # tuple's grow-by-copying
+            shape = None if self.block_size is None else (B, nkv, self.block_size, hs)
+            kv_cache = KVCache(shape)
         if kv_cache is not None:
-            past_k, past_v = kv_cache
-            k = torch.cat([past_k, k], dim=2)
-            v = torch.cat([past_v, v], dim=2)
-        # cache the NARROW tensors -- [B, nkv, T_kv, hs], n_rep times smaller
-        new_cache = (k, v)
+            # the NARROW k and v go in -- [B, nkv, T_kv, hs], n_rep smaller
+            k, v = kv_cache.append(k, v)
 
         T_kv = k.size(2)
         T_past = T_kv - T
@@ -120,7 +128,7 @@ class GQAttention(Module):
 
         out = out.transpose(1, 2).reshape(B, T, E)
         out = self.resid_dropout(self.proj(out))
-        return (out, new_cache) if use_cache else out
+        return (out, kv_cache) if use_cache else out
 
 
 if __name__ == "__main__":
@@ -258,7 +266,36 @@ if __name__ == "__main__":
         assert c[0].shape == (B, nkv, T, HS)
     print("decodes incrementally at every n_kv_head, cache stays [B, n_kv, T, hs]")
 
-    # 6. the payoff, measured on the real config: 8 layers, E=512, 8 heads,
+    # 6. the cache buffer. Hand the layer a block_size and it preallocates
+    #    [B, nkv, block_size, hs] once and writes each step at a cursor; leave
+    #    it out and the cache grows by copying, exactly as before. Same tokens
+    #    out either way -- the difference is how many allocations it took
+    buf = GQAttention(E, NH, 2, block_size=T)
+    grow = GQAttention(E, NH, 2)  # no block_size -> the naive mode
+    grow.load_state_dict(buf.state_dict())
+    full = buf(x)
+    cb = cg = None
+    ptrs, ob, og = set(), [], []
+    #    under no_grad, and not incidentally: k comes out of qkv, so it requires
+    #    grad whenever the weights do, and an in-place write into a buffer the
+    #    previous step's graph still needs is exactly what append refuses.
+    #    generate() is already decorated this way -- the buffer just makes the
+    #    requirement load-bearing instead of merely sensible
+    with torch.no_grad():
+        for t_ in range(T):
+            step_b, cb = buf(x[:, t_ : t_ + 1], cb, use_cache=True)
+            step_g, cg = grow(x[:, t_ : t_ + 1], cg, use_cache=True)
+            ptrs.add(cb[0].data_ptr())  # where this step's k actually lives
+            ob.append(step_b)
+            og.append(step_g)
+    assert (torch.cat(ob, dim=1) - full).abs().max() < 1e-6
+    assert (torch.cat(ob, dim=1) - torch.cat(og, dim=1)).abs().max() < 1e-6
+    assert len(ptrs) == 1, "the buffer should be allocated once, not per step"
+    assert cb.pos == T and cb.k.shape == (B, 2, T, HS)  # full capacity, all used
+    assert cg.shape is None and cg.k.shape == (B, 2, T, HS)  # grown to fit
+    print(f"decode {T} tokens -- buffer: 1 allocation   grow: {T}")
+
+    # 7. the payoff, measured on the real config: 8 layers, E=512, 8 heads,
     #    a full 512-token context. cache bytes are counted off the tensors the
     #    layer actually handed back, then multiplied by n_layer
     n_layer, Tb, Eb, nhb = 8, 512, 512, 8
@@ -281,7 +318,7 @@ if __name__ == "__main__":
         )
         assert total == 2 * n_layer * 1 * Tb * nkv * (Eb // nhb) * 2
 
-    # 7. ...and why anyone bothered, at a size this repo will not run. the same
+    # 8. ...and why anyone bothered, at a size this repo will not run. the same
     #    arithmetic on Llama-2-70B's geometry, for ONE sequence
     L, NHL, HSL, CTX = 80, 64, 128, 4096
 
@@ -295,7 +332,7 @@ if __name__ == "__main__":
     )
     print(f"    mqa  (n_kv_head={1:>2}): {cache_gb(1):>5.1f} GB")
     """
-    Test 6 is the table, test 7 is the reason. At this repo's scale MHA's cache
+    Test 7 is the table, test 8 is the reason. At this repo's scale MHA's cache
     is 8 MB and nobody cares. At 70B it is 10.7 GB for a single sequence -- more
     than the weights of a 7B model, for one user's context -- and it is re-read
     once per generated token. GQA-8 turns that into 1.3 GB, which is the
