@@ -19,6 +19,7 @@ class GPTConfig:
     norm: Norm = "layer"
     ffn: FFN = "dense"
     position: Position = "learned"
+    window: int | None = None  # sliding window; None attends to the whole past
 
     def __post_init__(self):
         assert self.n_embed % self.n_head == 0, "n_embed must divide by n_head"
@@ -35,6 +36,13 @@ class GPTConfig:
             assert (self.n_embed // self.n_head) % 2 == 0, (
                 "rope needs an even head_size: the dims rotate in pairs"
             )
+        if self.window is not None:
+            # a window is a mask, and only the layers that build their own mask
+            # from sliding_window_mask can narrow it
+            assert self.attention in ("sdpa", "gqa"), (
+                "window needs attention='sdpa' or 'gqa'"
+            )
+            assert self.window >= 1, "a window has to include the query itself"
         if self.n_kv_head is not None:
             assert self.attention == "gqa", "n_kv_head needs attention='gqa'"
             assert self.n_head % self.n_kv_head == 0, (
@@ -96,6 +104,20 @@ if __name__ == "__main__":
             {"position": "rope", "attention": "sdpa", "n_embed": 6, "n_head": 2},
             "head_size",
         ),
+    ]:
+        try:
+            replace(small_cfg, **bad)
+            raise SystemExit(f"should have failed: {bad}")
+        except AssertionError as e:
+            assert msg in str(e), (bad, str(e))
+
+    # 3c. a window is the second flag that constrains the attention, and for
+    #     the same reason: it is a mask, and only "sdpa" and "gqa" build their
+    #     own. W=0 is caught here too -- a query always attends to itself
+    assert replace(small_cfg, attention="sdpa", window=8).window == 8
+    for bad, msg in [
+        ({"window": 8}, "attention='sdpa'"),  # default attention is mha
+        ({"attention": "sdpa", "window": 0}, "include the query"),
     ]:
         try:
             replace(small_cfg, **bad)

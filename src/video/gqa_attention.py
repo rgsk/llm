@@ -8,6 +8,7 @@ from linear import Linear
 from module import Module
 from residual_proj import ResidualProj
 from rope import apply_rope, rope_tables
+from sliding_window import sliding_window_mask
 
 
 class GQAttention(Module):
@@ -49,6 +50,13 @@ class GQAttention(Module):
     nothing: the rotation acts per head on (T, head_size), so a k with n_rep
     fewer heads rotates by exactly the same table. What shrinks is the rotated
     cache -- fewer keys to rotate going in, and fewer to re-read every step.
+
+    window=W masks each query to the W keys ending at it (sliding_window.py),
+    and costs nothing here for the same reason rope does: a mask is a statement
+    about columns, grouping is a statement about heads, and the two never meet.
+    They cut different axes of the same cache -- GQA divides it by n_rep, a
+    window would bound it by W -- except that this rung does not shrink the
+    cache at all yet. It only stops the model looking at what is still there.
     """
 
     def __init__(
@@ -59,8 +67,10 @@ class GQAttention(Module):
         dropout: float = 0.0,
         block_size: int | None = None,
         use_rope: bool = False,
+        window: int | None = None,
     ):
         assert n_embed % n_head == 0, "n_embed must divide by n_head"
+        assert window is None or window >= 1, "a window has to include the query itself"
         n_kv_head = n_head if n_kv_head is None else n_kv_head
         assert n_head % n_kv_head == 0, (
             "n_kv_head must divide n_head: every kv head serves the same group size"
@@ -75,6 +85,7 @@ class GQAttention(Module):
         self.proj = ResidualProj(n_embed, n_embed)
         self.dropout_p = dropout
         self.resid_dropout = Dropout(dropout)
+        self.window = window
         # only needed to size a preallocated cache. None keeps the old
         # grow-by-copying behaviour, which is what training uses anyway
         self.block_size = block_size
@@ -124,18 +135,19 @@ class GQAttention(Module):
             k, v = kv_cache.append(k, v)
 
         T_kv = k.size(2)
-        T_past = T_kv - T
-        if kv_cache is None:
+        # a window nothing has fallen out of yet is not a window
+        unwindowed = self.window is None or T_kv <= self.window
+        if unwindowed and kv_cache is None:
             is_causal, attn_mask = True, None
-        elif T == 1:
+        elif unwindowed and T == 1:
             is_causal, attn_mask = False, None
         else:
-            # queries sit at T_past .. T_kv-1, and is_causal aligns top-left.
-            # same shift SDPAttention needed; grouping does not touch the mask,
-            # which is a fact about positions, not about heads
-            i = torch.arange(T_past, T_kv, device=x.device).unsqueeze(1)
-            j = torch.arange(T_kv, device=x.device)
-            is_causal, attn_mask = False, j <= i  # [T, T_kv], True = visible
+            # queries sit at T_past .. T_kv-1, and is_causal aligns top-left --
+            # the same shift SDPAttention needed, plus the band when a window
+            # is set. neither is a statement about heads, so grouping changes
+            # nothing here: the mask broadcasts over the head axis either way
+            is_causal = False
+            attn_mask = sliding_window_mask(T, T_kv, self.window, x.device)
 
         # k and v stay narrow. enable_gqa tells the kernel that q has n_rep
         # times more heads and to broadcast kv head g across the contiguous q
@@ -376,7 +388,64 @@ if __name__ == "__main__":
             assert (torch.cat([pre, rest], dim=1) - full).abs().max() < 1e-6
     print("rope + gqa decodes incrementally, grown cache and preallocated alike")
 
-    # 8. the payoff, measured on the real config: 8 layers, E=512, 8 heads,
+    # 8. the sliding window, which grouping does not touch for exactly the
+    #    reason rope did not: the mask indexes COLUMNS and grouping indexes
+    #    HEADS. The strongest way to say that is the degenerate case -- with
+    #    n_kv_head == n_head this has to be SDPAttention with the same window,
+    #    to the bit, the same claim test 1 made before either flag existed
+    W = 3
+    win = GQAttention(E, NH, NH, window=W)
+    ref_win = SDPAttention(E, NH, window=W)
+    win.load_state_dict(ref_win.state_dict())
+    assert (win(x) - ref_win(x)).abs().max() == 0
+
+    #    and at a real group size, against the same by-hand grouping test 3
+    #    used -- q head h against kv head h // n_rep -- now with the band
+    #    applied to the scores. no SDPA and no enable_gqa anywhere in here
+    gw = GQAttention(E, NH, 2, window=W)
+    q, k, v = gw.qkv(x).split([E, 2 * HS, 2 * HS], dim=-1)
+    q = q.view(B, T, NH, HS).transpose(1, 2)
+    k = k.view(B, T, 2, HS).transpose(1, 2)
+    v = v.view(B, T, 2, HS).transpose(1, 2)
+    band = sliding_window_mask(T, T, W)
+    heads = []
+    for h in range(NH):
+        g = h // gw.n_rep
+        sc = q[:, h] @ k[:, g].transpose(-2, -1) * HS**-0.5
+        heads.append(sc.masked_fill(~band, -torch.inf).softmax(dim=-1) @ v[:, g])
+    assert (gw.proj(torch.cat(heads, dim=-1)) - gw(x)).abs().max() < 1e-6
+    #    ...and it is a different function from the unwindowed layer, so the
+    #    agreement above is not two no-ops matching
+    plain_gw = GQAttention(E, NH, 2)
+    plain_gw.load_state_dict(gw.state_dict())
+    assert (gw(x) - plain_gw(x)).abs().max() > 1e-2
+    print(f"window W={W} is the same band under grouping, hand-computed per head")
+
+    # 9. the window through the preallocated cache, which is the combination
+    #    this layer is the only one to have: buffer mode writes at a cursor and
+    #    the window skips its mask while T_kv <= W, so a decode crosses a branch
+    #    boundary while writing in place. Both rope settings, since rope reads
+    #    T_past off the same cursor the buffer advances
+    for use_rope in (False, True):
+        m = GQAttention(E, NH, 2, block_size=T, use_rope=use_rope, window=W)
+        full = m(x)
+        with torch.no_grad():
+            c, steps = None, []
+            for t in range(T):
+                step, c = m(x[:, t : t + 1], c, use_cache=True)
+                steps.append(step)
+            assert (torch.cat(steps, dim=1) - full).abs().max() < 1e-6
+            for split in (1, W, W + 1, T - 1):  # either side of it, and on it
+                pre, c2 = m(x[:, :split], use_cache=True)
+                rest, c2 = m(x[:, split:], c2, use_cache=True)
+                assert (torch.cat([pre, rest], dim=1) - full).abs().max() < 1e-6
+        #    and the cache is exactly as large as it was without a window. this
+        #    rung buys a receptive field, not a byte -- W keys are attended and
+        #    T_kv keys are stored. closing that gap is the ring buffer's job
+        assert c2.pos == T and c2[0].shape == (B, 2, T, HS)
+    print("windowed decode holds through the buffer, and the cache is no smaller")
+
+    # 10. the payoff, measured on the real config: 8 layers, E=512, 8 heads,
     #    a full 512-token context. cache bytes are counted off the tensors the
     #    layer actually handed back, then multiplied by n_layer
     n_layer, Tb, Eb, nhb = 8, 512, 512, 8
@@ -399,7 +468,7 @@ if __name__ == "__main__":
         )
         assert total == 2 * n_layer * 1 * Tb * nkv * (Eb // nhb) * 2
 
-    # 9. ...and why anyone bothered, at a size this repo will not run. the same
+    # 11. ...and why anyone bothered, at a size this repo will not run. the same
     #    arithmetic on Llama-2-70B's geometry, for ONE sequence
     L, NHL, HSL, CTX = 80, 64, 128, 4096
 
@@ -413,7 +482,7 @@ if __name__ == "__main__":
     )
     print(f"    mqa  (n_kv_head={1:>2}): {cache_gb(1):>5.1f} GB")
     """
-    Test 8 is the table, test 9 is the reason. At this repo's scale MHA's cache
+    Test 10 is the table, test 11 is the reason. At this repo's scale MHA's cache
     is 8 MB and nobody cares. At 70B it is 10.7 GB for a single sequence -- more
     than the weights of a 7B model, for one user's context -- and it is re-read
     once per generated token. GQA-8 turns that into 1.3 GB, which is the

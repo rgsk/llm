@@ -63,6 +63,29 @@ distance is signed, and the sin half cancels only when `k = q`. Cached keys go
 in **already rotated**, rotated once, by the position the token actually had —
 `T_past` from `kv_cache.pos`. That is the invariant the next item depends on.
 
+**Sliding window (rung 1 of 3).** `sliding_window.py` — one function,
+`sliding_window_mask(T_q, T_kv, window)`, which subsumes the cached-query shift
+the two SDPA layers were already building by hand (`window=None` is exactly the
+old band). Wired into `sdpa_attention.py` and `gqa_attention.py` behind
+`window=W`, and through `Block` / `GPT` / `GPTConfig` as `window`, gated to
+`attention="sdpa"` or `"gqa"` the same way `use_rope` is.
+
+The three rungs are independent and were deliberately not done together: a
+window is a **mask**, a ring buffer is **storage that wraps**, attention sinks
+are a **policy about which slots never get evicted**. Rung 1 changes what the
+model computes and nothing about what it stores — the cache still holds every
+position and the kernel still walks all of them. Both attention layers keep
+their mask-free fast paths alive while `T_kv <= window`, so a decode crosses a
+branch boundary mid-run; that boundary is what the cache tests step over.
+
+Correct only because rope already made scores a function of `i - j`: a key 500
+back scores as a key 500 back whether or not position 499 is still visible.
+Tested against an eager band-mask oracle (and, per row, against attention over
+the literal `k[i-W+1:i+1]` slice — the masked columns contribute nothing).
+Receptive field is `L*(W-1)+1`, proved twice: boolean matrix powers of the mask,
+and a real stack of windowed layers where the out-of-reach positions move by
+**exactly zero**. Mistral-7B's W=4096 over 32 layers is a 131k-token reach.
+
 Note `block_size` now does double duty in `GQAttention`: it sizes the rope
 tables and selects the preallocated cache, so `use_rope=True` implies buffer
 mode. Harmless today; a separate flag if it ever stops being.
@@ -113,6 +136,14 @@ hygiene — the item that sat pending longest — is done too.
   the remaining guesses are dropped untested; counting them makes acceptance
   look like it falls with k when it is flat.
 
+- **Any `attn_mask` costs the flash backend.** Measured on the 4060:
+  `is_causal=True` in bf16 runs `FLASH_ATTENTION`; the same call with a bool
+  `attn_mask` does not, and falls to `EFFICIENT_ATTENTION`. So a sliding window
+  expressed as a mask is a *slowdown* over full causal attention at short
+  context, not a speedup — and the mask is itself a `[T_q, T_kv]` object, the
+  T² tensor SDPA exists not to materialise (4 GB at T=65536). A real windowed
+  kernel takes W as an integer and skips blocks. `sliding_window.py` test 6.
+
 - **Microbenchmarks of a cache flatter it.** Three times this session an
   isolated measurement overstated: widen-vs-MHA was 2.3x on the bare attention
   op and 1.1x in the layer; preallocation was 26x on the copy and 1.00x in
@@ -121,14 +152,29 @@ hygiene — the item that sat pending longest — is done too.
 
 ## Next, in order
 
-**1. Ring buffer, sliding window, attention sinks.** The half of preallocation
-that actually pays, and now unblocked: scores depend on `i - j`, which is what
-made evicting cache entries legitimate. `kv_cache.py` has the cursor but never
-wraps: capacity is `block_size` and a run still has to fit. Evicting the oldest
-entries and reusing their slots is the next step. StreamingLLM's wrinkle belongs
-here too — it re-indexes positions *within the cache*, which needs keys rotated
-at read time rather than baked at write time, and the current layers bake at
-write time. That is the one place this design will have to bend.
+**1. Ring buffer (rung 2), then attention sinks (rung 3).** Rung 1 shipped —
+see *Sliding window* above — and it bought quality/compute behaviour, not a
+byte. Rung 2 is the eviction: capacity `W`, cursor wraps, slot `i` holds
+position `p ≡ i (mod W)`. The change that propagates is that
+`self.k[:, :, :end]` stops being in position order, so the mask can no longer
+come from `arange`: `KVCache` has to expose a **positions vector** saying which
+absolute position lives in each slot, and attention builds both the mask and the
+ordering from that. Rotation stays baked in at write time and stays correct —
+only `q_pos - k_pos` matters, not slot order.
+
+Two constraints to pin before starting. A wrapped ring buffer cannot roll back
+past overwritten entries, so eviction and `rollback` (speculative decoding) are
+mutually constrained — assert it rather than let it corrupt. And rung 2's cache
+is the first one whose contents are not a prefix of the sequence, which every
+`c[0].shape == (B, nkv, T, hs)` assertion in the suite currently assumes.
+
+Rung 3 is attention sinks: pin the first `S` slots, ring the rest. This is the
+rung that forces the bend — once generation runs past `block_size` the rope
+table is exhausted, and StreamingLLM's fix is to **re-index positions within the
+cache**, which needs keys stored *unrotated* and rotated at read time. Keep
+write-time rotation for rungs 1–2 and introduce read-time rotation as rung 3's
+lesson: rotating the whole window every step is the cost, and the cost is the
+point.
 
 Also unblocked and unrun: the reverse-string probe below. Do it before or after,
 but do not let it silently not happen.

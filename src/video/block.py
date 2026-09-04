@@ -1,5 +1,7 @@
 from typing import Literal
 
+from torch import Tensor
+
 from common import KVCache
 from feed_forward import FeedForward
 from fused_qkv_attention import FusedQKVAttention
@@ -10,7 +12,6 @@ from module import Module
 from multi_head_attention import MultiHeadAttention
 from rms_norm import RMSNorm
 from sdpa_attention import SDPAttention
-from torch import Tensor
 
 Attention = Literal["mha", "fused", "sdpa", "gqa"]
 Norm = Literal["layer", "rms"]
@@ -25,6 +26,7 @@ def make_attention(
     dropout: float,
     n_kv_head: int | None = None,
     use_rope: bool = False,
+    window: int | None = None,
 ) -> Module:
     """All four write the same residual stream; only "mha" has different keys.
 
@@ -34,10 +36,15 @@ def make_attention(
 
     use_rope needs "sdpa" or "gqa": rotary positions live inside attention, so
     unlike norm or ffn they have to be built into whichever layer runs there,
-    and the two older layers never learned about them.
+    and the two older layers never learned about them. window is the same story
+    -- it is a mask, and only the two layers that build their mask from
+    sliding_window_mask know how to narrow it.
     """
     assert not use_rope or kind in ("sdpa", "gqa"), (
         f"use_rope needs attention='sdpa' or 'gqa', not {kind!r}"
+    )
+    assert window is None or kind in ("sdpa", "gqa"), (
+        f"window needs attention='sdpa' or 'gqa', not {kind!r}"
     )
     match kind:
         case "mha":
@@ -47,12 +54,12 @@ def make_attention(
         case "sdpa":
             # block_size is only needed to size the rope tables; without rope
             # this layer still builds its own mask and needs nothing
-            return SDPAttention(n_embed, n_head, dropout, block_size, use_rope)
+            return SDPAttention(n_embed, n_head, dropout, block_size, use_rope, window)
         case "gqa":
             # block_size is passed for the cache buffer, not for a mask: this is
             # the only attention that preallocates instead of growing by copying
             return GQAttention(
-                n_embed, n_head, n_kv_head, dropout, block_size, use_rope
+                n_embed, n_head, n_kv_head, dropout, block_size, use_rope, window
             )
         case _:
             raise ValueError(f"unknown attention: {kind}")
@@ -92,11 +99,12 @@ class Block(Module):
         ffn: FFN = "dense",
         n_kv_head: int | None = None,
         use_rope: bool = False,
+        window: int | None = None,
     ):
         self.ln1 = make_norm(norm, n_embed)
         self.ln2 = make_norm(norm, n_embed)
         self.attn = make_attention(
-            attention, n_embed, n_head, block_size, dropout, n_kv_head, use_rope
+            attention, n_embed, n_head, block_size, dropout, n_kv_head, use_rope, window
         )
         self.ffwd = make_ffwd(ffn, n_embed, dropout)
 
@@ -183,5 +191,38 @@ if __name__ == "__main__":
 
     # 7. use_cache is opt-in, so mha -- which has no cache -- still works
     assert Block(E, NH, T, attention="mha")(x).shape == (B, T, E)
+
+    # 8. the sliding window reaches attn and stops there. ln, ffwd and the two
+    #    residual adds are all per-position, so a block's reach is exactly its
+    #    attention's: perturb position t and W positions move, no more. that is
+    #    the per-layer step the L*(W-1)+1 receptive field is built out of
+    W = 3
+    win = Block(E, NH, T, attention="sdpa", window=W)
+    out = win(x)
+    for t in range(T):
+        x2 = x.clone()
+        x2[:, t] += 10.0
+        d = (win(x2) - out).abs().amax(dim=(0, 2))
+        assert (d[:t] == 0).all() and d[t] > 1e-3
+        assert (d[t + W :] == 0).all(), f"leak past the window at t={t}"
+    #    and it decodes, which is the pairing that can go wrong: the block hands
+    #    the cache through untouched while the window changes what attn does
+    #    with it
+    full = win(x)
+    cache, steps = None, []
+    for t in range(T):
+        out_t, cache = win(x[:, t : t + 1], cache, use_cache=True)
+        steps.append(out_t)
+    assert (torch.cat(steps, dim=1) - full).abs().max() < 1e-6
+    print(f"a block of W={W} moves exactly {W} positions, and still decodes")
+
+    # 9. and like use_rope, the flag only reaches the two layers that build
+    #    their own mask -- "mha" and "fused" would silently ignore it
+    for kind in ("mha", "fused"):
+        try:
+            Block(E, NH, T, attention=kind, window=W)
+            raise SystemExit(f"should have failed for {kind}")
+        except AssertionError as e:
+            assert "window" in str(e)
 
     print("ok")

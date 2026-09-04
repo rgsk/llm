@@ -1,6 +1,8 @@
 from typing import Literal
 
 import torch
+from torch import Tensor
+
 from block import FFN, Attention, Block, Norm, make_norm
 from common import KVCache
 from embedding import Embedding
@@ -9,7 +11,6 @@ from module import Module
 from module_list import ModuleList
 from residual_proj import ResidualProj
 from sinusoidal import SinusoidalEmbedding
-from torch import Tensor
 
 Position = Literal["learned", "sinusoidal", "rope"]
 
@@ -53,6 +54,7 @@ class GPT(Module):
         ffn: FFN = "dense",
         position: Position = "learned",
         n_kv_head: int | None = None,
+        window: int | None = None,
     ):
         self.block_size = block_size
         self.n_layer = n_layer
@@ -73,6 +75,7 @@ class GPT(Module):
                     ffn,
                     n_kv_head,
                     position == "rope",
+                    window,
                 )
                 for _ in range(n_layer)
             ]
@@ -381,6 +384,71 @@ if __name__ == "__main__":
             raise SystemExit(f"should have failed for {kind}")
         except AssertionError as e:
             assert "use_rope" in str(e)
+
+    # ------------------------------------------------------- sliding window
+
+    # 18. the window is a mask, so unlike rope it changes nothing structural:
+    #     same parameters, same checkpoint keys, same everything on disk. What
+    #     it changes is the answer, and the reach. NL layers of W step W-1
+    #     positions each, so the whole model sees NL*(W-1)+1 tokens back --
+    #     more than one layer's window, and far less than block_size
+    W = 3
+    wm = GPT(V, BS, E, NH, NL, attention="sdpa", window=W)
+    pm = GPT(V, BS, E, NH, NL, attention="sdpa")
+    pm.load_state_dict(wm.state_dict())
+    assert wm.state_dict().keys() == pm.state_dict().keys()
+    assert (wm(idx) - pm(idx)).abs().max() > 1e-2  # a different model, same file
+
+    #     measured the only way that proves it on a real model: change ONE
+    #     token, at position 0, and see which output positions notice. that is
+    #     the receptive field read backwards -- "what can position i see" and
+    #     "which outputs move when i poke input 0" are the same relation
+    #     transposed. the taint spreads one layer at a time, W-1 per layer:
+    #
+    #       after     tainted   why
+    #       layer 1   0-2       only these attend to position 0 directly
+    #       layer 2   0-4       position 4 attends to layer-1 outputs {2,3,4},
+    #                           and 2 is tainted
+    #       layer 3   0-6       position 6 attends to {4,5,6}, and 4 is tainted
+    #
+    #     ln_f and lm_head are per-position, so they spread it no further:
+    #     3*(3-1)+1 = 7. the two asserts do different jobs. the second is the
+    #     window being correct; the first stops the test passing vacuously,
+    #     since a model whose attention was silently broken would sail through
+    #     "nothing moved" alone. and == 0 is deliberate rather than a loose
+    #     tolerance that happened to hold: position 7 never reads a tensor that
+    #     changed, so its logits are bit-identical, not merely close. a leak of
+    #     one stale column would be tiny and nonzero, and < 1e-5 would accept it
+    span = NL * (W - 1) + 1
+    base = wm(idx)
+    idx2 = idx.clone()
+    idx2[:, 0] = (idx2[:, 0] + 1) % V  # a different token at position 0
+    d = (wm(idx2) - base).abs().amax(dim=(0, 2))  # per position, over B and V
+    assert (d[:span] > 1e-4).all(), d  # the window is not too narrow
+    assert (d[span:] == 0).all(), d  # ...and it does not leak
+    print(f"{NL} layers of W={W} reach {span} tokens; block_size is {BS}")
+
+    #     and it decodes: prefill part of the prompt, then step. every layer
+    #     crosses the T_kv <= W boundary mid-run, and all NL of them have to
+    #     land on the same logits the parallel forward produced
+    logits_w, caches_w = wm(idx[:, :2], use_cache=True)
+    outs = [logits_w]
+    for t in range(2, T):
+        logits_w, caches_w = wm(idx[:, t : t + 1], caches_w, use_cache=True)
+        outs.append(logits_w)
+    assert (torch.cat(outs, dim=1) - base).abs().max() < 1e-5
+    #     and nothing was evicted -- rung 1 stores the whole past and looks at
+    #     a window of it. the cache is still block_size-bound
+    assert caches_w[0][0].size(2) == T
+    print("windowed GPT decodes incrementally; the cache still holds everything")
+
+    # 19. the flag only reaches an attention that builds its own mask
+    for kind in ("mha", "fused"):
+        try:
+            GPT(V, BS, E, NH, NL, attention=kind, window=W)
+            raise SystemExit(f"should have failed for {kind}")
+        except AssertionError as e:
+            assert "window" in str(e)
 
     # ---------------------------------------------------------------- KV cache
 
