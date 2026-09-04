@@ -100,7 +100,7 @@ if __name__ == "__main__":
     #    because a sum of cosines at many frequencies is not a decaying kernel.
     #    "sinusoidal encodes distance" is a local statement; at range this
     #    carries an ordering, not a metric
-    by_distance = torch.tensor([torch.diagonal(g, offset=d)[0] for d in range(T)])
+    by_distance = torch.tensor([g[0, d] for d in range(T)])
     #    at d=0 each pair contributes sin^2 + cos^2 = 1, so the peak is E/2
     assert by_distance[0] == by_distance.max()
     assert abs(by_distance[0].item() - E / 2) < 1e-4
