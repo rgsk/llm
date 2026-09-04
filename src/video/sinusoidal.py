@@ -109,6 +109,12 @@ if __name__ == "__main__":
     assert by_distance[T // 2 :].max() < 0.75 * by_distance[0]
     print("dot by distance:", [f"{v:.1f}" for v in by_distance[:10]], "...")
 
+    #    and that sum is exactly what the identity predicts: E/2 cosines, one
+    #    per column pair, evaluated at the distance
+    theta = 10000 ** (-torch.arange(0, E, 2) / E)  # [E/2]
+    closed = torch.cos(torch.arange(T).unsqueeze(1) * theta).sum(1)  # [T]
+    assert (by_distance - closed).abs().max() < 1e-4
+
     # a learned table has no such structure: its diagonals are unrelated numbers
     gl = learned.weight @ learned.weight.T
     d5 = torch.diagonal(gl, offset=5)

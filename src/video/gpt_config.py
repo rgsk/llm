@@ -1,6 +1,7 @@
 from dataclasses import dataclass, fields
 
 from block import FFN, Attention, Norm
+from gpt import Position
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -17,9 +18,14 @@ class GPTConfig:
     n_kv_head: int | None = None  # "gqa" only; None means one k/v per query head
     norm: Norm = "layer"
     ffn: FFN = "dense"
+    position: Position = "learned"
 
     def __post_init__(self):
         assert self.n_embed % self.n_head == 0, "n_embed must divide by n_head"
+        if self.position == "sinusoidal":
+            # the columns come in (sin, cos) pairs, so there has to be an even
+            # number of them. Caught here rather than three frames deeper
+            assert self.n_embed % 2 == 0, "sinusoidal positions need an even n_embed"
         if self.n_kv_head is not None:
             assert self.attention == "gqa", "n_kv_head needs attention='gqa'"
             assert self.n_head % self.n_kv_head == 0, (

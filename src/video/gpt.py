@@ -1,3 +1,5 @@
+from typing import Literal
+
 import torch
 from block import FFN, Attention, Block, Norm, make_norm
 from common import KVCache
@@ -6,7 +8,32 @@ from linear import Linear
 from module import Module
 from module_list import ModuleList
 from residual_proj import ResidualProj
+from sinusoidal import SinusoidalEmbedding
 from torch import Tensor
+
+Position = Literal["learned", "sinusoidal"]
+
+
+def make_position(kind: Position, block_size: int, n_embed: int) -> Module:
+    """Both answer the same call -- a tensor of positions in, [.., n_embed] out --
+    and both get ADDED to the token embedding at the bottom of the stack.
+
+    "learned" is a block_size x n_embed table trained like any other parameter.
+    "sinusoidal" is the same shape computed from a formula, so it costs no
+    parameters and every row exists whether or not training ever reached it.
+
+    This lives beside the model rather than inside the block because an additive
+    position is a property of the input, not of attention. RoPE will not fit
+    here -- it multiplies q and k inside attention instead of adding anything to
+    the residual stream -- which is the point of naming the choice now.
+    """
+    match kind:
+        case "learned":
+            return Embedding(block_size, n_embed)
+        case "sinusoidal":
+            return SinusoidalEmbedding(block_size, n_embed)
+        case _:
+            raise ValueError(f"unknown position: {kind}")
 
 
 class GPT(Module):
@@ -21,12 +48,16 @@ class GPT(Module):
         attention: Attention = "mha",
         norm: Norm = "layer",
         ffn: FFN = "dense",
+        position: Position = "learned",
         n_kv_head: int | None = None,
     ):
         self.block_size = block_size
         self.n_layer = n_layer
         self.token_embedding_table = Embedding(vocab_size, n_embed)
-        self.position_embedding_table = Embedding(block_size, n_embed)
+        # kept under the old name: "learned" writes the same state_dict key it
+        # always did, so existing checkpoints load untouched. "sinusoidal"
+        # writes no key at all, which is the honest description of it
+        self.position_embedding_table = make_position(position, block_size, n_embed)
         self.blocks = ModuleList(
             [
                 Block(
@@ -248,13 +279,56 @@ if __name__ == "__main__":
     # - stream growth at depth 1/3/8/24: ['1.67x', '2.39x', '4.09x', '6.93x']
     assert max(growths) - min(growths) < 0.2  # flat in depth
 
+    # ----------------------------------------------------------- positions
+
+    pos_ids = torch.randint(0, V, (4, 8))
+    sin = GPT(V, BS, E, NH, NL, attention="sdpa", position="sinusoidal")
+    learned = GPT(V, BS, E, NH, NL, attention="sdpa")
+
+    # 10. sinusoidal is a drop-in on the position side: same call, same output
+    #     shape, and block_size * n_embed fewer parameters, because a formula is
+    #     not a table. Nothing else about the model moves
+    n_sin = sum(p.numel() for p in sin.parameters())
+    n_learned = sum(p.numel() for p in learned.parameters())
+    assert n_learned - n_sin == BS * E
+    assert sin(pos_ids).shape == learned(pos_ids).shape == (4, 8, V)
+
+    # 11. and it writes nothing to the checkpoint. The learned table is a key;
+    #     the formula is not, so the two are not interchangeable on disk even
+    #     though the tensors would line up -- and __init__ rebuilds these exact
+    #     numbers anyway, which is what makes the key unnecessary
+    assert "position_embedding_table.weight" in learned.state_dict()
+    assert not any("position" in k for k in sin.state_dict())
+    assert [n for n, _ in sin.named_buffers()] == ["position_embedding_table.pe"]
+    #     a float buffer, so .to() casts it -- unlike attention's bool tril
+    cast = GPT(V, BS, E, NH, NL, position="sinusoidal").to(torch.float64)
+    assert cast.position_embedding_table.pe.dtype == torch.float64
+
+    # 12. the cache still knows where it is. Positions come from
+    #     arange(T_past, T_past + T) either way, so the one thing that is easy
+    #     to get wrong here does not care which encoding produced them
+    full_sin = sin(pos_ids)
+    head, cs = sin(pos_ids[:, :5], use_cache=True)
+    tail, cs = sin(pos_ids[:, 5:], cs, use_cache=True)
+    assert (torch.cat([head, tail], dim=1) - full_sin).abs().max() < 1e-5
+
+    # 13. an unknown encoding fails where the model is built, not at forward.
+    #     RoPE will not arrive through this door: it multiplies q and k inside
+    #     attention rather than adding anything to the residual stream
+    try:
+        GPT(V, BS, E, NH, NL, position="rope")
+        raise SystemExit("should have failed")
+    except ValueError as e:
+        assert "unknown position" in str(e)
+    print("sinusoidal positions: same shapes, no parameters, no checkpoint keys")
+
     # ---------------------------------------------------------------- KV cache
 
     cm = GPT(V, BS, E, NH, NL, attention="fused")
     ids = torch.randint(0, V, (B, T))
     full = cm(ids)
 
-    # 10. end to end: prefill the prompt, then step one token at a time. the
+    # 14. end to end: prefill the prompt, then step one token at a time. the
     #     logits are the same ones the full forward produces
     prompt, rest = ids[:, :5], ids[:, 5:]
     out, caches = cm(prompt, use_cache=True)
@@ -264,12 +338,12 @@ if __name__ == "__main__":
         assert (out[:, -1] - full[:, 5 + t]).abs().max() < 1e-5
     print("cached prefill + decode matches full forward")
 
-    # 11. one cache per block, none shared, each grown to the full length
+    # 15. one cache per block, none shared, each grown to the full length
     assert len(caches) == NL
     assert all(k.shape == v.shape == (B, NH, T, E // NH) for k, v in caches)
     assert caches[0][0].data_ptr() != caches[1][0].data_ptr()
 
-    # 12. THE bug this design exists to avoid: the cached token must be told
+    # 16. THE bug this design exists to avoid: the cached token must be told
     #     where it is. Feeding it as a fresh sequence puts it at position 0, and
     #     nothing errors -- the logits are just quietly wrong
     _, c5 = cm(ids[:, :5], use_cache=True)
@@ -278,7 +352,7 @@ if __name__ == "__main__":
     assert (cached_step - full[:, 5:6]).abs().max() < 1e-5
     assert (naive_step - full[:, 5:6]).abs().max() > 1e-3
 
-    # 13. block_size counts the cache too, not just idx
+    # 17. block_size counts the cache too, not just idx
     try:
         big = [
             (torch.zeros(1, NH, BS, E // NH), torch.zeros(1, NH, BS, E // NH))
@@ -289,7 +363,7 @@ if __name__ == "__main__":
     except AssertionError as e:
         assert "block_size" in str(e)
 
-    # 14. use_cache=False is untouched: still a bare Tensor, still trains
+    # 18. use_cache=False is untouched: still a bare Tensor, still trains
     assert isinstance(cm(ids), Tensor)
     cm.zero_grad()
     cross_entropy(cm(ids).reshape(B * T, V), targets.reshape(B * T)).backward()

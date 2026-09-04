@@ -34,6 +34,7 @@ gpt_cfg = GPTConfig(
     n_head=6,
     n_layer=4,
     attention="sdpa",
+    position="learned",
 )
 
 # gpt_cfg = big_cfg
