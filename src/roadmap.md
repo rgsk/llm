@@ -87,6 +87,41 @@ Receptive field is `L*(W-1)+1`, proved twice: boolean matrix powers of the mask,
 and a real stack of windowed layers where the out-of-reach positions move by
 **exactly zero**. Mistral-7B's W=4096 over 32 layers is a 131k-token reach.
 
+**Ring buffer (rung 2).** `ring_kv_cache.py` — `RingKVCache(KVCache)`, capacity
+`W` instead of `block_size`, cursor wraps, the entry for position `p` lives in
+slot `p % W`. Memory per layer stops growing with the run: measured flat at
+0.50 GB from 4k to 256k context (32L/8kv/hs=128, bf16) against 32 GB for a full
+cache. Wired into `GQAttention` as `ring=True` and through `Block` / `GPT` /
+`GPTConfig`, gated to `attention="gqa"` — `"sdpa"` grows its cache by `torch.cat`
+and never held a `KVCache` to wrap.
+
+Three things this pass established, all measured rather than asserted:
+
+- **Slot order is not information.** Softmax is permutation-equivariant over the
+  key axis, so the ring never needs un-permuting — only the *mask* needs to know
+  which position lives in which slot. `sliding_window.py` grew
+  `window_mask_from_positions(q_pos, k_pos, window)` for that, and
+  `sliding_window_mask` is now the contiguous special case of it.
+- **Decode needs no mask at all.** Every slot a ring still holds is inside its
+  window by construction, so rung 2 takes back out of the hot path the mask
+  rung 1 put into it. The mask survives only for prefill and chunked verify.
+- **Evicting == masking.** A ring decode reproduces a full-cache windowed decode
+  to `1e-6` (`ring_kv_cache.py` test 7, `gqa_attention.py` tests 10–11, over a
+  run long enough for the cursor to go round 8x). Eviction is not an
+  approximation of the windowed model; it *is* the windowed model.
+
+Two contracts broke, both on purpose. `append` no longer returns what it stores —
+a prefill longer than the ring gets back every key it is entitled to and only
+its tail is retained. And `rollback` refuses once the ring has wrapped, because
+the entries it wants back are the ones eviction overwrote: speculative decoding
+and eviction are genuinely mutually exclusive there, so it asserts rather than
+returning stale keys.
+
+`GPT.forward` had a latent bug the ring exposed: `T_past` was read off the
+cache's width, which is the same number right up until a cache learns to evict.
+It now asks for `pos` and falls back to the width only for the plain tuple that
+`"fused"` and `"sdpa"` return.
+
 Note `block_size` now does double duty in `GQAttention`: it sizes the rope
 tables and selects the preallocated cache, so `use_rope=True` implies buffer
 mode. Harmless today; a separate flag if it ever stops being.
@@ -153,29 +188,21 @@ hygiene — the item that sat pending longest — is done too.
 
 ## Next, in order
 
-**1. Ring buffer (rung 2), then attention sinks (rung 3).** Rung 1 shipped —
-see *Sliding window* above — and it bought quality/compute behaviour, not a
-byte. Rung 2 is the eviction: capacity `W`, cursor wraps, slot `i` holds
-position `p ≡ i (mod W)`. The change that propagates is that
-`self.k[:, :, :end]` stops being in position order, so the mask can no longer
-come from `arange`: `KVCache` has to expose a **positions vector** saying which
-absolute position lives in each slot, and attention builds both the mask and the
-ordering from that. Rotation stays baked in at write time and stays correct —
-only `q_pos - k_pos` matters, not slot order.
-
-Two constraints to pin before starting. A wrapped ring buffer cannot roll back
-past overwritten entries, so eviction and `rollback` (speculative decoding) are
-mutually constrained — assert it rather than let it corrupt. And rung 2's cache
-is the first one whose contents are not a prefix of the sequence, which every
-`c[0].shape == (B, nkv, T, hs)` assertion in the suite currently assumes.
-
-Rung 3 is attention sinks: pin the first `S` slots, ring the rest. This is the
+**1. Attention sinks (rung 3).** Rungs 1 and 2 shipped — see *Sliding window*
+and *Ring buffer* above. Rung 3 is attention sinks: pin the first `S` slots, ring the rest. This is the
 rung that forces the bend — once generation runs past `block_size` the rope
 table is exhausted, and StreamingLLM's fix is to **re-index positions within the
 cache**, which needs keys stored *unrotated* and rotated at read time. Keep
 write-time rotation for rungs 1–2 and introduce read-time rotation as rung 3's
 lesson: rotating the whole window every step is the cost, and the cost is the
 point.
+
+Concretely, what rung 3 has to change: `RingKVCache` gains `S` pinned slots the
+cursor skips, so the wrap is over `slots[S:]` rather than all of them —
+`positions` already carries everything the mask needs, so that side is done.
+Then `GPT.forward`'s `T_past + T <= block_size` assert becomes the binding
+constraint, because it is the rope table, not the cache, that runs out. That is
+where write-time rotation has to give.
 
 Also unblocked and unrun: the reverse-string probe below. Do it before or after,
 but do not let it silently not happen.

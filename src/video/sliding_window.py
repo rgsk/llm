@@ -54,6 +54,22 @@ import torch
 from torch import Tensor
 
 
+def window_mask_from_positions(
+    q_pos: Tensor, k_pos: Tensor, window: int | None = None
+) -> Tensor:
+    """[len(q_pos), len(k_pos)] bool, from explicit ABSOLUTE positions.
+
+    The general form, and the only one that survives a cache whose contents are
+    not a contiguous prefix. Nothing here assumes k_pos is sorted, contiguous,
+    or starts at zero -- a ring buffer's keys are none of those.
+    """
+    assert window is None or window >= 1, "a window has to include the query itself"
+    visible = k_pos <= q_pos.unsqueeze(1)
+    if window is not None:
+        visible &= k_pos > q_pos.unsqueeze(1) - window
+    return visible
+
+
 def sliding_window_mask(
     T_q: int,
     T_kv: int,
@@ -62,19 +78,20 @@ def sliding_window_mask(
 ) -> Tensor:
     """[T_q, T_kv] bool, True = visible. The queries are the LAST T_q keys.
 
-    Query row r sits at absolute position T_kv - T_q + r, because with a cache
-    the new tokens are the tail of the sequence and not the start of it. It
-    sees every key at or before itself, and -- given a window -- no key more
-    than window - 1 positions back. window=None is plain causal attention.
+    The contiguous special case of window_mask_from_positions: the keys are
+    positions 0 .. T_kv-1 in order, so the two position vectors are aranges and
+    this builds them itself. Query row r sits at absolute position
+    T_kv - T_q + r, because with a cache the new tokens are the tail of the
+    sequence and not the start of it. It sees every key at or before itself,
+    and -- given a window -- no key more than window - 1 positions back.
+    window=None is plain causal attention.
     """
-    assert window is None or window >= 1, "a window has to include the query itself"
     T_past = T_kv - T_q
-    i = torch.arange(T_past, T_kv, device=device).unsqueeze(1)  # query positions
-    j = torch.arange(T_kv, device=device)  # key positions
-    visible = j <= i
-    if window is not None:
-        visible &= j > i - window
-    return visible
+    return window_mask_from_positions(
+        torch.arange(T_past, T_kv, device=device),
+        torch.arange(T_kv, device=device),
+        window,
+    )
 
 
 if __name__ == "__main__":
@@ -117,6 +134,27 @@ if __name__ == "__main__":
     assert torch.equal(sliding_window_mask(3, 3, W), full[:3, :3])
     assert torch.equal(sliding_window_mask(T - 3, T, W), full[3:])
     print("mask rows are the same whether built at once or one step at a time")
+
+    # 2b. the general form, which the ring buffer needs and this file does not.
+    #     sliding_window_mask assumes the keys are 0..T_kv-1 in order;
+    #     window_mask_from_positions assumes nothing at all. Hand it the same
+    #     positions and it is the same mask -- that is the refactor's whole
+    #     claim -- but hand it a PERMUTED key order and it tracks the keys
+    #     rather than the slots, which is exactly what wrapping storage needs
+    q_pos = torch.arange(T)
+    k_pos = torch.arange(T)
+    assert torch.equal(window_mask_from_positions(q_pos, k_pos, W), band)
+    perm = torch.randperm(T)
+    permuted = window_mask_from_positions(q_pos, k_pos[perm], W)
+    assert torch.equal(permuted, band[:, perm])
+    #     ...and it does not need the keys to be a contiguous run either: drop
+    #     every other position and the mask still says the right thing
+    sparse = torch.tensor([0, 3, 4, 7])
+    assert torch.equal(
+        window_mask_from_positions(torch.tensor([7]), sparse, W),
+        torch.tensor([[False, False, False, True]]),  # only 7 is within 3 of 7
+    )
+    print("the positions form tracks keys, not slots")
 
     # 3. the oracle. A mask is only worth trusting if it means what it says, so
     #    compute attention through the band and then compute it AGAIN over the

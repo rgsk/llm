@@ -55,6 +55,7 @@ class GPT(Module):
         position: Position = "learned",
         n_kv_head: int | None = None,
         window: int | None = None,
+        ring: bool = False,
     ):
         self.block_size = block_size
         self.n_layer = n_layer
@@ -76,6 +77,7 @@ class GPT(Module):
                     n_kv_head,
                     position == "rope",
                     window,
+                    ring,
                 )
                 for _ in range(n_layer)
             ]
@@ -118,9 +120,16 @@ class GPT(Module):
 
         With position="rope" there is nothing to add here at all; the attention
         layers do the same T_past arithmetic on their own tables instead.
+
+        T_past used to be read off the cache's width, which was the same number
+        right up until a cache learned to evict. A ring's width saturates at its
+        capacity while the sequence keeps going, so ask it for `pos` -- the
+        count of tokens ever written -- and fall back to the width only for the
+        plain tuple that "fused" and "sdpa" hand back, which has no cursor.
         """
         _, T = idx.shape
-        T_past = 0 if kv_caches is None else kv_caches[0][0].size(2)
+        past = None if kv_caches is None else kv_caches[0]
+        T_past = 0 if past is None else getattr(past, "pos", past[0].size(2))
         assert T_past + T <= self.block_size, (
             f"sequence of {T_past + T} > block_size {self.block_size}"
         )
@@ -449,6 +458,46 @@ if __name__ == "__main__":
             raise SystemExit(f"should have failed for {kind}")
         except AssertionError as e:
             assert "window" in str(e)
+
+    # 20. the ring buffer, end to end. Same windowed model as test 18, except
+    #     the cache now evicts what the window stopped reaching, so decoding
+    #     has to land on exactly the logits the parallel windowed forward gives
+    rm = GPT(V, BS, E, NH, NL, attention="gqa", n_kv_head=2, window=W, ring=True)
+    km = GPT(V, BS, E, NH, NL, attention="gqa", n_kv_head=2, window=W)
+    km.load_state_dict(rm.state_dict())
+    base_r = rm(idx)
+    assert (base_r - km(idx)).abs().max() == 0  # ring touches the cache, not the model
+    with torch.no_grad():
+        logits_r, caches_r = rm(idx[:, :1], use_cache=True)
+        outs = [logits_r]
+        for t in range(1, T):
+            logits_r, caches_r = rm(idx[:, t : t + 1], caches_r, use_cache=True)
+            outs.append(logits_r)
+    assert (torch.cat(outs, dim=1) - base_r).abs().max() < 1e-5
+
+    #     and THIS is the line the ring exposes in GPT.forward. T_past used to
+    #     be read off the cache's width, which is the same number right up
+    #     until a cache learns to evict -- after that the width saturates at W
+    #     while the sequence keeps going. Reading the width here would have put
+    #     every token after the {W}th at the wrong position, and the model would
+    #     have carried on returning plausible logits
+    assert caches_r[0][0].size(2) == W  # what the old code would have believed
+    assert caches_r[0].pos == T  # what is actually true
+    assert all(c.k.shape[2] == W for c in caches_r)  # flat across every layer
+    print(f"ring GPT: {T} tokens decoded, every layer's cache {W} wide, not {T}")
+
+    # 21. and the flag is gated twice: only "gqa" holds a cache that can wrap,
+    #     and a ring with no window has no capacity to be
+    try:
+        GPT(V, BS, E, NH, NL, attention="sdpa", window=W, ring=True)
+        raise SystemExit("should have failed")
+    except AssertionError as e:
+        assert "ring needs attention='gqa'" in str(e)
+    try:
+        GPT(V, BS, E, NH, NL, attention="gqa", ring=True)
+        raise SystemExit("should have failed")
+    except AssertionError as e:
+        assert "capacity IS the window" in str(e)
 
     # ---------------------------------------------------------------- KV cache
 

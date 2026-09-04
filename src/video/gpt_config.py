@@ -20,6 +20,7 @@ class GPTConfig:
     ffn: FFN = "dense"
     position: Position = "learned"
     window: int | None = None  # sliding window; None attends to the whole past
+    ring: bool = False  # evict past the window instead of keeping everything
 
     def __post_init__(self):
         assert self.n_embed % self.n_head == 0, "n_embed must divide by n_head"
@@ -43,6 +44,11 @@ class GPTConfig:
                 "window needs attention='sdpa' or 'gqa'"
             )
             assert self.window >= 1, "a window has to include the query itself"
+        if self.ring:
+            # only "gqa" holds a KVCache to wrap, and the ring's capacity is the
+            # window, so there is no ring without one
+            assert self.attention == "gqa", "ring needs attention='gqa'"
+            assert self.window is not None, "a ring buffer's capacity IS the window"
         if self.n_kv_head is not None:
             assert self.attention == "gqa", "n_kv_head needs attention='gqa'"
             assert self.n_head % self.n_kv_head == 0, (

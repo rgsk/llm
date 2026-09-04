@@ -7,8 +7,9 @@ from kv_cache import KVCache
 from linear import Linear
 from module import Module
 from residual_proj import ResidualProj
+from ring_kv_cache import RingKVCache
 from rope import apply_rope, rope_tables
-from sliding_window import sliding_window_mask
+from sliding_window import sliding_window_mask, window_mask_from_positions
 
 
 class GQAttention(Module):
@@ -55,8 +56,17 @@ class GQAttention(Module):
     and costs nothing here for the same reason rope does: a mask is a statement
     about columns, grouping is a statement about heads, and the two never meet.
     They cut different axes of the same cache -- GQA divides it by n_rep, a
-    window would bound it by W -- except that this rung does not shrink the
-    cache at all yet. It only stops the model looking at what is still there.
+    window would bound it by W -- except that a window alone does not shrink
+    the cache at all. It only stops the model looking at what is still there.
+
+    ring=True is what closes that gap (ring_kv_cache.py). The cache becomes a
+    RingKVCache whose capacity IS the window, so the entry for position p lives
+    in slot p % W and memory per layer stops growing with the run. Two things
+    follow. The cached keys are no longer in position order, so the mask comes
+    from the cache's `positions` vector rather than from arange. And a single
+    query needs no mask AT ALL -- every slot the ring still holds is inside its
+    window by construction -- so rung 2 takes back out of the decode path the
+    mask rung 1 put into it.
     """
 
     def __init__(
@@ -68,9 +78,13 @@ class GQAttention(Module):
         block_size: int | None = None,
         use_rope: bool = False,
         window: int | None = None,
+        ring: bool = False,
     ):
         assert n_embed % n_head == 0, "n_embed must divide by n_head"
         assert window is None or window >= 1, "a window has to include the query itself"
+        assert not ring or window is not None, (
+            "a ring buffer's capacity IS the window, so ring=True needs one"
+        )
         n_kv_head = n_head if n_kv_head is None else n_kv_head
         assert n_head % n_kv_head == 0, (
             "n_kv_head must divide n_head: every kv head serves the same group size"
@@ -86,6 +100,7 @@ class GQAttention(Module):
         self.dropout_p = dropout
         self.resid_dropout = Dropout(dropout)
         self.window = window
+        self.ring = ring
         # only needed to size a preallocated cache. None keeps the old
         # grow-by-copying behaviour, which is what training uses anyway
         self.block_size = block_size
@@ -111,6 +126,10 @@ class GQAttention(Module):
         k = k.view(B, T, nkv, hs).transpose(1, 2)  # [B, nkv, T, hs]
         v = v.view(B, T, nkv, hs).transpose(1, 2)
 
+        # captured BEFORE the append, which advances it. a ring's pos keeps
+        # counting tokens past its capacity, so this stays the absolute position
+        # of the first new token however many times the buffer has been round
+        T_past = 0 if kv_cache is None else kv_cache.pos
         if self.use_rope:
             # q is [B, nh, T, hs] and k is [B, nkv, T, hs], and the rotation
             # does not care: it acts on (T, hs) and broadcasts over whatever
@@ -118,7 +137,6 @@ class GQAttention(Module):
             # is a fact about positions, and the two never meet -- the same
             # reason the causal mask needed no change for GQA.
             # before the append, so the cache holds keys already rotated
-            T_past = 0 if kv_cache is None else kv_cache.pos
             cos = self.rope_cos[T_past : T_past + T]
             sin = self.rope_sin[T_past : T_past + T]
             q, k = apply_rope(q, cos, sin), apply_rope(k, cos, sin)
@@ -128,19 +146,42 @@ class GQAttention(Module):
             # head_size; B, device and dtype come from the data on first write.
             # capacity is block_size, and without one this falls back to the
             # tuple's grow-by-copying
-            shape = None if self.block_size is None else (B, nkv, self.block_size, hs)
-            kv_cache = KVCache(shape)
+            if self.ring:
+                # capacity is the WINDOW, not block_size: the cache stops
+                # sizing itself to the run and starts sizing itself to what the
+                # mask can still reach
+                kv_cache = RingKVCache((B, nkv, self.window, hs))
+            else:
+                shape = (
+                    None if self.block_size is None else (B, nkv, self.block_size, hs)
+                )
+                kv_cache = KVCache(shape)
         if kv_cache is not None:
             # the NARROW k and v go in -- [B, nkv, T_kv, hs], n_rep smaller
             k, v = kv_cache.append(k, v)
 
         T_kv = k.size(2)
+        ring = isinstance(kv_cache, RingKVCache)
         # a window nothing has fallen out of yet is not a window
         unwindowed = self.window is None or T_kv <= self.window
         if unwindowed and kv_cache is None:
             is_causal, attn_mask = True, None
-        elif unwindowed and T == 1:
+        elif (unwindowed or ring) and T == 1:
+            # one query, and everything it may attend to is in front of it: a
+            # full cache within the window, or a ring, which holds nothing else
             is_causal, attn_mask = False, None
+        elif ring:
+            # the cached keys are in SLOT order, which stopped being position
+            # order the first time the cursor went round. only the cache knows
+            # what is where, so the mask is built from its positions vector.
+            # nothing needs un-permuting: softmax is permutation-equivariant
+            # over the key axis, and rope baked each key's position into it
+            is_causal = False
+            attn_mask = window_mask_from_positions(
+                torch.arange(T_past, T_past + T, device=x.device),
+                kv_cache.key_positions,
+                self.window,
+            )
         else:
             # queries sit at T_past .. T_kv-1, and is_causal aligns top-left --
             # the same shift SDPAttention needed, plus the band when a window
@@ -445,7 +486,76 @@ if __name__ == "__main__":
         assert c2.pos == T and c2[0].shape == (B, 2, T, HS)
     print("windowed decode holds through the buffer, and the cache is no smaller")
 
-    # 10. the payoff, measured on the real config: 8 layers, E=512, 8 heads,
+    # 10. the ring buffer, which is that last sentence stopped being true. The
+    #     cache becomes capacity-W storage that wraps, so the keys the window
+    #     can no longer reach are no longer kept. THE claim is that this costs
+    #     nothing: eviction is not an approximation of the windowed model, it
+    #     IS the windowed model, so a ring decode has to reproduce the parallel
+    #     windowed forward exactly -- the same bar test 9's full cache cleared
+    for use_rope in (False, True):
+        m = GQAttention(E, NH, 2, block_size=T, use_rope=use_rope, window=W, ring=True)
+        ref = GQAttention(E, NH, 2, block_size=T, use_rope=use_rope, window=W)
+        ref.load_state_dict(m.state_dict())
+        full = m(x)
+        #     ring changes the CACHE and nothing else, so with no cache at all
+        #     the two layers are the same function to the bit
+        assert (full - ref(x)).abs().max() == 0
+        with torch.no_grad():
+            c, steps = None, []
+            for t in range(T):
+                step, c = m(x[:, t : t + 1], c, use_cache=True)
+                steps.append(step)
+            assert (torch.cat(steps, dim=1) - full).abs().max() < 1e-6
+            #     and the payoff, which test 9 could not assert: the cache
+            #     never grew past the window. it holds the last W positions,
+            #     in slot order, and pos keeps counting tokens regardless
+            assert c.k.shape == (B, 2, W, HS)
+            assert c.pos == T and c.fill == W
+            assert sorted(c.key_positions.tolist()) == list(range(T - W, T))
+            #     prefill-then-continue still works, including when the prefill
+            #     is longer than the ring: the chunk gets back every key it is
+            #     entitled to, and only its tail is retained
+            for split in (1, W, W + 1, T - 1):
+                pre, c2 = m(x[:, :split], use_cache=True)
+                rest, c2 = m(x[:, split:], c2, use_cache=True)
+                assert (torch.cat([pre, rest], dim=1) - full).abs().max() < 1e-6, split
+                assert c2.k.shape == (B, 2, W, HS)
+    print(f"ring decode == windowed forward, and the cache stays {W} wide")
+
+    #     ...and a ring with no window has no capacity to be, so it is refused
+    #     at construction rather than defaulting to something arbitrary
+    try:
+        GQAttention(E, NH, 2, ring=True)
+        raise SystemExit("should have failed")
+    except AssertionError as e:
+        assert "capacity IS the window" in str(e)
+
+    # 11. the same thing over a run long enough for the cursor to go round
+    #     eight times, because "it wraps correctly" is the one claim a
+    #     T-token test cannot make. 64 tokens through a ring of 8, against a
+    #     cache that keeps all 64 and masks. Same logits, flat memory
+    Wl, Nl = 8, 64
+    xl = torch.randn(B, Nl, E)
+    ring_m = GQAttention(E, NH, 2, window=Wl, ring=True)
+    keep_m = GQAttention(E, NH, 2, window=Wl)  # no block_size -> grow mode
+    keep_m.load_state_dict(ring_m.state_dict())
+    with torch.no_grad():
+        cr = ck = None
+        or_, ok_ = [], []
+        for t in range(Nl):
+            sr, cr = ring_m(xl[:, t : t + 1], cr, use_cache=True)
+            sk, ck = keep_m(xl[:, t : t + 1], ck, use_cache=True)
+            or_.append(sr)
+            ok_.append(sk)
+            assert cr.k.size(2) == Wl  # flat, every step
+    assert (torch.cat(or_, dim=1) - torch.cat(ok_, dim=1)).abs().max() < 1e-6
+    assert ck.k.size(2) == Nl and cr.pos == ck.pos == Nl
+    print(
+        f"{Nl} tokens, cursor round {Nl // Wl}x -- ring cache {Wl} wide, "
+        f"kept cache {Nl}, identical logits"
+    )
+
+    # 12. the payoff, measured on the real config: 8 layers, E=512, 8 heads,
     #    a full 512-token context. cache bytes are counted off the tensors the
     #    layer actually handed back, then multiplied by n_layer
     n_layer, Tb, Eb, nhb = 8, 512, 512, 8
@@ -468,7 +578,7 @@ if __name__ == "__main__":
         )
         assert total == 2 * n_layer * 1 * Tb * nkv * (Eb // nhb) * 2
 
-    # 11. ...and why anyone bothered, at a size this repo will not run. the same
+    # 13. ...and why anyone bothered, at a size this repo will not run. the same
     #    arithmetic on Llama-2-70B's geometry, for ONE sequence
     L, NHL, HSL, CTX = 80, 64, 128, 4096
 
@@ -482,7 +592,7 @@ if __name__ == "__main__":
     )
     print(f"    mqa  (n_kv_head={1:>2}): {cache_gb(1):>5.1f} GB")
     """
-    Test 10 is the table, test 11 is the reason. At this repo's scale MHA's cache
+    Test 12 is the table, test 13 is the reason. At this repo's scale MHA's cache
     is 8 MB and nobody cares. At 70B it is 10.7 GB for a single sequence -- more
     than the weights of a 7B model, for one user's context -- and it is re-read
     once per generated token. GQA-8 turns that into 1.3 GB, which is the
