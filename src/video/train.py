@@ -9,7 +9,13 @@ from checkpoint import save_checkpoint
 from clip_grad_norm import clip_grad_norm
 from cross_entropy import cross_entropy
 from dataset import BinDataset, get_batch, meta
-from evaluate import bits_per_char, estimate_loss, full_loss
+from evaluate import (
+    bits_per_char,
+    estimate_agreement,
+    estimate_loss,
+    full_loss,
+    tokens_per_pass,
+)
 from gpt import GPT
 from gpt_config import GPTConfig
 from logger import Run
@@ -28,7 +34,16 @@ def train(
     weight_decay: float = 0.1,
     grad_clip: float = 1.0,
     resume: dict | None = None,
+    reference: GPT | None = None,
+    select: str = "val",
+    draft_k: int = 4,
 ) -> list[dict]:
+    """reference turns on the speculative-decoding metrics: how often this model's
+    tokens would be accepted by that one. select="accept" then keeps the
+    checkpoint that agrees most instead of the one with the lowest val loss --
+    which is the right objective for a draft model, and only for a draft model."""
+    assert select in ("val", "accept"), select
+    assert select == "val" or reference is not None, "select='accept' needs a reference"
     torch.manual_seed(cfg.seed)
     run = Run(cfg.name, asdict(cfg) | asdict(gpt_cfg), enabled=cfg.use_wandb)
     train_gen = torch.Generator().manual_seed(cfg.seed)
@@ -40,6 +55,7 @@ def train(
     T = gpt_cfg.block_size
     V = gpt_cfg.vocab_size
     best_val = float("inf")
+    best_accept = -1.0  # only used when select == "accept"
     history: list[dict] = []
     t0 = time.perf_counter()
     gnorm = torch.tensor(float("nan"))  # no gradient exists before the first step
@@ -54,36 +70,64 @@ def train(
         train_gen.set_state(resume["train_gen"].cpu())  # map_location put them on gpu
         eval_gen.set_state(resume["eval_gen"].cpu())
         best_val = resume["val_loss"]
+        best_accept = resume.get("accept", -1.0)
         # not step + 1: evaluate() saves before the update at that step
         start_step = resume["step"]
         print(f"resuming at step {start_step}, val {best_val:.4f}")
 
     def evaluate(it: int, lr: float) -> None:
-        nonlocal best_val
+        nonlocal best_val, best_accept
         eval_state = eval_gen.get_state()  # before the draws, so a resume replays them
         tr = estimate_loss(
             model, train_ds, cfg.batch_size, T, cfg.eval_iters, eval_gen, device
         )
         va = full_loss(model, val_ds, cfg.batch_size, T, device, max_windows=4000)
         bpc = bits_per_char(va)
-        history.append(
-            {
-                "step": it,
-                "train": tr,
-                "val": va,
-                "bpc": bpc,
-                "lr": lr,
-                "gnorm": gnorm.item(),
-                "secs": time.perf_counter() - t0,
-            }
-        )
-        print(
+        row = {
+            "step": it,
+            "train": tr,
+            "val": va,
+            "bpc": bpc,
+            "lr": lr,
+            "gnorm": gnorm.item(),
+            "secs": time.perf_counter() - t0,
+        }
+        line = (
             f"step {it:>5}  train {tr:.4f}  val {va:.4f}  bpc {bpc:.3f}  "
             f"lr {lr:.2e}  |g| {gnorm:6.2f}  {time.perf_counter() - t0:6.1f}s"
         )
+        if reference is not None:
+            # a quarter of the eval batch: this runs a second, bigger model, and
+            # two [B, T, V] logit tensors is what costs memory here
+            top1, accept = estimate_agreement(
+                model,
+                reference,
+                val_ds,
+                max(1, cfg.batch_size // 4),
+                T,
+                max(1, cfg.eval_iters // 4),
+                eval_gen,
+                device,
+                cfg.amp,
+            )
+            row |= {
+                "top1": top1,
+                "accept": accept,
+                "tok_per_pass": tokens_per_pass(accept, draft_k),
+            }
+            line += (
+                f"\n           top1 {top1:.3f}  accept {accept:.3f}  "
+                f"{row['tok_per_pass']:.2f} tok/pass at k={draft_k}"
+            )
+        history.append(row)
+        print(line)
         run.log(history[-1], step=it)
-        if va < best_val and ckpt_path is not None:
-            best_val = va
+        improved = (
+            va < best_val if select == "val" else row.get("accept", -1.0) > best_accept
+        )
+        best_val = min(best_val, va)
+        best_accept = max(best_accept, row.get("accept", -1.0))
+        if improved and ckpt_path is not None:
             save_checkpoint(
                 ckpt_path,
                 model,
@@ -91,6 +135,7 @@ def train(
                 step=it,
                 val_loss=va,
                 bpc=bpc,
+                **{k: row[k] for k in ("top1", "accept", "tok_per_pass") if k in row},
                 opt=opt.state_dict(),
                 train_gen=train_gen.get_state(),
                 eval_gen=eval_state,

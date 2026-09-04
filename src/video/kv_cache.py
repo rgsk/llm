@@ -79,6 +79,24 @@ class KVCache:
         # views, not copies: the caller attends over the live buffer
         return self.k[:, :, :end], self.v[:, :, :end]
 
+    def rollback(self, pos: int) -> None:
+        """Forget everything after `pos`.
+
+        Speculative decoding writes tokens it may have to take back: the draft
+        proposes k, the target accepts j of them, and both caches have to
+        un-write the rest. In buffer mode that is one integer -- the stale
+        entries stay where they are and the next write lands on top of them.
+        In grow mode the cache IS the tensor, so it has to be re-sliced.
+
+        This is the operation the cursor exists for. Nothing before speculative
+        decoding needed a cache that could go backwards.
+        """
+        assert 0 <= pos <= self.pos, f"cannot roll back to {pos} from {self.pos}"
+        if self.shape is None and self.k is not None:
+            self.k = self.k[:, :, :pos]
+            self.v = self.v[:, :, :pos]
+        self.pos = pos
+
     # what the tuple gave for free, so nothing downstream has to change
     def __getitem__(self, i: int) -> Tensor:
         assert self.k is not None, "nothing written to this cache yet"
@@ -196,7 +214,36 @@ if __name__ == "__main__":
         "grow mode is differentiable; the buffer refuses grad instead of failing later"
     )
 
-    # 8. what it costs, at a size worth measuring: decoding N tokens by copying
+    # 8. rolling back, which is what speculative decoding needs and nothing
+    #    before it did. Both modes forget the tail and agree on what is left
+    for shape in (None, (B, NKV, T, HS)):
+        c = KVCache(shape)
+        for step in steps:
+            c.append(*step)
+        c.rollback(3)
+        assert c.pos == 3
+        assert torch.equal(c[0], k_all[:, :, :3]) and torch.equal(c[1], v_all[:, :, :3])
+        #    and the next write lands where the rolled-back one was
+        ck, _ = c.append(*steps[7])
+        assert ck.shape == (B, NKV, 4, HS)
+        assert torch.equal(ck[:, :, 3], steps[7][0][:, :, 0])
+        assert torch.equal(ck[:, :, :3], k_all[:, :, :3])
+    #    in buffer mode it is an integer, so the storage never moves
+    c = KVCache((B, NKV, T, HS))
+    for step in steps:
+        c.append(*step)
+    before = c.k.data_ptr()
+    c.rollback(2)
+    c.append(*steps[0])
+    assert c.k.data_ptr() == before  # no reallocation, no copy: just the cursor
+    try:
+        c.rollback(99)
+        raise SystemExit("should have failed")
+    except AssertionError as e:
+        assert "roll back" in str(e)
+    print("rollback: both modes forget the tail, the buffer without moving a byte")
+
+    # 9. what it costs, at a size worth measuring: decoding N tokens by copying
     #    moves sum(t for t in 1..N) rows, which is O(N^2). The buffer moves N
     Bb, NKVb, Nb, HSb = 4, 8, 512, 64
     tok = [

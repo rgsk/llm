@@ -39,6 +39,81 @@ def estimate_loss(
 
 
 @torch.no_grad()
+def estimate_agreement(
+    model: GPT,
+    reference: GPT,
+    ds: BinDataset,
+    batch_size: int,
+    block_size: int,
+    iters: int = 50,
+    generator: torch.Generator | None = None,
+    device: str = "cpu",
+    amp: bool = True,
+) -> tuple[float, float]:
+    """How much of `model` would survive speculative decoding against `reference`.
+
+    Returns (top1, accept).
+
+    top1 is argmax agreement, which is exactly the acceptance rate under greedy
+    decoding: a drafted token is kept iff the target would have picked it too.
+
+    accept is sum_x min(p_model(x), p_ref(x)), averaged over positions. Under
+    the standard speculative rule -- draw x from the draft, keep it with
+    probability min(1, p_ref(x) / p_model(x)) -- that sum IS the expected
+    fraction of drafted tokens accepted, at temperature 1. It also equals
+    1 - TV(p_model, p_ref), so "make the draft accepted more often" and "move
+    the draft's distribution onto the target's" are the same instruction.
+
+    This is a validation number, measured teacher-forced on real text. At
+    generation time the context is the model's own output, so live acceptance
+    runs a little lower -- treat this as the ceiling, and a fair one for
+    comparing checkpoints, which is what it is for.
+
+    Cost: a full reference forward per batch. Pass a smaller batch_size than
+    training uses -- two [B, T, V] logit tensors is the memory here, not the
+    weights.
+    """
+    modes = model.training, reference.training
+    model.eval()
+    reference.eval()
+    top1s, accepts = [], []
+    for _ in range(iters):
+        x, _ = get_batch(ds, batch_size, block_size, generator)
+        x = x.to(device)
+        with autocast(str(device), amp):
+            draft_logits = model(x)  # [B, T, V]
+            ref_logits = reference(x)
+        top1s.append((draft_logits.argmax(-1) == ref_logits.argmax(-1)).float().mean())
+        # chunked over positions: two [B*T, V] softmaxes at once is the peak
+        flat_d = draft_logits.reshape(-1, draft_logits.size(-1))
+        flat_r = ref_logits.reshape(-1, ref_logits.size(-1))
+        overlap = []
+        for i in range(0, flat_d.size(0), 4096):
+            p = flat_d[i : i + 4096].float().softmax(-1)
+            q = flat_r[i : i + 4096].float().softmax(-1)
+            overlap.append(torch.minimum(p, q).sum(-1))
+        accepts.append(torch.cat(overlap).mean())
+    if modes[0]:
+        model.train()
+    if modes[1]:
+        reference.train()
+    return torch.stack(top1s).mean().item(), torch.stack(accepts).mean().item()
+
+
+def tokens_per_pass(accept: float, k: int) -> float:
+    """Expected tokens per target forward when drafting k of them.
+
+    Each of the k drafted tokens survives with probability `accept`, and the
+    target's own token is free at the end of the run -- so the expectation is
+    1 + a + a^2 + ... + a^k. At a=0 that is 1 (the cache-only baseline, no win);
+    at a=1 it is k+1.
+    """
+    if accept >= 1.0:
+        return float(k + 1)
+    return (1 - accept ** (k + 1)) / (1 - accept)
+
+
+@torch.no_grad()
 def full_loss(
     model: GPT,
     ds: BinDataset,
