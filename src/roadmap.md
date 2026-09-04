@@ -78,8 +78,9 @@ position and the kernel still walks all of them. Both attention layers keep
 their mask-free fast paths alive while `T_kv <= window`, so a decode crosses a
 branch boundary mid-run; that boundary is what the cache tests step over.
 
-Correct only because rope already made scores a function of `i - j`: a key 500
-back scores as a key 500 back whether or not position 499 is still visible.
+It asks nothing of the positional scheme — a window is correct under learned
+absolute positions too (Longformer, 2020). RoPE's `i - j` property gates rungs
+2 and 3, where keys are *evicted* and positions re-indexed, not this one.
 Tested against an eager band-mask oracle (and, per row, against attention over
 the literal `k[i-W+1:i+1]` slice — the masked columns contribute nothing).
 Receptive field is `L*(W-1)+1`, proved twice: boolean matrix powers of the mask,

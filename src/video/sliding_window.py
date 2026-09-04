@@ -13,11 +13,17 @@ still holds them, the kernel still walks them, they just contribute nothing.
 So this rung buys a change in what the model *computes*, and buys nothing at
 all in memory. Saying otherwise is the usual confusion.
 
-It is only correct because scores already depend on `i - j`. RoPE bakes each
-key's rotation in at write time, by the absolute position that token had, and
-`R(m)^T R(n) = R(n - m)` -- so a key sitting 500 positions back scores exactly
-as a key 500 positions back should, whether or not anything in between is
-still visible. Dropping columns from the mask cannot desynchronise anything.
+Nothing here depends on the positional scheme, and it is worth saying so
+because the next two rungs do. A window works under learned absolute positions
+exactly as well as under RoPE -- Longformer shipped this in 2020, before RoPE
+was in anything. The cache still holds every key, each carrying whatever
+position it was given, and hiding a column does not change what the columns
+left behind mean.
+
+What RoPE's `R(m)^T R(n) = R(n - m)` buys is rungs 2 and 3. THROWING AWAY a
+key, and re-indexing positions inside the cache, are only legitimate once a
+score depends on the distance between query and key rather than on where
+either of them sits. So RoPE gates the ring buffer, not this file.
 
 The interesting fact is that a window does not cap what a *model* can see.
 Stack L layers of window W and information travels W-1 positions per layer:

@@ -43,9 +43,10 @@ class SDPAttention(Module):
     It changes what this layer COMPUTES and not what it stores: the cache still
     holds every position and the kernel still walks every one of them. What it
     buys is a model whose reach grows with depth -- L*(W-1)+1 -- instead of a
-    score matrix that grows with T^2. And it is only sound because rope already
-    made scores a function of i - j, so a key 500 positions back scores exactly
-    as it should whether or not position 499 is still in the mask.
+    score matrix that grows with T^2. It asks nothing of use_rope: hiding a
+    column does not change what the columns left behind mean, so a window is
+    correct under any positional scheme. It is EVICTING a key -- the ring
+    buffer -- that needs scores to be a function of i - j.
     """
 
     def __init__(
@@ -361,11 +362,13 @@ if __name__ == "__main__":
         assert (d[t + W :] == 0).all(), f"leak past the window at t={t}"
     print(f"one layer of W={W} moves exactly {W} positions")
 
-    # 12. rope and the window together, which is the pair that makes rung 1
-    #     legitimate. rotations are baked in at write time by ABSOLUTE position,
-    #     so dropping columns from the mask cannot desynchronise the ones left:
-    #     the score for a key W-1 back is R(-(W-1)) whether it is key 3 or key
-    #     3000. decode has to reproduce the parallel forward here too
+    # 12. rope and the window together. Neither needs the other -- test 9's
+    #     band is correct under learned positions too -- but they have to
+    #     COMPOSE, and the cached path is where that could fail: rotations are
+    #     baked in at write time by absolute position, and the mask hides
+    #     columns without touching them, so the score for a key W-1 back is
+    #     R(-(W-1)) whether it is key 3 or key 3000. decode has to reproduce
+    #     the parallel forward here too
     rw = SDPAttention(E, NH, 0.0, T, use_rope=True, window=W)
     rw.load_state_dict(ref_rope.state_dict())
     full_rw = rw(x)
