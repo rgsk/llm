@@ -26,6 +26,15 @@ class GPTConfig:
             # the columns come in (sin, cos) pairs, so there has to be an even
             # number of them. Caught here rather than three frames deeper
             assert self.n_embed % 2 == 0, "sinusoidal positions need an even n_embed"
+        if self.position == "rope":
+            # rope rotates inside attention, so only an attention that knows
+            # about it can carry it -- and it pairs dims per HEAD, not per model
+            assert self.attention in ("sdpa", "gqa"), (
+                "position='rope' needs attention='sdpa' or 'gqa'"
+            )
+            assert (self.n_embed // self.n_head) % 2 == 0, (
+                "rope needs an even head_size: the dims rotate in pairs"
+            )
         if self.n_kv_head is not None:
             assert self.attention == "gqa", "n_kv_head needs attention='gqa'"
             assert self.n_head % self.n_kv_head == 0, (
@@ -76,6 +85,23 @@ if __name__ == "__main__":
         raise SystemExit("should have failed")
     except AssertionError as e:
         assert "n_head" in str(e)
+
+    # 3b. rope is the first position that constrains the attention: it rotates
+    #     inside the layer, so only "sdpa" can carry it, and it pairs dims per
+    #     head rather than per model -- an odd head_size has nothing to rotate
+    assert replace(small_cfg, attention="sdpa", position="rope").position == "rope"
+    for bad, msg in [
+        ({"position": "rope"}, "attention='sdpa'"),  # default attention is mha
+        (
+            {"position": "rope", "attention": "sdpa", "n_embed": 6, "n_head": 2},
+            "head_size",
+        ),
+    ]:
+        try:
+            replace(small_cfg, **bad)
+            raise SystemExit(f"should have failed: {bad}")
+        except AssertionError as e:
+            assert msg in str(e), (bad, str(e))
 
     # 4. from_dict tolerates a main.py checkpoint's extra training keys
     saved = {

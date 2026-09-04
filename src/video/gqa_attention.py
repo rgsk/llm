@@ -7,6 +7,7 @@ from kv_cache import KVCache
 from linear import Linear
 from module import Module
 from residual_proj import ResidualProj
+from rope import apply_rope, rope_tables
 
 
 class GQAttention(Module):
@@ -43,6 +44,11 @@ class GQAttention(Module):
        in fused_gqa_attention.py, test 9). enable_gqa=True has the kernel
        broadcast instead, and it never materialises the copy. The eager file
        reaches the same place by folding the group into q; here it is a flag.
+
+    use_rope=True adds rotary positions, and the mismatched head counts cost
+    nothing: the rotation acts per head on (T, head_size), so a k with n_rep
+    fewer heads rotates by exactly the same table. What shrinks is the rotated
+    cache -- fewer keys to rotate going in, and fewer to re-read every step.
     """
 
     def __init__(
@@ -52,6 +58,7 @@ class GQAttention(Module):
         n_kv_head: int | None = None,
         dropout: float = 0.0,
         block_size: int | None = None,
+        use_rope: bool = False,
     ):
         assert n_embed % n_head == 0, "n_embed must divide by n_head"
         n_kv_head = n_head if n_kv_head is None else n_kv_head
@@ -71,6 +78,12 @@ class GQAttention(Module):
         # only needed to size a preallocated cache. None keeps the old
         # grow-by-copying behaviour, which is what training uses anyway
         self.block_size = block_size
+        self.use_rope = use_rope
+        if use_rope:
+            assert block_size is not None, "rope needs block_size to size its tables"
+            cos, sin = rope_tables(block_size, self.head_size)
+            self.register_buffer("rope_cos", cos, persistent=False)
+            self.register_buffer("rope_sin", sin, persistent=False)
 
     def forward(
         self,
@@ -86,6 +99,18 @@ class GQAttention(Module):
         q = q.view(B, T, nh, hs).transpose(1, 2)  # [B, nh,  T, hs]
         k = k.view(B, T, nkv, hs).transpose(1, 2)  # [B, nkv, T, hs]
         v = v.view(B, T, nkv, hs).transpose(1, 2)
+
+        if self.use_rope:
+            # q is [B, nh, T, hs] and k is [B, nkv, T, hs], and the rotation
+            # does not care: it acts on (T, hs) and broadcasts over whatever
+            # head axis it is handed. grouping is a fact about heads, rotation
+            # is a fact about positions, and the two never meet -- the same
+            # reason the causal mask needed no change for GQA.
+            # before the append, so the cache holds keys already rotated
+            T_past = 0 if kv_cache is None else kv_cache.pos
+            cos = self.rope_cos[T_past : T_past + T]
+            sin = self.rope_sin[T_past : T_past + T]
+            q, k = apply_rope(q, cos, sin), apply_rope(k, cos, sin)
 
         if use_cache and kv_cache is None:
             # the layer allocates it because only the layer knows n_kv_head and
@@ -295,7 +320,63 @@ if __name__ == "__main__":
     assert cg.shape is None and cg.k.shape == (B, 2, T, HS)  # grown to fit
     print(f"decode {T} tokens -- buffer: 1 allocation   grow: {T}")
 
-    # 7. the payoff, measured on the real config: 8 layers, E=512, 8 heads,
+    # 7. rope, and the one thing GQA could plausibly have broken: q has nh
+    #    heads and k has nkv of them, so a positional scheme that mixed heads
+    #    together would need special handling here. rope does not mix them. it
+    #    acts on (T, head_size) and broadcasts over the head axis, so rotating
+    #    the narrow k and then letting the kernel broadcast it is the same as
+    #    broadcasting first and rotating the wide copy. that commuting is what
+    #    makes "no change needed" a fact rather than a hope
+    rp = GQAttention(E, NH, 2, block_size=T, use_rope=True)
+    cos, sin = rp.rope_cos, rp.rope_sin
+    k_narrow = rp.qkv(x).split([E, 2 * HS, 2 * HS], dim=-1)[1]
+    k_narrow = k_narrow.view(B, T, 2, HS).transpose(1, 2)  # [B, nkv, T, hs]
+    rot_then_wide = apply_rope(k_narrow, cos, sin).repeat_interleave(rp.n_rep, dim=1)
+    wide_then_rot = apply_rope(k_narrow.repeat_interleave(rp.n_rep, dim=1), cos, sin)
+    assert (rot_then_wide - wide_then_rot).abs().max() == 0
+    print("rope commutes with the kv-head broadcast, exactly")
+
+    #    so the degenerate case still lands on the layer it should: with
+    #    n_kv_head == n_head this has to be SDPAttention with rope, the same
+    #    way test 1 pinned it without rope
+    rp_mha = GQAttention(E, NH, NH, block_size=T, use_rope=True)
+    ref = SDPAttention(E, NH, 0.0, T, use_rope=True)
+    assert rp_mha.state_dict().keys() == ref.state_dict().keys()
+    rp_mha.load_state_dict(ref.state_dict())
+    assert (rp_mha(x) - ref(x)).abs().max() < 1e-6
+    #    and rope costs no parameters at any group size
+    assert sum(p_.numel() for p_ in rp.parameters()) == sum(
+        p_.numel() for p_ in GQAttention(E, NH, 2).parameters()
+    )
+    assert not any("rope" in k_ for k_ in rp.state_dict())
+
+    #    the cache still decodes. note block_size now does two jobs -- it sizes
+    #    the rope tables AND selects the preallocated cache -- so use_rope=True
+    #    implies the buffer mode. that coupling is harmless (training never uses
+    #    a cache, and preallocating is the better mode anyway) but it means the
+    #    grow path has to be asked for on purpose: clear block_size after the
+    #    tables are built. both modes advance kv_cache.pos, which is where
+    #    T_past comes from, so both have to land in the same place
+    for grow in (False, True):
+        m = GQAttention(E, NH, 2, use_rope=True, block_size=T)
+        m.load_state_dict(rp.state_dict())
+        if grow:
+            m.block_size = None  # tables keep their size; the cache stops preallocating
+        full = m(x)
+        #    no_grad for the same reason test 6 needs it: the buffer writes in
+        #    place, and the rotation is upstream of that write
+        with torch.no_grad():
+            c, steps = None, []
+            for t in range(T):
+                step, c = m(x[:, t : t + 1], c, use_cache=True)
+                steps.append(step)
+            assert (torch.cat(steps, dim=1) - full).abs().max() < 1e-6
+            pre, c2 = m(x[:, :3], use_cache=True)
+            rest, c2 = m(x[:, 3:], c2, use_cache=True)
+            assert (torch.cat([pre, rest], dim=1) - full).abs().max() < 1e-6
+    print("rope + gqa decodes incrementally, grown cache and preallocated alike")
+
+    # 8. the payoff, measured on the real config: 8 layers, E=512, 8 heads,
     #    a full 512-token context. cache bytes are counted off the tensors the
     #    layer actually handed back, then multiplied by n_layer
     n_layer, Tb, Eb, nhb = 8, 512, 512, 8
@@ -318,7 +399,7 @@ if __name__ == "__main__":
         )
         assert total == 2 * n_layer * 1 * Tb * nkv * (Eb // nhb) * 2
 
-    # 8. ...and why anyone bothered, at a size this repo will not run. the same
+    # 9. ...and why anyone bothered, at a size this repo will not run. the same
     #    arithmetic on Llama-2-70B's geometry, for ONE sequence
     L, NHL, HSL, CTX = 80, 64, 128, 4096
 
@@ -332,7 +413,7 @@ if __name__ == "__main__":
     )
     print(f"    mqa  (n_kv_head={1:>2}): {cache_gb(1):>5.1f} GB")
     """
-    Test 7 is the table, test 8 is the reason. At this repo's scale MHA's cache
+    Test 8 is the table, test 9 is the reason. At this repo's scale MHA's cache
     is 8 MB and nobody cares. At 70B it is 10.7 GB for a single sequence -- more
     than the weights of a 7B model, for one user's context -- and it is re-read
     once per generated token. GQA-8 turns that into 1.3 GB, which is the

@@ -24,24 +24,36 @@ def make_attention(
     block_size: int,
     dropout: float,
     n_kv_head: int | None = None,
+    use_rope: bool = False,
 ) -> Module:
     """All four write the same residual stream; only "mha" has different keys.
 
     n_kv_head is "gqa" only -- the others project one k and v per query head, so
     there is nothing to set. "gqa" with n_kv_head=None is MHA arithmetic in the
     gqa layout, which is how the two get compared.
+
+    use_rope needs "sdpa" or "gqa": rotary positions live inside attention, so
+    unlike norm or ffn they have to be built into whichever layer runs there,
+    and the two older layers never learned about them.
     """
+    assert not use_rope or kind in ("sdpa", "gqa"), (
+        f"use_rope needs attention='sdpa' or 'gqa', not {kind!r}"
+    )
     match kind:
         case "mha":
             return MultiHeadAttention(n_embed, n_head, block_size, dropout)
         case "fused":
             return FusedQKVAttention(n_embed, n_head, block_size, dropout)
         case "sdpa":
-            return SDPAttention(n_embed, n_head, dropout)  # builds its own mask
+            # block_size is only needed to size the rope tables; without rope
+            # this layer still builds its own mask and needs nothing
+            return SDPAttention(n_embed, n_head, dropout, block_size, use_rope)
         case "gqa":
             # block_size is passed for the cache buffer, not for a mask: this is
             # the only attention that preallocates instead of growing by copying
-            return GQAttention(n_embed, n_head, n_kv_head, dropout, block_size)
+            return GQAttention(
+                n_embed, n_head, n_kv_head, dropout, block_size, use_rope
+            )
         case _:
             raise ValueError(f"unknown attention: {kind}")
 
@@ -79,11 +91,12 @@ class Block(Module):
         norm: Norm = "layer",
         ffn: FFN = "dense",
         n_kv_head: int | None = None,
+        use_rope: bool = False,
     ):
         self.ln1 = make_norm(norm, n_embed)
         self.ln2 = make_norm(norm, n_embed)
         self.attn = make_attention(
-            attention, n_embed, n_head, block_size, dropout, n_kv_head
+            attention, n_embed, n_head, block_size, dropout, n_kv_head, use_rope
         )
         self.ffwd = make_ffwd(ffn, n_embed, dropout)
 

@@ -5,6 +5,7 @@ from dropout import Dropout
 from linear import Linear
 from module import Module
 from residual_proj import ResidualProj
+from rope import apply_rope, rope_tables
 from torch import Tensor
 
 
@@ -29,9 +30,22 @@ class SDPAttention(Module):
     aligns its triangle to the top-left corner, which is only the causal mask
     when the queries start at position 0. With a cache they do not, so the layer
     has to say which of the two situations it is in -- see forward.
+
+    use_rope=True turns on rotary positions (rope.py). This is the only place
+    positions can enter once they are rotary rather than additive: GPT stops
+    adding a position vector to the residual stream and this layer rotates q and
+    k instead. The rotation happens BEFORE the cache append, so the cache holds
+    keys that are already rotated and no step re-rotates them.
     """
 
-    def __init__(self, n_embed: int, n_head: int, dropout: float = 0.0):
+    def __init__(
+        self,
+        n_embed: int,
+        n_head: int,
+        dropout: float = 0.0,
+        block_size: int | None = None,
+        use_rope: bool = False,
+    ):
         assert n_embed % n_head == 0, "n_embed must divide by n_head"
         self.n_head = n_head
         self.head_size = n_embed // n_head
@@ -39,6 +53,12 @@ class SDPAttention(Module):
         self.proj = ResidualProj(n_embed, n_embed)
         self.dropout_p = dropout
         self.resid_dropout = Dropout(dropout)
+        self.use_rope = use_rope
+        if use_rope:
+            assert block_size is not None, "rope needs block_size to size its tables"
+            cos, sin = rope_tables(block_size, self.head_size)
+            self.register_buffer("rope_cos", cos, persistent=False)
+            self.register_buffer("rope_sin", sin, persistent=False)
 
     def forward(
         self,
@@ -54,6 +74,17 @@ class SDPAttention(Module):
         k = k.view(B, T, nh, hs).transpose(1, 2)
         v = v.view(B, T, nh, hs).transpose(1, 2)
 
+        T_past = 0 if kv_cache is None else kv_cache[0].size(2)
+        if self.use_rope:
+            # the new tokens are at T_past .. T_past+T-1, not at 0 .. T-1 --
+            # the same off-by-cache GPT has to get right for an additive
+            # position. and this runs BEFORE the append: the past keys in the
+            # cache were rotated when they were written, so rotating the
+            # concatenated k would rotate them a second time
+            cos = self.rope_cos[T_past : T_past + T]
+            sin = self.rope_sin[T_past : T_past + T]
+            q, k = apply_rope(q, cos, sin), apply_rope(k, cos, sin)
+
         if kv_cache is not None:
             past_k, past_v = kv_cache
             k = torch.cat([past_k, k], dim=2)  # [B, nh, T_kv, hs]
@@ -61,7 +92,6 @@ class SDPAttention(Module):
         new_cache = (k, v)
 
         T_kv = k.size(2)
-        T_past = T_kv - T
         if kv_cache is None:
             # no past: the triangle the kernel builds is exactly ours
             is_causal, attn_mask = True, None
@@ -98,6 +128,7 @@ if __name__ == "__main__":
     import time
 
     from fused_qkv_attention import FusedQKVAttention
+    from rope import RopeAttention
 
     torch.manual_seed(0)
     B, T, E, NH = 2, 8, 32, 4
@@ -190,11 +221,57 @@ if __name__ == "__main__":
     assert (shifted - rest_s).abs().max() < 1e-6  # the band forward builds
     print("is_causal == hand-built top-left mask, exactly")
 
+    # 7. rope, wired in. the reference is rope.py's RopeAttention -- same
+    #    parameter names, same rotation, no cache -- so with the same weights
+    #    the two must agree exactly. that pins the wiring rather than the maths,
+    #    which rope.py already tested
+    HS = E // NH
+    rp = SDPAttention(E, NH, 0.0, T, use_rope=True)
+    ref_rope = RopeAttention(E, NH, T)
+    assert rp.state_dict().keys() == ref_rope.state_dict().keys()
+    rp.load_state_dict(ref_rope.state_dict())
+    full_r = rp(x)
+    assert (full_r - ref_rope(x)).abs().max() < 1e-6
+    #    and it is doing something: same weights without the flag differ
+    plain = SDPAttention(E, NH)
+    plain.load_state_dict(ref_rope.state_dict())
+    assert (full_r - plain(x)).abs().max() > 1e-3
+    #    the tables cost no parameters and no checkpoint keys
+    assert sum(p.numel() for p in rp.parameters()) == sum(
+        p.numel() for p in plain.parameters()
+    )
+    assert [n for n, _ in rp.named_buffers()] == ["rope_cos", "rope_sin"]
+
+    # 8. rope and the cache, which is the one thing this file can get wrong that
+    #    rope.py cannot. the invariant: what goes INTO the cache is already
+    #    rotated, by the position the token actually had
+    pre_r, cr = rp(x[:, :3], use_cache=True)
+    kp = rp.qkv(x[:, :3]).split(E, dim=-1)[1].view(B, 3, NH, HS).transpose(1, 2)
+    rotated = apply_rope(kp, rp.rope_cos[:3], rp.rope_sin[:3])
+    assert (cr[0] - rotated).abs().max() < 1e-6  # cached k IS the rotated k
+    assert (cr[0] - kp).abs().max() > 1e-3  # not the raw projection
+    #    so the continuation rotates only its own rows. rotate the concatenated
+    #    k instead and the three cached keys pick up a second rotation -- the
+    #    forward still runs, still returns plausible logits, and is wrong
+    rest_r, _ = rp(x[:, 3:], cr, use_cache=True)
+    assert (torch.cat([pre_r, rest_r], dim=1) - full_r).abs().max() < 1e-6
+    twice = apply_rope(cr[0], rp.rope_cos[:3], rp.rope_sin[:3])
+    assert (twice - cr[0]).abs().max() > 1e-3
+    #    and forgetting T_past is the other half of the same bug: rotating the
+    #    new rows as if they started at 0 is what an offset-free table gives
+    at_zero = apply_rope(kp, rp.rope_cos[:3], rp.rope_sin[:3])  # correct only here
+    assert (at_zero - rotated).abs().max() == 0  # T_past = 0 for the prefill
+    k5 = rp.qkv(x[:, 3:]).split(E, dim=-1)[1].view(B, T - 3, NH, HS).transpose(1, 2)
+    right = apply_rope(k5, rp.rope_cos[3:T], rp.rope_sin[3:T])
+    wrong_off = apply_rope(k5, rp.rope_cos[: T - 3], rp.rope_sin[: T - 3])
+    assert (right - wrong_off).abs().max() > 1e-3
+    print("rope: rotated keys go into the cache, and only the new rows rotate")
+
     if not torch.cuda.is_available():
         print("ok (cpu -- skipped the memory and backend tests)")
         raise SystemExit
 
-    # 7. the point of the whole file: memory. Ours allocates [B, nh, T, T] and
+    # 9. the point of the whole file: memory. Ours allocates [B, nh, T, T] and
     #    several copies of it; SDPA allocates none, so it scales with T not T^2
     print(
         f"\npeak memory for one forward, B=4 nh=8 E=512  ({torch.cuda.get_device_name(0)})"
@@ -222,7 +299,7 @@ if __name__ == "__main__":
     Test 7 is the table to hold on screen. Doubling T roughly quadruples the hand-written column (133 → 458 → 1689 MB) and exactly doubles SDPA's (24 → 48 → 96 MB). That's T² versus T, measured, not asserted. The last column shows why: one copy of the score matrix at T=2048 is 512 MB, and we hold several at once — scores, the masked version, the softmax output. At T=2048 this layer alone is 1.7 GB on an 8 GB card, which is the actual reason long-context models were impossible before this kernel.
     """
 
-    # 8. and it is faster, which is a consequence of the same thing -- fewer
+    # 10. and it is faster, which is a consequence of the same thing -- fewer
     #    round trips to HBM, not fewer floating point operations
     xb = torch.randn(4, 1024, 512, device="cuda")
     t = {}
@@ -248,7 +325,7 @@ if __name__ == "__main__":
     Test 6's 4.4x is worth framing correctly: SDPA does the same number of FLOPs. It wins by not shipping 512 MB out to HBM and back between each step. That's the whole of FlashAttention's idea — it's an IO story, not an arithmetic one.
     """
 
-    # 7. "flash" is a backend, not this layer. In fp32 it is not even available
+    # 11. "flash" is a backend, not this layer. In fp32 it is not even available
     import warnings
 
     from torch.nn.attention import SDPBackend, sdpa_kernel
@@ -279,7 +356,7 @@ if __name__ == "__main__":
                     pass
             print(f"  {dt!s:<16} {', '.join(ok)}")
 
-    # 8. and the rest of the speedup is behind the DTYPE, not behind this file.
+    # 12. and the rest of the speedup is behind the DTYPE, not behind this file.
     #    flash needs fp16/bf16, so in fp32 it is unavailable on every card --
     #    including this one, which supports bf16 perfectly well. The model just
     #    is not running in it. Mixed precision is a separate change.

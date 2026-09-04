@@ -11,27 +11,30 @@ from residual_proj import ResidualProj
 from sinusoidal import SinusoidalEmbedding
 from torch import Tensor
 
-Position = Literal["learned", "sinusoidal"]
+Position = Literal["learned", "sinusoidal", "rope"]
 
 
-def make_position(kind: Position, block_size: int, n_embed: int) -> Module:
-    """Both answer the same call -- a tensor of positions in, [.., n_embed] out --
-    and both get ADDED to the token embedding at the bottom of the stack.
+def make_position(kind: Position, block_size: int, n_embed: int) -> Module | None:
+    """The first two answer the same call -- a tensor of positions in,
+    [.., n_embed] out -- and both get ADDED to the token embedding at the bottom
+    of the stack.
 
     "learned" is a block_size x n_embed table trained like any other parameter.
     "sinusoidal" is the same shape computed from a formula, so it costs no
     parameters and every row exists whether or not training ever reached it.
 
-    This lives beside the model rather than inside the block because an additive
-    position is a property of the input, not of attention. RoPE will not fit
-    here -- it multiplies q and k inside attention instead of adding anything to
-    the residual stream -- which is the point of naming the choice now.
+    "rope" returns None, and the None is the whole point: rotary positions are
+    not something you add to the residual stream, so there is nothing to build
+    here. They multiply q and k inside attention, which is why the flag is
+    handed to Block instead and only "sdpa" knows what to do with it.
     """
     match kind:
         case "learned":
             return Embedding(block_size, n_embed)
         case "sinusoidal":
             return SinusoidalEmbedding(block_size, n_embed)
+        case "rope":
+            return None
         case _:
             raise ValueError(f"unknown position: {kind}")
 
@@ -69,6 +72,7 @@ class GPT(Module):
                     norm,
                     ffn,
                     n_kv_head,
+                    position == "rope",
                 )
                 for _ in range(n_layer)
             ]
@@ -108,14 +112,19 @@ class GPT(Module):
         pos starts at T_past. Get this wrong and generation still runs and still
         returns plausible-looking logits -- every token just believes it is at
         the start of the sequence.
+
+        With position="rope" there is nothing to add here at all; the attention
+        layers do the same T_past arithmetic on their own tables instead.
         """
         _, T = idx.shape
         T_past = 0 if kv_caches is None else kv_caches[0][0].size(2)
         assert T_past + T <= self.block_size, (
             f"sequence of {T_past + T} > block_size {self.block_size}"
         )
-        pos = torch.arange(T_past, T_past + T, device=idx.device)
-        x = self.token_embedding_table(idx) + self.position_embedding_table(pos)
+        x = self.token_embedding_table(idx)
+        if self.position_embedding_table is not None:
+            pos = torch.arange(T_past, T_past + T, device=idx.device)
+            x = x + self.position_embedding_table(pos)
 
         new_caches: list[KVCache] = []
         for i, block in enumerate(self.blocks):
@@ -312,15 +321,66 @@ if __name__ == "__main__":
     tail, cs = sin(pos_ids[:, 5:], cs, use_cache=True)
     assert (torch.cat([head, tail], dim=1) - full_sin).abs().max() < 1e-5
 
-    # 13. an unknown encoding fails where the model is built, not at forward.
-    #     RoPE will not arrive through this door: it multiplies q and k inside
-    #     attention rather than adding anything to the residual stream
+    # 13. an unknown encoding fails where the model is built, not at forward
     try:
-        GPT(V, BS, E, NH, NL, position="rope")
+        GPT(V, BS, E, NH, NL, position="absolute-ish")
         raise SystemExit("should have failed")
     except ValueError as e:
         assert "unknown position" in str(e)
     print("sinusoidal positions: same shapes, no parameters, no checkpoint keys")
+
+    # 14. rope does not arrive through this door at all. there is no position
+    #     module, so the bottom of the stack adds nothing: token embeddings go
+    #     into block 0 untouched, and every position lives inside attention
+    rope_m = GPT(V, BS, E, NH, NL, attention="sdpa", position="rope")
+    assert rope_m.position_embedding_table is None
+    assert not any("position" in k for k in rope_m.state_dict())
+    assert sum(p.numel() for p in rope_m.parameters()) == n_sin  # same as sinusoidal
+    assert rope_m(pos_ids).shape == (4, 8, V)
+    #     the tables are per-layer buffers, and none of them is a checkpoint key
+    assert [n for n, _ in rope_m.named_buffers()] == [
+        f"blocks.{i}.attn.rope_{t}" for i in range(NL) for t in ("cos", "sin")
+    ]
+
+    # 15. and the cache still knows where it is -- the same test as 12, which is
+    #     the point. rope moved the arithmetic from GPT.forward into the
+    #     attention layer, so the property has to survive the move: prefill 5
+    #     then decode 3 must equal one pass over all 8. this is the test that
+    #     fails if the layer rotates the concatenated k instead of only the new
+    #     rows, or forgets T_past and rotates every step as if it were at 0
+    full_rope = rope_m(pos_ids)
+    head, cs = rope_m(pos_ids[:, :5], use_cache=True)
+    tail, cs = rope_m(pos_ids[:, 5:], cs, use_cache=True)
+    assert (torch.cat([head, tail], dim=1) - full_rope).abs().max() < 1e-5
+    #     one token at a time, the path generate() actually walks
+    outs, cs = [], None
+    for t in range(8):
+        step, cs = rope_m(pos_ids[:, t : t + 1], cs, use_cache=True)
+        outs.append(step)
+    assert (torch.cat(outs, dim=1) - full_rope).abs().max() < 1e-5
+    print("rope: no position module, no checkpoint keys, cache-consistent")
+
+    # 16. and it works with gqa too, where k has fewer heads than q. rope acts
+    #     per head, so the narrower k is not a special case -- proved in
+    #     gqa_attention.py test 7; here it just has to survive the wiring
+    gq = GPT(V, BS, E, NH, NL, attention="gqa", n_kv_head=2, position="rope")
+    assert gq.position_embedding_table is None
+    full_gq = gq(pos_ids)
+    outs, cs = [], None
+    with torch.no_grad():
+        for t in range(8):
+            step, cs = gq(pos_ids[:, t : t + 1], cs, use_cache=True)
+            outs.append(step)
+    assert (torch.cat(outs, dim=1) - full_gq).abs().max() < 1e-5
+    print("rope + gqa: same model, n_rep smaller rotated cache")
+
+    # 17. the flag only reaches an attention that knows what to do with it
+    for kind in ("mha", "fused"):
+        try:
+            GPT(V, BS, E, NH, NL, attention=kind, position="rope")
+            raise SystemExit(f"should have failed for {kind}")
+        except AssertionError as e:
+            assert "use_rope" in str(e)
 
     # ---------------------------------------------------------------- KV cache
 
