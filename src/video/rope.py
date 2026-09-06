@@ -1,17 +1,57 @@
 import torch
 import torch.nn.functional as F
+from kv_cache import KVCache
 from linear import Linear
 from module import Module
 from residual_proj import ResidualProj
 from torch import Tensor
 
 
-def rope_tables(block_size: int, head_size: int, base: float = 10000.0):
-    """cos and sin of pos * theta_i, both [block_size, head_size / 2]."""
+def rope_inv_freq(head_size: int, base: float = 10000.0, device=None) -> Tensor:
+    """theta_i = base^(-2i/hs), [hs/2] -- the half of RoPE that never moves.
+
+    Position is the other half, and the only one that has to wait for a forward
+    pass. Splitting them is what makes the angles buildable on the fly.
+    """
     assert head_size % 2 == 0, "head_size must be even: the dims rotate in pairs"
-    inv_freq = base ** (-torch.arange(0, head_size, 2) / head_size)  # [hs/2]
-    angles = torch.arange(block_size).unsqueeze(1) * inv_freq  # [T, hs/2]
+    i = torch.arange(0, head_size, 2, device=device, dtype=torch.float32)
+    return base ** (-i / head_size)
+
+
+def rope_angles(
+    offset: int, seq_len: int, head_size: int, base: float = 10000.0, device=None
+) -> tuple[Tensor, Tensor]:
+    """cos and sin at positions offset .. offset+seq_len-1, both [seq_len, hs/2].
+
+    rope_tables' rows, evaluated where they are needed instead of stored. The
+    same numbers -- the table was only ever a cache of this formula -- except
+    that `offset` is an int rather than an index into something block_size rows
+    tall. There is no position this cannot reach.
+
+    Everything here is float32 and none of it is a buffer, which is one
+    decision, not two. Under bf16 the product pos * theta_i loses the angle
+    outright at long offsets, and a registered inv_freq would be rounded to 8
+    mantissa bits by the first .to(bfloat16) with no way back (test 15). Built
+    from an int and a Python float each call, there is nothing for a cast to
+    reach. That costs ~7us per layer per decode step against holding the
+    tensor; a decode step is milliseconds, and this way it cannot go quietly
+    wrong.
+    """
+    inv_freq = rope_inv_freq(head_size, base, device)
+    pos = torch.arange(offset, offset + seq_len, device=device, dtype=torch.float32)
+    angles = pos.unsqueeze(1) * inv_freq  # [seq_len, hs/2]
     return angles.cos(), angles.sin()
+
+
+def rope_tables(block_size: int, head_size: int, base: float = 10000.0):
+    """cos and sin of pos * theta_i, both [block_size, head_size / 2].
+
+    Precomputed rows 0 .. block_size-1, which is what a layer wants when it
+    knows its length up front. Written in terms of rope_angles to say the thing
+    plainly: the table IS the formula at offset 0, with a last row chosen by
+    whoever called it.
+    """
+    return rope_angles(0, block_size, head_size, base)
 
 
 def apply_rope(x: Tensor, cos: Tensor, sin: Tensor) -> Tensor:
@@ -75,6 +115,101 @@ class RopeAttention(Module):
         out = F.scaled_dot_product_attention(q, k, v, is_causal=True)
         out = out.transpose(1, 2).reshape(B, T, E)
         return self.proj(out)
+
+
+class RopeKVAttention(Module):
+    """RopeAttention plus a KV cache, and the one thing that pairing needs.
+
+    RopeAttention rotates by 0 .. T-1 because it always sees the whole
+    sequence. With a cache it does not: x holds only the new tokens, and those
+    sit at T_past .. T_past+T-1, where T_past is what the cache already holds.
+    Rotate them at 0 instead and generation still runs and still returns
+    plausible logits -- every token just quietly believes it is at the start of
+    the sequence, and test 13 is what catches it.
+
+    That is the whole delta. Two pieces of the bookkeeping are worth naming:
+
+      - k is rotated BEFORE it is appended, so the cache holds rotated keys and
+        nothing is ever rotated twice. v is not rotated at all -- position
+        belongs in the scores, not in what gets collected.
+      - the constructor takes no block_size. There is no table to size: the
+        angles come from rope_angles(T_past, T, inv_freq), and an offset is an
+        int. This layer decodes at position 100,000 as readily as at 10.
+
+    Which is what makes it worth having as its own file entry rather than a
+    flag on SDPAttention: it shows where the ceiling actually is. Not
+    positions -- those were always a formula, and a formula has no last row.
+    Memory: the cache takes one k and one v per token, forever, and test 14
+    watches it grow. Bounding that is eviction, which needs a window and a ring
+    buffer. RoPE is what makes eviction legitimate, not what performs it --
+    scores depend on m - n, so dropping old keys does not change what the
+    survivors mean to each other (test 5, again).
+
+    Still deliberately small: no dropout, no GQA, no preallocation. Grow mode
+    is the honest cache here, because a preallocated one needs a capacity, and
+    a capacity is precisely what this class exists not to have.
+    """
+
+    def __init__(self, n_embed: int, n_head: int, base: float = 10000.0):
+        assert n_embed % n_head == 0, "n_embed must divide by n_head"
+        self.n_head = n_head
+        self.head_size = n_embed // n_head
+        self.qkv = Linear(n_embed, 3 * n_embed, bias=False)
+        self.proj = ResidualProj(n_embed, n_embed)
+        self.base = base  # a float, not a tensor: nothing here to move or cast
+
+    def angles(self, offset: int, seq_len: int, device, dtype) -> tuple[Tensor, Tensor]:
+        """Where this layer thinks its tokens are. One line, and a seam.
+
+        Everything positional the layer does goes through here, so overriding
+        it is how a variant changes position without touching attention: test
+        15 does it to hold theta_i in bf16, and re-basing a window into
+        [0, W) -- rung 3 -- is the same override with a different offset.
+        """
+        cos, sin = rope_angles(offset, seq_len, self.head_size, self.base, device)
+        return cos.to(dtype), sin.to(dtype)  # cast the result, not the math
+
+    def forward(
+        self,
+        x: Tensor,
+        kv_cache: KVCache | None = None,
+        use_cache: bool = False,
+    ) -> Tensor | tuple[Tensor, KVCache]:
+        B, T, E = x.shape
+        nh, hs = self.n_head, self.head_size
+        q, k, v = self.qkv(x).split(E, dim=-1)
+        q = q.view(B, T, nh, hs).transpose(1, 2)  # [B, nh, T, hs]
+        k = k.view(B, T, nh, hs).transpose(1, 2)
+        v = v.view(B, T, nh, hs).transpose(1, 2)
+
+        # read BEFORE the append, which advances it
+        T_past = 0 if kv_cache is None else kv_cache.pos
+        cos, sin = self.angles(T_past, T, x.device, x.dtype)
+        q, k = apply_rope(q, cos, sin), apply_rope(k, cos, sin)
+
+        if use_cache and kv_cache is None:
+            kv_cache = KVCache()  # grow mode: no block_size, no capacity to outgrow
+        if kv_cache is not None:
+            k, v = kv_cache.append(k, v)  # already-rotated keys go in
+
+        T_kv = k.size(2)
+        if T_kv == T:
+            is_causal, attn_mask = True, None  # nothing cached: the plain tril
+        elif T == 1:
+            is_causal, attn_mask = False, None  # one query, all of it behind
+        else:
+            # queries sit at T_past .. T_kv-1, and is_causal would align them
+            # top-left instead. two aranges say where they really are
+            is_causal = False
+            q_pos = torch.arange(T_past, T_kv, device=x.device).unsqueeze(1)
+            attn_mask = torch.arange(T_kv, device=x.device) <= q_pos
+
+        out = F.scaled_dot_product_attention(
+            q, k, v, attn_mask=attn_mask, is_causal=is_causal
+        )
+        out = out.transpose(1, 2).reshape(B, T, E)
+        out = self.proj(out)
+        return (out, kv_cache) if use_cache else out
 
 
 if __name__ == "__main__":
@@ -272,5 +407,147 @@ if __name__ == "__main__":
         for a, b in zip(rope.parameters(), ref_mod.parameters())
     )
     assert gd < 1e-5 and (xm.grad - xr.grad).abs().max() < 1e-5
+
+    # ------------------------------------------ angles on the fly + a cache
+
+    # 12. the swap that licenses the rest: rope_angles(off, n) is the table's
+    #     rows off .. off+n-1, exactly, at every offset a cache can ask for --
+    #     the start, the middle, the last row, a whole prefill. if this were
+    #     only approximately true, swapping one for the other would change the
+    #     model. and then the point of the formula: a table has a last row,
+    #     chosen by whoever sized it, and a formula does not. position 100,000
+    #     costs the same as position 3 and needed nobody to predict it
+    for off, n in ((0, T), (5, 3), (T - 1, 1), (1, T - 1)):
+        c_fly, s_fly = rope_angles(off, n, HS)
+        assert (c_fly - cos[off : off + n]).abs().max() < 1e-6, (off, n)
+        assert (s_fly - sin[off : off + n]).abs().max() < 1e-6, (off, n)
+    assert rope_angles(100_000, 1, HS)[0].shape == (1, HS // 2)
+    #     the table's answer to that same question is not a wrong number, it is
+    #     an empty tensor -- which is why running past it surfaces as a
+    #     broadcast error in apply_rope rather than as quietly bad output
+    assert cos[100_000:100_001].shape == (0, HS // 2)
+    print("angles on the fly: same numbers as the table, and no last row")
+
+    # 13. THE test, the one every cached layer has to pass: prefill part of the
+    #     sequence, then decode the rest one token at a time, and land on what
+    #     the parallel forward already produced. it fails if the layer rotates
+    #     the concatenated k instead of only the new rows, or rotates every
+    #     step as if it were at position 0. the reference is RopeAttention with
+    #     the same weights, so this also pins the drop-in claim: the cache is an
+    #     addition, not a different layer
+    kvr = RopeKVAttention(E, NH)
+    assert kvr.state_dict().keys() == rope.state_dict().keys()
+    kvr.load_state_dict(rope.state_dict())
+    full = rope(x)
+    assert (kvr(x) - full).abs().max() < 1e-6
+
+    head, c = kvr(x[:, :5], use_cache=True)
+    outs = [head]
+    for t in range(5, T):
+        step, c = kvr(x[:, t : t + 1], c, use_cache=True)
+        outs.append(step)
+    assert (torch.cat(outs, dim=1) - full).abs().max() < 1e-5
+    print("prefill + decode == full forward")
+
+    # 14. and the headline: it decodes past any block_size, because it never
+    #     had one. RopeAttention has to be told how long the run will be to
+    #     serve as the reference at all -- being told is exactly the constraint
+    #     generate.py asserts -- and the layer under test is told nothing and
+    #     agrees anyway. so what is left is not positions, which were only ever
+    #     a formula. it is bytes: the cache kept one k and one v per token and
+    #     grows linearly forever. bounding that is rung 2, and rope is what
+    #     makes bounding it legitimate rather than what does it -- scores
+    #     depend on m - n, so the keys that survive eviction still mean to each
+    #     other exactly what they meant before (test 5)
+    LONG = 3 * T
+    xl = torch.randn(B, LONG, E)
+    ref_long = RopeAttention(E, NH, LONG)
+    ref_long.load_state_dict(rope.state_dict())
+    outs, c, widths = [], None, []
+    for t in range(LONG):
+        step, c = kvr(xl[:, t : t + 1], c, use_cache=True)
+        outs.append(step)
+        widths.append(c[0].size(2))
+    assert (torch.cat(outs, dim=1) - ref_long(xl)).abs().max() < 1e-5
+    assert widths == list(range(1, LONG + 1)) and c.pos == LONG
+    print(f"{LONG} tokens with no block_size, and a cache {LONG} slots wide")
+
+    # 15. why none of this is a buffer. bf16 keeps 8 mantissa bits, so a
+    #     theta_i rounded to it carries ~0.2% relative error and the angle
+    #     pos * theta_i multiplies that by pos -- cos then walks off by
+    #     radians, not by epsilon. Module.to casts every float buffer
+    #     (module.py:91-95), so an inv_freq registered the way the tables are
+    #     would be wrecked by the first .to(bfloat16), and .float() afterwards
+    #     recovers nothing. built from an int and a Python float each call,
+    #     there is nothing for a cast to reach
+    cast = rope_inv_freq(HS).bfloat16().float()  # what such a buffer would hold
+    for far in (512, 5000):
+        err = (rope_angles(far, 1, HS)[0] - (far * cast).cos()).abs().max()
+        print(f"  pos {far:>5}: a bf16-cast inv_freq costs {err:.4f} in cos")
+    assert (rope_angles(5000, 1, HS)[0] - (5000 * cast).cos()).abs().max() > 0.1
+
+    #     and the same mistake inside a layer, which is where it would actually
+    #     bite. angles() is the only seam it needs, so the variant is four
+    #     lines and everything else -- weights, cache, attention -- is held
+    #     identical between the two
+    class Bf16FreqRope(RopeKVAttention):
+        """theta_i at bf16 precision: the buffer that is deliberately not there."""
+
+        def angles(self, offset, seq_len, device, dtype):
+            inv = rope_inv_freq(self.head_size, self.base, device).bfloat16().float()
+            pos = torch.arange(offset, offset + seq_len, dtype=torch.float32)
+            a = pos.unsqueeze(1) * inv
+            return a.cos().to(dtype), a.sin().to(dtype)
+
+    worse = Bf16FreqRope(E, NH)
+    worse.load_state_dict(rope.state_dict())
+
+    def step_at(layer: RopeKVAttention, pos: int) -> Tensor:
+        """One decode step with the query at `pos`, in whatever dtype the layer
+        holds. The cache is advanced rather than filled: 5000 real steps prove
+        the same thing and take a minute, and every layer is handed the
+        identical state either way."""
+        xin = x.to(layer.qkv.weight.dtype)
+        _, c = layer(xin[:, :3], use_cache=True)
+        c.pos = pos
+        return layer(xin[:, 3:4], c, use_cache=True)[0].float()
+
+    drift = {}
+    for pos in (0, 512, 5000, 50_000):
+        ok = step_at(kvr, pos)
+        drift[pos] = ((ok - step_at(worse, pos)).abs().max() / ok.abs().max()).item()
+    print("  the same layer with theta_i in bf16, output drift by position:")
+    print("   " + "   ".join(f"{pos}: {d:.2%}" for pos, d in drift.items()))
+    #     which is the shape of the whole problem. the error is not in the
+    #     rotation, it is in the arm being long -- nothing whatsoever where a
+    #     block_size-bounded model ever ran, and a twentieth of the step's own
+    #     output by the time a ring buffer has let the run get interesting.
+    #     a bug that only appears past the horizon you just removed
+    assert drift[0] < 1e-4  # nothing to see wherever the tables were tested
+    assert drift[5000] > 0.02  # same layer, same weights, 5000 positions in
+    assert drift[0] < drift[512] < drift[5000] < drift[50_000]
+
+    #     done right, the same layer runs entirely in bf16 and stays put:
+    #     ~0.6% of its own output at every distance, which is bf16's noise on
+    #     weights and activations and has nothing to do with position. flat is
+    #     the whole claim -- the rotation stays exact however far out it goes,
+    #     and only the final cast is lossy
+    kv16 = RopeKVAttention(E, NH)
+    kv16.load_state_dict(rope.state_dict())
+    kv16.to(torch.bfloat16)
+    assert not list(kv16.buffers())  # there was nothing for .to() to reach
+    flat = {}
+    for pos in drift:
+        ok = step_at(kvr, pos)
+        flat[pos] = ((ok - step_at(kv16, pos)).abs().max() / ok.abs().max()).item()
+    print("  and with the angles built right, the same layer all in bf16:")
+    print("   " + "   ".join(f"{pos}: {d:.2%}" for pos, d in flat.items()))
+    assert max(flat.values()) < 0.02  # small
+    assert flat[50_000] < 2 * flat[0]  # ...and, unlike drift, not growing
+    assert flat[50_000] < drift[50_000] / 10  # where the other was 13% off
+    #     worth reading the two rows against each other at position 0, where
+    #     the rounded theta is the BETTER of the two -- it does its arithmetic
+    #     in float32 while this one is bf16 throughout. that is what a dtype
+    #     bug looks like from inside a short test: fine, fine, then 13% off
 
     print("ok")
