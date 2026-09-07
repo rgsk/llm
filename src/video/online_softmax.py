@@ -121,7 +121,7 @@ if __name__ == "__main__":
     masked = torch.tensor([[float("-inf"), float("-inf"), 1.0, 2.0]])
     p = online_softmax(masked, 2)
     assert torch.equal(p, F.softmax(masked, dim=-1))
-    assert p[0, 0] == 0 and abs(p.sum().item() - 1.0) < 1e-6
+    assert p[0, 0] == 0 and p[0, 1] == 0 and abs(p.sum().item() - 1.0) < 1e-6
 
     # 5. autograd flows through the loop unchanged -- the rescale is ordinary
     # differentiable arithmetic, not a custom backward
