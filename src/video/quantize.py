@@ -1,5 +1,7 @@
 """int8 weight-only quantization: store w as small ints plus a float scale."""
 
+import math
+
 import torch
 from torch import Tensor
 
@@ -7,11 +9,20 @@ from embedding import Embedding
 from linear import Linear
 from module import Module
 
-QMAX = 127  # symmetric range, so -128 goes unused and 0 maps to exactly 0
+QMAX = 127  # int8 symmetric: -128 goes unused so 0 maps to exactly 0
 
 
-def quantize(w: Tensor, dim: int | None = -1) -> tuple[Tensor, Tensor]:
-    """w -> (int8, scale), with w ~= q * scale. dim=None is one scale for all of w."""
+def qmax(bits: int) -> int:
+    """Largest integer the symmetric range uses: 127 at 8 bits, 7 at 4."""
+    return 2 ** (bits - 1) - 1
+
+
+def quantize(w: Tensor, dim: int | None = -1, bits: int = 8) -> tuple[Tensor, Tensor]:
+    """w -> (int8, scale), with w ~= q * scale. dim=None is one scale for all of w.
+
+    bits=4 still returns int8; pack_int4 is what makes it smaller.
+    """
+    QMAX = qmax(bits)
     amax = w.abs().amax() if dim is None else w.abs().amax(dim=dim, keepdim=True)
     # an all-zero row gives scale 0, and w / 0 is nan. the int8 cast below
     # happens to turn that nan into 0 on both cpu and cuda, but that is
@@ -28,16 +39,78 @@ def dequantize(q: Tensor, scale: Tensor) -> Tensor:
     return q.to(scale.dtype) * scale
 
 
+def block(bits: int) -> tuple[int, int]:
+    """(values, bytes) in one packing block -- the smallest run that divides evenly.
+
+    4 bits -> 2 values per byte, 6 -> 4 per 3 bytes, 5 -> 8 per 5. Any width
+    lands on a byte boundary eventually; this is where.
+    """
+    k = 8 // math.gcd(bits, 8)
+    return k, k * bits // 8
+
+
+def acc_dtype(bits: int) -> torch.dtype:
+    """Narrowest signed int a whole block fits in, sign bit spare.
+
+    Load-bearing at inference: unpacking builds a chain of full-size temporaries,
+    so this width sets the cost of rebuilding a weight -- 60 MB per 8 MB weight
+    at int64 against 18 at int16 (probe 7). The thresholds are 15 and 31, not 16
+    and 32, because these are signed: the top bit is not ours to use.
+
+    It only works if nothing downstream promotes. sum() over an integer tensor
+    widens to int64 unless told otherwise, which silently undid all of this.
+    """
+    width = block(bits)[0] * bits
+    return torch.int16 if width <= 15 else torch.int32 if width <= 31 else torch.int64
+
+
+def pack_bits(q: Tensor, bits: int) -> Tensor:
+    """[..., n] int8 -> [..., n * bits // 8] uint8. Without this int4 saves nothing.
+
+    Each block of k values becomes one k*bits-wide integer, then splits to bytes.
+    """
+    k, nb = block(bits)
+    assert q.size(-1) % k == 0, f"{bits}-bit packing needs a multiple of {k}"
+    dt = acc_dtype(bits)
+    shift = torch.arange(k, device=q.device, dtype=dt) * bits
+    v = (q.to(dt) & ((1 << bits) - 1)).unflatten(-1, (-1, k))
+    packed = (v << shift).sum(-1, keepdim=True, dtype=dt)  # sum() widens to int64
+    out = (packed >> (torch.arange(nb, device=q.device, dtype=dt) * 8)) & 0xFF
+    return out.flatten(-2).to(torch.uint8)
+
+
+def unpack_bits(p: Tensor, bits: int) -> Tensor:
+    """The inverse. The subtract at the end is two's-complement sign extension."""
+    k, nb = block(bits)
+    dt = acc_dtype(bits)
+    b = p.to(dt).unflatten(-1, (-1, nb))
+    packed = (b << (torch.arange(nb, device=p.device, dtype=dt) * 8)).sum(
+        -1, keepdim=True, dtype=dt
+    )
+    v = (packed >> (torch.arange(k, device=p.device, dtype=dt) * bits)) & (
+        (1 << bits) - 1
+    )
+    v = v.flatten(-2)
+    return torch.where(v >= 1 << (bits - 1), v - (1 << bits), v).to(torch.int8)
+
+
+def quantize_packed(w: Tensor, dim: int | None = -1, bits: int = 8):
+    """quantize(), stored the way the layers hold it: int4 goes two per byte."""
+    q, scale = quantize(w, dim, bits)
+    return (q if bits == 8 else pack_bits(q, bits)), scale
+
+
 class QuantizedLinear(Module):
     """A Linear whose weight is stored int8. Built from a trained Linear, not trained.
 
     `qs` supplies an already-quantized weight, so a tied pair can share one.
     """
 
-    def __init__(self, linear: Linear, dim: int | None = -1, qs=None):
+    def __init__(self, linear: Linear, dim: int | None = -1, bits: int = 8, qs=None):
         self.in_features = linear.in_features
         self.out_features = linear.out_features
-        q, scale = qs if qs is not None else quantize(linear.weight.data, dim)
+        self.bits = bits
+        q, scale = qs or quantize_packed(linear.weight.data, dim, bits)
         self.register_buffer("qweight", q)
         self.register_buffer("scale", scale)
         self.bias = None
@@ -47,7 +120,8 @@ class QuantizedLinear(Module):
     def forward(self, x: Tensor) -> Tensor:
         # the whole matrix is reconstructed every call: this saves memory at
         # rest, not compute. a real int8 kernel multiplies without dequantizing
-        out = x @ dequantize(self.qweight, self.scale).T
+        q = self.qweight if self.bits == 8 else unpack_bits(self.qweight, self.bits)
+        out = x @ dequantize(q, self.scale).T
         if self.bias is not None:
             out = out + self.bias
         return out
@@ -61,16 +135,22 @@ class QuantizedEmbedding(Module):
     both. The cost is that the error now enters the residual stream at layer 0.
     """
 
-    def __init__(self, embedding: Embedding, dim: int | None = -1, qs=None):
+    def __init__(
+        self, embedding: Embedding, dim: int | None = -1, bits: int = 8, qs=None
+    ):
         self.num_embeddings = embedding.num_embeddings
         self.embedding_dim = embedding.embedding_dim
-        q, scale = qs if qs is not None else quantize(embedding.weight.data, dim)
+        self.bits = bits
+        q, scale = qs or quantize_packed(embedding.weight.data, dim, bits)
         self.register_buffer("qweight", q)
         self.register_buffer("scale", scale)
 
     def forward(self, idx: Tensor) -> Tensor:
+        q = self.qweight[idx]  # index first: unpacking the whole table is wasted work
+        if self.bits != 8:
+            q = unpack_bits(q, self.bits)
         scale = self.scale if self.scale.ndim == 0 else self.scale[idx]
-        return dequantize(self.qweight[idx], scale)
+        return dequantize(q, scale)
 
 
 def nbytes(sd: dict[str, Tensor]) -> int:
@@ -79,22 +159,57 @@ def nbytes(sd: dict[str, Tensor]) -> int:
     return sum(seen.values())
 
 
+def quantizable(model: Module) -> list[str]:
+    """Dotted paths of every layer quantize_model would swap."""
+    found: list[str] = []
+
+    def walk(m: Module, prefix: str) -> None:
+        for name, child in m.__dict__.items():
+            if not isinstance(child, Module):
+                continue
+            path = f"{prefix}{name}"
+            if isinstance(child, Linear | Embedding):
+                found.append(path)
+            else:
+                walk(child, f"{path}.")
+
+    walk(model, "")
+    return found
+
+
 def quantize_model(
-    model: Module, dim: int | None = -1, skip: tuple[str, ...] = ()
+    model: Module,
+    dim: int | None = -1,
+    bits: int = 8,
+    skip: tuple[str, ...] = (),
+    override: dict[str, int] | None = None,
 ) -> Module:
-    """Swap every Linear and Embedding for its int8 form, in place.
+    """Swap every Linear and Embedding for its quantized form, in place.
 
-    `skip` matches dotted paths. Weights that were tied stay tied: they are
-    quantized once and the buffers are shared, so the pair shrinks instead of
-    silently unsharing into an fp32 copy plus an int8 one.
+    `bits` is the default width; `override` sets it per dotted path, which is
+    how a mixed-precision model is built. `skip` leaves a layer in fp32.
+
+    Weights that were tied stay tied: quantized once, buffers shared, so the
+    pair shrinks instead of unsharing into an fp32 copy plus a narrow one.
     """
-    shared: dict[int, tuple[Tensor, Tensor]] = {}
+    override = override or {}
+    shared: dict[tuple[int, int], tuple[Tensor, Tensor]] = {}
+    widths: dict[int, tuple[str, int]] = {}
 
-    def qs_for(w: Tensor) -> tuple[Tensor, Tensor]:
+    def bits_for(path: str) -> int:
+        for k, v in override.items():
+            if path == k or path.endswith(f".{k}"):
+                return v
+        return bits
+
+    def qs_for(w: Tensor, b: int, path: str) -> tuple[Tensor, Tensor]:
+        # a tied pair given two widths would unshare, which COSTS memory (test 12)
+        first, first_b = widths.setdefault(w.data_ptr(), (path, b))
+        assert first_b == b, f"{path} and {first} are tied: {b} vs {first_b} bits"
         # not setdefault: that would evaluate quantize() before checking the key
-        key = w.data_ptr()
+        key = (w.data_ptr(), b)
         if key not in shared:
-            shared[key] = quantize(w, dim)
+            shared[key] = quantize_packed(w, dim, b)
         return shared[key]
 
     def walk(m: Module, prefix: str) -> None:
@@ -104,12 +219,12 @@ def quantize_model(
             path = f"{prefix}{name}"
             if any(path == s or path.endswith(f".{s}") for s in skip):
                 continue
-            if isinstance(child, Linear):
-                setattr(m, name, QuantizedLinear(child, dim, qs_for(child.weight.data)))
-            elif isinstance(child, Embedding):
-                setattr(
-                    m, name, QuantizedEmbedding(child, dim, qs_for(child.weight.data))
+            if isinstance(child, Linear | Embedding):
+                b = bits_for(path)
+                cls = (
+                    QuantizedLinear if isinstance(child, Linear) else QuantizedEmbedding
                 )
+                setattr(m, name, cls(child, dim, b, qs_for(child.weight.data, b, path)))
             else:
                 walk(child, f"{path}.")
 
@@ -235,6 +350,12 @@ if __name__ == "__main__":
     m = fresh()
     n_linear, n_embed = count(m, Linear), count(m, Embedding)
     assert n_linear > 0 and n_embed == 2  # token table and learned positions
+    # quantizable() must agree with what the swap actually does -- it is what
+    # a one-layer-at-a-time sweep builds its skip lists from
+    paths = quantizable(m)
+    assert len(paths) == n_linear + n_embed
+    assert paths[0] == "token_embedding_table" and paths[-1] == "lm_head"
+    assert "blocks.0.attn.proj" in paths  # nested, and the prefix is dotted
     quantize_model(m)
     assert count(m, Linear) == 0 and count(m, QuantizedLinear) == n_linear
     assert count(m, Embedding) == 0 and count(m, QuantizedEmbedding) == n_embed
@@ -289,6 +410,74 @@ if __name__ == "__main__":
     assert pair_bytes(head_only) > pair_bytes(base)  # unshared: strictly worse
     assert pair_bytes(neither) == pair_bytes(base)
 
+    # 14. packing is what makes a narrow width save anything: a 4-bit weight
+    # sitting in an int8 tensor is still a whole byte. any width lands on a byte
+    # boundary eventually -- block() says after how many values
+    assert [block(b) for b in (2, 4, 5, 6, 8)] == [
+        (4, 1),
+        (2, 1),
+        (8, 5),
+        (4, 3),
+        (1, 1),
+    ]
+    for bits in (2, 3, 4, 5, 6, 7, 8):
+        k, nb = block(bits)
+        lo, hi = -(2 ** (bits - 1)), qmax(bits)
+        q = torch.randint(lo, hi + 1, (3, k * 8), dtype=torch.int8)
+        packed = pack_bits(q, bits)
+        assert packed.dtype == torch.uint8
+        assert packed.numel() * 8 == q.numel() * bits  # no padding, no waste
+        assert torch.equal(unpack_bits(packed, bits), q)  # sign extension included
+
+    # a row that does not fill a whole block is refused rather than padded
+    try:
+        pack_bits(torch.zeros(2, 15, dtype=torch.int8), 6)
+        raise SystemExit("should have refused a partial block")
+    except AssertionError as e:
+        assert "multiple of 4" in str(e)
+
+    # 15. int4 is the same scheme with a smaller rail: 15 levels, not 255. the
+    # half-step bound is unchanged -- what changes is how big a step is
+    w = torch.randn(64, 128)
+    q, sc = quantize(w, bits=4)
+    assert q.abs().max() == qmax(4) == 7
+    assert (q.abs().amax(-1) == qmax(4)).all()
+    assert ((dequantize(q, sc) - w).abs() <= sc / 2 + 1e-9).all()
+    err8 = (dequantize(*quantize(w, bits=8)) - w).abs().mean()
+    err4 = (dequantize(q, sc) - w).abs().mean()
+    print(f"mean |error| int8 {err8:.2e}  int4 {err4:.2e}  ({err4 / err8:.0f}x)")
+    assert 14 < err4 / err8 < 22  # the step ratio is QMAX8/QMAX4 = 127/7 = 18.1
+
+    # 16. and it costs half the bytes of int8 through the whole model
+    b32 = nbytes(fresh().state_dict())
+    m8 = quantize_model(fresh(), bits=8)
+    m4 = quantize_model(fresh(), bits=4)
+    b8, b4 = nbytes(m8.state_dict()), nbytes(m4.state_dict())
+    print(
+        f"toy GPT: fp32 {b32 / 2**10:.0f} KB  int8 {b8 / 2**10:.0f} KB  int4 {b4 / 2**10:.0f} KB"
+    )
+    assert b4 < b8 < b32
+    x4 = torch.randint(0, cfg.vocab_size, (2, 16))
+    assert m4(x4).shape == m8(x4).shape  # it still runs, packed and all
+
+    # 17. override sets the width per layer, which is how a mixed-precision
+    # model is built. a tied pair must agree: two widths would unshare it and
+    # COST memory, so it asserts instead of quietly regressing (see test 12)
+    mixed = quantize_model(fresh(), bits=4, override={"blocks.0.attn.proj": 8})
+    assert mixed.blocks[0].attn.proj.bits == 8
+    assert mixed.blocks[1].attn.proj.bits == 4
+    assert nbytes(quantize_model(fresh(), bits=4).state_dict()) < nbytes(
+        mixed.state_dict()
+    )
+    try:
+        quantize_model(fresh(), bits=4, override={"lm_head": 8})
+        raise SystemExit("should have refused to split a tied pair")
+    except AssertionError as e:
+        assert "tied" in str(e)
+
+    # ...and the paths it does not name keep the default
+    assert quantize_model(fresh(), bits=6).lm_head.bits == 6
+
     # --- the rest needs the trained checkpoint, and is skipped without it ---
     from paths import CKPT_DIR
 
@@ -332,5 +521,20 @@ if __name__ == "__main__":
     # one float per row against a whole matrix of int8
     assert kls["per-tensor"] > 3 * kls["per-channel"]
     assert kls["per-channel"] < 1e-3
+
+    # 18. int4 on real weights, and the law behind the gap. KL is quadratic in
+    # the step size and the steps differ by QMAX8/QMAX4 = 127/7, so the error
+    # should grow ~(127/7)^2 = 329x. measured 343x -- within 4% of a closed form
+    m, _ = load_checkpoint(ckpt, dev)
+    quantize_model(m, bits=4)
+    with torch.no_grad():
+        lp = m(x).float().log_softmax(-1)
+    kl4 = (ref.exp() * (ref - lp)).sum(-1).mean().item()
+    ratio, predicted = kl4 / kls["per-channel"], (QMAX / qmax(4)) ** 2
+    mb4 = nbytes(m.state_dict()) / 2**20
+    print(f"  int4         KL {kl4:.2e} nats   {fp32_mb:.1f} -> {mb4:.1f} MB")
+    print(f"  int4/int8 KL {ratio:.0f}x vs (127/7)^2 = {predicted:.0f}x predicted")
+    assert 0.7 < ratio / predicted < 1.5
+    assert mb4 < 0.6 * fp32_mb / 3.97  # genuinely half of int8, because it packs
 
     print("ok")

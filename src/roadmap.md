@@ -1,6 +1,6 @@
 # Roadmap
 
-Updated 2026-09-08, after int8 quantization landed.
+Updated 2026-09-09, after quantization finished.
 
 ## Done
 
@@ -145,19 +145,33 @@ the criterion the sliding window passes and this fails. Same output as `sdpa`,
 slower (65 vs 4.4 ms at T=4096), more memory. It exists to be measured, not
 called.
 
-**Quantization (int8 weight-only).** `quantize.py` — `quantize` / `dequantize`,
-`QuantizedLinear`, `QuantizedEmbedding`, `quantize_model`. Symmetric, scale-only,
-per-channel by default (`dim=-1`); `dim=None` is per-tensor. Post-training, so
-everything is a buffer and nothing is a Parameter. Not wired into `GPTConfig` —
-same criterion as online softmax.
+**Quantization.** `quantize.py` — `quantize` / `dequantize`, `pack_bits` /
+`unpack_bits` at any width 2-8, `QuantizedLinear`, `QuantizedEmbedding`,
+`quantizable`, `quantize_model`. Symmetric, scale-only, per-output-row by
+default (`dim=-1`); `dim=None` is per-tensor; `bits` is the width and
+`override` sets it per dotted path, which is how a mixed model is built.
+Post-training, so everything is a buffer and nothing is a Parameter. Not wired
+into `GPTConfig` — same criterion as online softmax. Measurements live in
+`quantize.ipynb`, seven probes.
 
-On the trained 27M checkpoint: **104 MB -> 26.2 MB (3.97x) for +0.0001 bpc.**
+On the trained 27M checkpoint, **int8 costs +0.0001 bpc for 3.97x**. The full
+curve is in *Measured* below; int6 is the quality sweet spot and int4 the
+memory one.
 
-Tied weights are quantized **once** and the buffers shared. Quantizing one side
-of a tie is the trap: it unshares, leaving an fp32 table plus a fresh int8 copy,
-and the pair gets *bigger*. Measured on a toy GPT — both 142 KB, neither 236 KB,
-head-only 270 KB. It works because `dim=-1` on a `[V, E]` tied weight means
-per-token for the lookup and per-output-channel for `lm_head`: the same axis.
+Tied weights are quantized **once** and the buffers shared, and a tied pair
+given two widths asserts rather than unsharing. Quantizing one side of a tie is
+the trap: it leaves an fp32 table plus a fresh narrow copy and the pair gets
+*bigger*. Measured on a toy GPT — both 142 KB, neither 236 KB, head-only 270 KB.
+It works because `dim=-1` on a `[V, E]` tied weight means per-token for the
+lookup and per-output-channel for `lm_head`: the same axis.
+
+Packing is what makes a narrow width save anything — a 4-bit weight in an int8
+tensor is still a whole byte. `block(bits)` gives the smallest run that lands on
+a byte boundary (`8 // gcd(bits, 8)` values), and `acc_dtype` the narrowest
+signed container it fits in. Smallest block is right: bigger blocks halve the
+packed-side tensors but force a wider container on the unpacked-side ones, which
+are one element per weight and dominate. Measured 34 MB (k=4, int32) against
+64 MB (k=8, int64) at 6 bits.
 
 The old "three genuinely big remaining pieces" list is closed except for data:
 SDPA, RMSNorm, SwiGLU, weight tying, and the KV cache all shipped. Optimizer
@@ -243,6 +257,61 @@ hygiene — the item that sat pending longest — is done too.
   ones. Attention spreads wider than FFN, and early blocks wider than late.
   `quantize.ipynb` probe 2; the four-weight sample in `quantize.py` missed it.
 
+- **Quantization error is ~96% additive, so KL/MB is a budget and not a
+  heuristic.** 35 per-layer KLs sum to 1.71e-4 against 1.78e-4 measured
+  all-at-once. Greedy selection by KL-per-MB then predicts the total to within
+  4% at every point from 1 to 34 units. For small perturbations
+  `KL ~ 1/2 d'Fd`, so additivity says the per-layer logit perturbations are
+  close to orthogonal — what independent rounding errors should be.
+
+- **One bit is worth 4x, from 4 bits up.** KL is quadratic in the step size and
+  a bit halves the step: 4->5 measures 4.9x, 5->6 measures 4.3x, 6->8 measures
+  **16.5x against 16x predicted**. Below 4 bits it breaks (8.4x for 3->4, 14.8x
+  for 2->3) because the perturbation stops being small. int2 lands at bpc 3.04,
+  *worse than the untrained model's 2.96* — destroyed, not degraded.
+
+- **The width curve, trained 27M, real packed sizes.** int4 13.2 MB / +0.0244
+  bpc; **int5 16.5 / +0.0050; int6 19.7 / +0.0012**; int8 26.2 / +0.0001;
+  fp32 104.0. int6 is the quality sweet spot and it is not a width anyone names.
+
+- **Row-wise scales, then stop.** Per-tensor is 6.1x worse in KL for 0.5% less
+  size, so it is never right. But **group-wise scales are not worth it here**:
+  within-row spread is 1.5-1.8x against 2.7-12.3x between rows, so groups attack
+  a problem 4x smaller than the one per-row already solved, at 11% more storage
+  (G=64 is 4.5 effective bits/weight against 4.05). Real formats need them
+  because outlier *features* appear past ~6.7B params; at 27M they do not.
+
+- **Spread does not predict sensitivity.** The position table has the widest
+  rows in the model (12.3x) and is the *second least* sensitive layer. Per-row
+  scaling already neutralises spread — that is its job — so a wide ratio
+  predicts how much per-row beats per-tensor, not what quantizing that layer
+  costs. Two different questions.
+
+- **Mixed precision is real but bounded by `log4` of the sensitivity spread.**
+  Optimal allocation is `b_i = log4(A_i / n_i) + c` — bits scale with the log of
+  **per-weight** sensitivity, so ranking on raw KL protects big layers for the
+  wrong reason. Per-weight sensitivity spans 28x here, so the optimal spread is
+  **2.4 bits**, and mixed buys ~18% less error at matched size (16.4 MB /
+  +0.0041 against uniform int5's 16.5 / +0.0050). An earlier test of **int8/int4
+  lost to uniform** — a 4-bit gap against a 2.4-bit optimum overshoots both
+  ends. Size and sensitivity are uncorrelated (r = -0.05), so the tempting
+  "downgrade the big insensitive layers" story is not the mechanism; bits are
+  *moved*, and a swap pays whenever `KL_i > 4 KL_j`.
+
+- **Nothing is faster, and the loss is shaped backwards.** Dequantization cost
+  tracks weight size so it is paid *per forward*, while matmul cost scales with
+  tokens: ~3.6x slower at decode (B=1,T=1), ~1x at batch. A real int8 kernel is
+  the opposite — it helps decode, which is bandwidth-bound. **Memory does pay
+  though**: total in flight (resident + transient) is fp32 104 MB, int8 42.2,
+  int6 53.7, **int4 31.2**. int6 costs more in flight than int8 because a 24-bit
+  block needs int32 where int4's 8-bit block fits int16.
+
+- **`sum()` over an integer tensor promotes to int64 unless given `dtype=`.**
+  It silently undid `acc_dtype` one line after it was chosen, making every
+  downstream temporary int64. Fixing it took int4's transient from 60 MB to 18
+  and decode from ~5.5x to ~3.6x. A conclusion about a *technique* was really a
+  fact about a missing keyword argument — the reason probe 7 records it.
+
 - **Microbenchmarks of a cache flatter it.** Three times this session an
   isolated measurement overstated: widen-vs-MHA was 2.3x on the bare attention
   op and 1.1x in the layer; preallocation was 26x on the copy and 1.00x in
@@ -274,21 +343,12 @@ table the 4-weight sample had missed.
 
 ## Next, in order
 
-**1. Quantization, the rest.** int8 landed — see *Quantization* above. Four
-probes left, in the order they are worth doing: **int4 + bit-packing** (two
-weights per byte, unpack in forward); **per-layer sensitivity** (quantize one
-layer at a time, watch KL — the instrument is cheap enough now); **is it
-faster** (almost certainly not: `QuantizedLinear.forward` rebuilds the whole
-fp32 matrix every call, so it saves memory at rest and does strictly more
-compute); and **activation quantization**, which is the hard one and may not be
-worth an episode.
-
-**2. BPE tokenizer + FineWeb-Edu.** `src/tokenizer.py` works; port and clean it
+**1. BPE tokenizer + FineWeb-Edu.** `src/tokenizer.py` works; port and clean it
 into `video/`. Byte-level, count pairs, merge, repeat. This is also where the
 chat special tokens get minted, so it has to precede SFT. Then real data at a
 size that does not fit in RAM.
 
-**3. Padding and attention masks.** *Currently missing everywhere in
+**2. Padding and attention masks.** *Currently missing everywhere in
 `src/video/`* — checked, not assumed. Fine for pretraining on contiguous shards,
 a blocker for everything after it: SFT needs the loss masked over prompt tokens
 (`ignore_index`), and batched generation needs left-padding plus a real mask,
@@ -296,17 +356,20 @@ since `generate` assumes every row shares a prompt length. That makes this gate
 RL as well as SFT — rollouts are batched generation. Small file. It has to land
 before SFT, not during.
 
-**4. SFT + LoRA.** Cleaner versions of `src/sft.py` and `src/lora.py`. Chat
+**3. SFT + LoRA.** Cleaner versions of `src/sft.py` and `src/lora.py`. Chat
 template, loss masking, then LoRA as the parameter-efficient variant. This is
 where it stops being a continuation engine.
 
-**5. RL.** **DPO first** — a loss function over a frozen reference model, no
+**4. RL.** **DPO first** — a loss function over a frozen reference model, no
 reward model, no rollouts, no value head, which fits the file-plus-test format.
 PPO/GRPO after, and budget three episodes: sampling loop, advantage estimation,
 KL control. It is the first thing in the series that can silently fail to learn.
 
 ## Worth covering, unscheduled
 
+- **Activation quantization** — the half `quantize.py` does not do. Needs
+  calibration, is where per-tensor genuinely fails, and weight-only already
+  delivers the 4x. Probably not an episode.
 - **Chat templates and special tokens** — cheap, high payoff, pairs with SFT.
   The difference between a continuer and an assistant is mostly a format contract.
 - **Attention sinks (rung 3)** — sidestepped 2026-09-07 for quantization, not
