@@ -1,6 +1,6 @@
 # Roadmap
 
-Updated 2026-09-04, after RoPE landed.
+Updated 2026-09-07, after online softmax landed.
 
 ## Done
 
@@ -126,6 +126,25 @@ Note `block_size` now does double duty in `GQAttention`: it sizes the rope
 tables and selects the preallocated cache, so `use_rope=True` implies buffer
 mode. Harmless today; a separate flag if it ever stops being.
 
+**Online softmax.** `online_softmax.py` — the streaming `(m, l)` recurrence and
+a `flash_attention` built on it, tiled over both queries and keys. Closes the
+one place the series said *trust the kernel*: `sdpa_attention.py` measured the
+T² blow-up and handed the fix to SDPA.
+
+Peak memory, 4060, B=2 nh=4 hs=64, fp32:
+
+| T | naive | flash (128×128) | SDPA |
+|---|---|---|---|
+| 512 | 44 MB | 23 MB | 21 MB |
+| 1024 | 119 MB | 28 MB | 25 MB |
+| 2048 | 413 MB | 38 MB | 33 MB |
+| 4096 | 1577 MB | 58 MB | 49 MB |
+
+**Deliberately not wired.** It changes no logits, so it earns no config knob —
+the criterion the sliding window passes and this fails. Same output as `sdpa`,
+slower (65 vs 4.4 ms at T=4096), more memory. It exists to be measured, not
+called.
+
 The old "three genuinely big remaining pieces" list is closed except for data:
 SDPA, RMSNorm, SwiGLU, weight tying, and the KV cache all shipped. Optimizer
 hygiene — the item that sat pending longest — is done too.
@@ -180,6 +199,17 @@ hygiene — the item that sat pending longest — is done too.
   T² tensor SDPA exists not to materialise (4 GB at T=65536). A real windowed
   kernel takes W as an integer and skips blocks. `sliding_window.py` test 6.
 
+- **A fully masked tile makes `nan`, not zero.** `-inf - -inf` in the rescale,
+  when the running max is still `-inf`. Substituting 0 for `m_new` there is
+  exact — every term involved is `-inf`, so both exps are 0 and the state is
+  unchanged. Fires on sliding windows (masked blocks come *first*), not on plain
+  causal, where block 0 is always visible. `online_softmax.py` test 4.
+
+- **The block-skip bound must be a host int.** Comparing `ki` against a CUDA
+  tensor syncs once per block: 4.89 ms of pure loop overhead at T=4096 vs
+  0.02 ms for a Python int, ~6% of total runtime. `q_pos.max()` is worse still
+  (5.78 ms). The traffic was the bottleneck again — 528 syncs instead of 512 MB.
+
 - **Microbenchmarks of a cache flatter it.** Three times this session an
   isolated measurement overstated: widen-vs-MHA was 2.3x on the bare attention
   op and 1.1x in the layer; preallocation was 26x on the copy and 1.00x in
@@ -188,24 +218,11 @@ hygiene — the item that sat pending longest — is done too.
 
 ## Next, in order
 
-**1. Attention sinks (rung 3).** Rungs 1 and 2 shipped — see *Sliding window*
-and *Ring buffer* above. Rung 3 is attention sinks: pin the first `S` slots, ring the rest. This is the
-rung that forces the bend — once generation runs past `block_size` the rope
-table is exhausted, and StreamingLLM's fix is to **re-index positions within the
-cache**, which needs keys stored *unrotated* and rotated at read time. Keep
-write-time rotation for rungs 1–2 and introduce read-time rotation as rung 3's
-lesson: rotating the whole window every step is the cost, and the cost is the
-point.
-
-Concretely, what rung 3 has to change: `RingKVCache` gains `S` pinned slots the
-cursor skips, so the wrap is over `slots[S:]` rather than all of them —
-`positions` already carries everything the mask needs, so that side is done.
-Then `GPT.forward`'s `T_past + T <= block_size` assert becomes the binding
-constraint, because it is the rope table, not the cache, that runs out. That is
-where write-time rotation has to give.
-
-Also unblocked and unrun: the reverse-string probe below. Do it before or after,
-but do not let it silently not happen.
+**1. Quantization (int8/int4).** Weight-only first, per-channel scales, on the
+~29M `artifacts/checkpoints/big_*.pt`. The sequel to `amp.py` on the precision
+axis, and the answer to "how does this scale to a 7B on a 4060". Like online
+softmax the eager version will be slower (dequant, then matmul); unlike it, the
+4x size drop and the bpc delta are real and measurable through `evaluate.py`.
 
 **2. BPE tokenizer + FineWeb-Edu.** `src/tokenizer.py` works; port and clean it
 into `video/`. Byte-level, count pairs, merge, repeat. This is also where the
@@ -233,15 +250,33 @@ KL control. It is the first thing in the series that can silently fail to learn.
 
 - **Chat templates and special tokens** — cheap, high payoff, pairs with SFT.
   The difference between a continuer and an assistant is mostly a format contract.
-- **Quantization (int8/int4)** — weight-only is ~100 lines, and it is the answer
-  to "how does this scale to a 7B on a 4060".
-- **Online softmax / flash internals** — `sdpa_attention.py` currently says eager
-  ops cannot express the tiling and leaves it there. Deriving the streaming
-  recurrence closes the one place the series says "trust the kernel".
+- **Attention sinks (rung 3)** — sidestepped 2026-09-07 for quantization, not
+  abandoned. Rungs 1 and 2 shipped; the plan is kept verbatim below.
 - **MoE** — routing, top-k experts, load-balancing loss. Self-contained.
 - **An eval beyond val loss** — bpc is there; something task-shaped makes the SFT
   and RL episodes legible.
 - **YaRN / NTK context extension** — only as a RoPE sequel, if RoPE lands well.
+
+### Attention sinks (rung 3), parked
+
+Rungs 1 and 2 shipped — see *Sliding window* and *Ring buffer* above. Rung 3 is
+attention sinks: pin the first `S` slots, ring the rest. This is the
+rung that forces the bend — once generation runs past `block_size` the rope
+table is exhausted, and StreamingLLM's fix is to **re-index positions within the
+cache**, which needs keys stored *unrotated* and rotated at read time. Keep
+write-time rotation for rungs 1–2 and introduce read-time rotation as rung 3's
+lesson: rotating the whole window every step is the cost, and the cost is the
+point.
+
+Concretely, what rung 3 has to change: `RingKVCache` gains `S` pinned slots the
+cursor skips, so the wrap is over `slots[S:]` rather than all of them —
+`positions` already carries everything the mask needs, so that side is done.
+Then `GPT.forward`'s `T_past + T <= block_size` assert becomes the binding
+constraint, because it is the rope table, not the cache, that runs out. That is
+where write-time rotation has to give.
+
+Also unblocked and unrun: the reverse-string probe below. Do it before or after,
+but do not let it silently not happen.
 
 ## Skip
 
