@@ -1,6 +1,6 @@
 # Roadmap
 
-Updated 2026-09-07, after online softmax landed.
+Updated 2026-09-08, after int8 quantization landed.
 
 ## Done
 
@@ -145,6 +145,20 @@ the criterion the sliding window passes and this fails. Same output as `sdpa`,
 slower (65 vs 4.4 ms at T=4096), more memory. It exists to be measured, not
 called.
 
+**Quantization (int8 weight-only).** `quantize.py` — `quantize` / `dequantize`,
+`QuantizedLinear`, `QuantizedEmbedding`, `quantize_model`. Symmetric, scale-only,
+per-channel by default (`dim=-1`); `dim=None` is per-tensor. Post-training, so
+everything is a buffer and nothing is a Parameter. Not wired into `GPTConfig` —
+same criterion as online softmax.
+
+On the trained 27M checkpoint: **104 MB -> 26.2 MB (3.97x) for +0.0001 bpc.**
+
+Tied weights are quantized **once** and the buffers shared. Quantizing one side
+of a tie is the trap: it unshares, leaving an fp32 table plus a fresh int8 copy,
+and the pair gets *bigger*. Measured on a toy GPT — both 142 KB, neither 236 KB,
+head-only 270 KB. It works because `dim=-1` on a `[V, E]` tied weight means
+per-token for the lookup and per-output-channel for `lm_head`: the same axis.
+
 The old "three genuinely big remaining pieces" list is closed except for data:
 SDPA, RMSNorm, SwiGLU, weight tying, and the KV cache all shipped. Optimizer
 hygiene — the item that sat pending longest — is done too.
@@ -210,19 +224,64 @@ hygiene — the item that sat pending longest — is done too.
   0.02 ms for a Python int, ~6% of total runtime. `q_pos.max()` is worse still
   (5.78 ms). The traffic was the bottleneck again — 528 syncs instead of 512 MB.
 
+- **int8 weight-only is close to free, and KL is the instrument.** On the
+  trained 27M: per-channel +0.0001 bpc, per-tensor +0.0005 — both buried in the
+  fourth decimal. The same comparison in **KL against the fp32 logits is 1.78e-4
+  vs 1.08e-3, a clean 6.1x**, from 8 sequences instead of a 1M-token sweep. Use
+  Δbpc for the headline, KL for anything that has to discriminate.
+
+- **Per-tensor buys nothing.** 3.99x against per-channel's 3.97x — the scales are
+  one float per row against a whole matrix of int8, under 1% of the size, for 6x
+  the accuracy. There is no regime in this model where per-tensor is right.
+
+- **Quantize the embeddings.** Skipping them costs 3.97x -> 3.16x to save
+  0.4e-4 nats. A fifth of this model is embedding.
+
+- **The position table has the widest rows in the model** — 12.3x between its
+  loudest and quietest row, against 2.7x for the token table and 1.8-8.1x for
+  the blocks. Early positions appear in every window, late ones only in long
+  ones. Attention spreads wider than FFN, and early blocks wider than late.
+  `quantize.ipynb` probe 2; the four-weight sample in `quantize.py` missed it.
+
 - **Microbenchmarks of a cache flatter it.** Three times this session an
   isolated measurement overstated: widen-vs-MHA was 2.3x on the bare attention
   op and 1.1x in the layer; preallocation was 26x on the copy and 1.00x in
   `generate`. Isolate any component of a decode step and it looks like the
   bottleneck.
 
+## Where things go
+
+Three files per topic, and the split is about what can *fail*, not what is slow:
+
+- **`video/<topic>.py`**, tests under `__main__` — anything that can break
+  because of a **code** change. Kept fast (`quantize.py` is 1.9s). Artifact
+  dependencies are fine when guarded: check the checkpoint exists, print a skip
+  line, exit clean.
+- **`video/<topic>.ipynb`** — **measurements**: anything that can only change
+  when an artifact does (a checkpoint's weight statistics, a dataset's token
+  counts), plus sweeps too slow to run every time, plus the topic's formulas in
+  LaTeX. Outputs committed; they are the archive. Cell 1 is the prelude —
+  imports and shared helpers — and **a probe cell may read names from the
+  prelude, never from another probe cell**, so any cell runs after a restart.
+  A helper earns a place in the prelude when a second probe needs it.
+- **`walkthroughs/<topic>.ipynb`** — rough derivation scratch, never re-run.
+
+The rule caught a real case: `quantize.py`'s row-max probe took 30ms but
+asserted a property of the *checkpoint*, so no code change could fail it. It
+moved to the notebook, where the full 36-weight version found the 12.3x position
+table the 4-weight sample had missed.
+
+
 ## Next, in order
 
-**1. Quantization (int8/int4).** Weight-only first, per-channel scales, on the
-~29M `artifacts/checkpoints/big_*.pt`. The sequel to `amp.py` on the precision
-axis, and the answer to "how does this scale to a 7B on a 4060". Like online
-softmax the eager version will be slower (dequant, then matmul); unlike it, the
-4x size drop and the bpc delta are real and measurable through `evaluate.py`.
+**1. Quantization, the rest.** int8 landed — see *Quantization* above. Four
+probes left, in the order they are worth doing: **int4 + bit-packing** (two
+weights per byte, unpack in forward); **per-layer sensitivity** (quantize one
+layer at a time, watch KL — the instrument is cheap enough now); **is it
+faster** (almost certainly not: `QuantizedLinear.forward` rebuilds the whole
+fp32 matrix every call, so it saves memory at rest and does strictly more
+compute); and **activation quantization**, which is the hard one and may not be
+worth an episode.
 
 **2. BPE tokenizer + FineWeb-Edu.** `src/tokenizer.py` works; port and clean it
 into `video/`. Byte-level, count pairs, merge, repeat. This is also where the
