@@ -18,7 +18,10 @@ dependencies = [
 
 [dependency-groups]
 dev = [
-    "ipykernel>=7.3.0",
+    # <7: ipykernel 7 reworked the kernel async/status protocol and the
+    # current VS Code Jupyter ext (2025.9.1) can miss the reply that ends
+    # a cell -- outputs land but the spinner never resolves, needing a reload
+    "ipykernel>=6.29,<7",
     "ipywidgets>=8.1.9",
     "ruff>=0.16.2",
 ]
