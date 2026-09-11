@@ -7,5 +7,11 @@
             "source.organizeImports.ruff": "explicit",
             "source.fixAll.ruff": "explicit"
         }
-    }
+    },
+    "notebook.formatOnSave.enabled": true,
+    "python.analysis.extraPaths": [
+        "src",
+        "src/video",
+        "src/scratch"
+    ],
 }
