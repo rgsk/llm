@@ -1,11 +1,16 @@
+import first
 from first import Tensor, contiguous_strides, flatten, infer_shape, prod
-from test_utils import check_raises
+from test_utils import check_raises, run_tests
 
 
 def t1():
+    Tensor.__init__.test()
+    Tensor._offset.test()
+
     a = Tensor([1, 2, 3, 4, 5, 6], (2, 3))
     assert a.data == [1, 2, 3, 4, 5, 6]
     assert a.shape == (2, 3)
+
     assert a._offset((1, 2)) == 5
     assert a.data[a._offset((1, 2))] == 6
 
@@ -29,6 +34,8 @@ def t2():
 
 
 def t3():
+    Tensor.transpose.test()
+
     a = Tensor([1, 2, 3, 4, 5, 6], shape=(2, 3))
     assert a.strides == (3, 1)
 
@@ -52,6 +59,9 @@ def t3():
 
 
 def t4():
+    Tensor.tolist.test()
+    Tensor.__repr__.test()
+
     a = Tensor([1, 2, 3, 4, 5, 6], (2, 3))
     assert a.tolist() == [[1, 2, 3], [4, 5, 6]]
     assert a.transpose(0, 1).tolist() == [
@@ -64,14 +74,15 @@ def t4():
 
 
 def t5():
-    a_list = [
-        [1, 2, 3],
-        [4, 5, 6],
-    ]
     infer_shape.test()
     flatten.test()
 
-    a = Tensor(a_list)
+    a = Tensor(
+        [
+            [1, 2, 3],
+            [4, 5, 6],
+        ]
+    )
     assert a.shape == (2, 3)
     assert a.data == [1, 2, 3, 4, 5, 6]
 
@@ -94,6 +105,11 @@ def t5():
 
 def t6():
     prod.test()
+    Tensor.numel.fget.test()
+    Tensor.is_contiguous.test()
+    Tensor.flat.test()
+    Tensor.contiguous.test()
+
     a = Tensor([[1, 2, 3], [4, 5, 6]])
     assert a.numel == 6
 
@@ -124,6 +140,7 @@ def t6():
 
 
 def tests():
+    run_tests(first)
     t1()
     t2()
     t3()
