@@ -1,12 +1,5 @@
 from first import Tensor, contiguous_strides, flatten, infer_shape, prod
-
-
-def check_raises(exc, fn, msg=None):
-    try:
-        fn()
-    except exc as e:
-        return e
-    raise AssertionError(msg or f"expected {exc.__name__}, nothing raised")
+from test_utils import check_raises
 
 
 def t1():
@@ -101,8 +94,7 @@ def t5():
 
 
 def t6():
-    assert prod((2, 3)) == 6
-    assert prod((2, 3, 4)) == 24
+    prod.test()
     a = Tensor([[1, 2, 3], [4, 5, 6]])
     assert a.numel == 6
 

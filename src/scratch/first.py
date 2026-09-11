@@ -1,3 +1,6 @@
+from test_utils import selftest
+
+
 def contiguous_strides(shape):
     res = []
     p = 1
@@ -26,7 +29,12 @@ def flatten(nested):
     return out
 
 
+@selftest
 def prod(xs):
+    def test(self):
+        assert self((2, 3)) == 6
+        assert self((2, 3, 4)) == 24
+
     out = 1
     for x in xs:
         out *= x
