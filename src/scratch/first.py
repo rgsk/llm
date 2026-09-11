@@ -7,8 +7,37 @@ def contiguous_strides(shape):
     return tuple(reversed(res))
 
 
+def infer_shape(nested):
+    shape = []
+    while isinstance(nested, list):
+        shape.append(len(nested))
+        if len(nested) == 0:
+            break
+        nested = nested[0]
+    return tuple(shape)
+
+
+def flatten(nested):
+    if not isinstance(nested, list):
+        return [nested]
+    out = []
+    for e in nested:
+        out += flatten(e)
+    return out
+
+
+def prod(xs):
+    out = 1
+    for x in xs:
+        out *= x
+    return out
+
+
 class Tensor:
-    def __init__(self, data, shape, strides=None):
+    def __init__(self, data, shape=None, strides=None):
+        if shape is None:
+            shape = infer_shape(data)
+            data = flatten(data)
         self.data = data
         self.shape = shape
         self.strides = contiguous_strides(shape) if strides is None else strides
@@ -33,6 +62,21 @@ class Tensor:
             return [build(idx + (i,)) for i in range(self.shape[d])]
 
         return build(())
+
+    @property
+    def numel(self):
+        return prod(self.shape)
+
+    def is_contiguous(self):
+        return self.strides == contiguous_strides(self.shape)
+
+    def flat(self):
+        return flatten(self.tolist())
+
+    def contiguous(self):
+        if self.is_contiguous():
+            return self
+        return Tensor(self.flat(), self.shape)
 
     def __repr__(self):
         return (
