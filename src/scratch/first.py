@@ -1,7 +1,12 @@
 from test_utils import selftest
 
 
+@selftest
 def contiguous_strides(shape):
+    def test(self):
+        assert self((2, 3)) == (3, 1)
+        assert self((2, 3, 4)) == (12, 4, 1)
+
     res = []
     p = 1
     for s in reversed(shape):
@@ -10,7 +15,16 @@ def contiguous_strides(shape):
     return tuple(reversed(res))
 
 
+@selftest
 def infer_shape(nested):
+    def test(self):
+        assert self(
+            [
+                [1, 2, 3],
+                [4, 5, 6],
+            ]
+        ) == (2, 3)
+
     shape = []
     while isinstance(nested, list):
         shape.append(len(nested))
@@ -20,7 +34,16 @@ def infer_shape(nested):
     return tuple(shape)
 
 
+@selftest
 def flatten(nested):
+    def test(self):
+        assert self(
+            [
+                [1, 2, 3],
+                [4, 5, 6],
+            ]
+        ) == [1, 2, 3, 4, 5, 6]
+
     if not isinstance(nested, list):
         return [nested]
     out = []
