@@ -286,9 +286,17 @@ class Tensor:
         shape, strides = list(self.shape), list(self.strides)
         shape[d0], shape[d1] = shape[d1], shape[d0]
         strides[d0], strides[d1] = strides[d1], strides[d0]
-        return Tensor(
+        out = Tensor(
             self.data, tuple(shape), tuple(strides), _parents=(self,), _op="transpose"
         )
+
+        def _backward() -> None:
+            assert out.grad is not None
+            g = Tensor(out.grad, out.shape).transpose(d0, d1)  # back to self.shape
+            self._accum(g.flat())  # .flat() re-reads it in self's logical order
+
+        out._backward = _backward
+        return out
 
     @selftest(transpose)
     def _(fn):
@@ -299,6 +307,27 @@ class Tensor:
         assert t.data is a.data  # a view, not a copy
         assert t.tolist() == [[1, 4], [2, 5], [3, 6]]
         assert (t._op, t._parents) == ("transpose", (a,))  # stays in the graph
+
+        # the view reads the base's 1..6 as [1, 4, 2, 5, 3, 6]. seed each slot with
+        # the value it reads, and a correct backward gives every element its own back
+        g = fn(Tensor([1, 2, 3, 4, 5, 6], (2, 3)), 0, 1)  # (3,2) view of a (2,3)
+        g.grad = [1.0, 4.0, 2.0, 5.0, 3.0, 6.0]
+        g._backward()
+        assert g._parents[0].grad == [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]  # 2 gets 2, not 4
+
+    @property
+    def T(self) -> Tensor:
+        assert len(self.shape) == 2, f"T is 2-D only, got {self.shape}"
+        return self.transpose(0, 1)
+
+    @selftest(T.fget)  # type: ignore[attr-defined]
+    def _(fn):
+        a = Tensor([1, 2, 3, 4, 5, 6], (2, 3))
+        assert fn(a).tolist() == a.transpose(0, 1).tolist()  # just the 2-D shorthand
+        assert fn(a).shape == (3, 2)
+
+        e = check_raises(AssertionError, lambda: fn(Tensor(list(range(8)), (2, 2, 2))))
+        assert "2-D only" in str(e)  # batched code must say which dims it means
 
     def tolist(self) -> Nested:
         def build(idx: Index) -> Nested:
@@ -344,7 +373,14 @@ class Tensor:
     def contiguous(self) -> Tensor:
         if self.is_contiguous():
             return self
-        return Tensor(self.flat(), self.shape, _parents=(self,), _op="contiguous")
+        out = Tensor(self.flat(), self.shape, _parents=(self,), _op="contiguous")
+
+        def _backward() -> None:
+            assert out.grad is not None
+            self._accum(out.grad)  # same shape, same logical order: straight through
+
+        out._backward = _backward
+        return out
 
     @selftest(contiguous)
     def _(fn):
@@ -361,6 +397,10 @@ class Tensor:
         assert (tc._op, tc._parents) == ("contiguous", (t,))
         assert fn(tc) is tc  # already contiguous: same node, nothing added
 
+        tc.grad = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]
+        tc._backward()
+        assert t.grad == [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]  # copy only moved the storage
+
     @overload
     def reshape(self, *shape: int) -> Tensor: ...
     @overload
@@ -374,7 +414,14 @@ class Tensor:
             shape = tuple(self.numel // known if s == -1 else s for s in shape)
         assert prod(shape) == self.numel, f"cannot reshape {self.shape} -> {shape}"
         src = self.contiguous()
-        return Tensor(src.data, shape, _parents=(src,), _op="reshape")
+        out = Tensor(src.data, shape, _parents=(src,), _op="reshape")
+
+        def _backward() -> None:
+            assert out.grad is not None
+            src._accum(out.grad)  # only the shape changed, so the flat grad carries
+
+        out._backward = _backward
+        return out
 
     @selftest(reshape)
     def _(fn):
@@ -399,6 +446,12 @@ class Tensor:
         assert tr.data == [1, 4, 2, 5, 3, 6]
         assert tr._parents[0]._op == "contiguous"  # the copy is its own node
         assert fn(t, 2, 3).tolist() == [[1, 4, 2], [5, 3, 6]]
+
+        base = Tensor([[1, 2, 3], [4, 5, 6]])
+        r6 = fn(base, 6)
+        r6.grad = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]
+        r6._backward()
+        assert base.grad == [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]  # flat order is preserved
 
     def indices(self) -> Iterator[Index]:
         return iter_indices(self.shape)
@@ -426,9 +479,16 @@ class Tensor:
                 strides.append(0)  # <- stay put
             else:
                 raise ValueError(f"cannot expand {self.shape} -> {shape}")
-        return Tensor(
+        out = Tensor(
             self.data, tuple(shape), tuple(strides), _parents=(self,), _op="expand"
         )
+
+        def _backward() -> None:
+            assert out.grad is not None
+            self._accum(unbroadcast(out.grad, out.shape, self.shape))
+
+        out._backward = _backward
+        return out
 
     @selftest(expand)
     def _(fn):
@@ -445,6 +505,12 @@ class Tensor:
 
         err = check_raises(ValueError, lambda: fn(Tensor([[1, 2], [3, 4]]), (2, 3)))
         assert "cannot expand" in str(err)
+
+        src = Tensor([10.0, 20.0, 30.0])
+        ex = fn(src, (2, 3))
+        ex.grad = [1.0] * 6
+        ex._backward()
+        assert src.grad == [2.0, 2.0, 2.0]  # a stride-0 dim sums its copies back down
 
     def _binop(
         self, other: Tensor | Scalar, f: BinFn, da: BinFn, db: BinFn, op: str

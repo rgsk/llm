@@ -547,16 +547,64 @@ def t16():
     to.backward(torch.ones_like(to))
     assert close(x.grad, tx) and close(w.grad, tw) and close(s.grad, ts)
 
-    # matmul accumulates onto the node it was handed, view or not; transpose has no
-    # backward of its own yet, so the grad stops at the view and never reaches k
+    # the attention shape: the grad runs back through the transpose all the way to k
     q, k = rnd((2, 4, 6, 8)), rnd((2, 4, 6, 8))
-    kt = k.transpose(2, 3)
-    (q @ kt).backward()
-    tq = tg(q)
-    to = tq @ tg(k).transpose(2, 3)
+    (q @ k.transpose(2, 3)).backward()
+    tq, tk = tg(q), tg(k)
+    to = tq @ tk.transpose(2, 3)
     to.backward(torch.ones_like(to))
-    assert close(q.grad, tq)
-    assert kt.grad is not None and k.grad is None  # flip when views get a backward
+    assert close(q.grad, tq) and close(k.grad, tk)
+
+
+def t17():
+    Tensor.transpose.test()
+    Tensor.T.fget.test()
+    Tensor.contiguous.test()
+    Tensor.reshape.test()
+    Tensor.expand.test()
+    random.seed(0)
+
+    # a view is a graph node, so the grad has to travel back through it to the base.
+    # each lambda runs unchanged on a torch tensor too -- same spelling, same answer
+    for shape, view in [
+        ((2, 3), lambda t: t.transpose(0, 1)),
+        ((2, 3), lambda t: t.T),
+        ((2, 3), lambda t: t.reshape(3, 2)),
+        ((2, 3), lambda t: t.reshape(-1)),
+        ((2, 3), lambda t: t.expand((4, 2, 3))),  # a fresh leading dim
+        ((1, 3), lambda t: t.expand((4, 3))),  # a stride-0 dim: grads fold back down
+        ((2, 3), lambda t: t.transpose(0, 1).contiguous()),
+        ((2, 3), lambda t: t.transpose(0, 1).reshape(6)),  # copies on the way through
+    ]:
+        a = rnd(shape)
+        v = view(a)
+        (v * v).backward()  # a mul below the view, so the incoming grad isn't all ones
+
+        ta = tg(a)
+        tv = view(ta)
+        to = tv * tv
+        to.backward(torch.ones_like(to))
+        assert close(a.grad, ta), shape
+
+    # reshaping a non-contiguous view inserts a copy, and the chain runs through it
+    a = rnd((2, 3))
+    v = a.transpose(0, 1).reshape(6)
+    assert [t._op or "leaf" for t in topo(v)] == [
+        "leaf",
+        "transpose",
+        "contiguous",
+        "reshape",
+    ]
+
+    # a view feeding two branches: both grads land on the one base
+    b = rnd((3, 3))
+    bt = b.T
+    (bt @ b + bt).backward()  # bt feeds the matmul and the add
+    tb = tg(b)
+    tbt = tb.T
+    to = tbt @ tb + tbt
+    to.backward(torch.ones_like(to))
+    assert close(b.grad, tb)
 
 
 def tests():
@@ -577,6 +625,7 @@ def tests():
     t14()
     t15()
     t16()
+    t17()
     print("✅ ok")
 
 
