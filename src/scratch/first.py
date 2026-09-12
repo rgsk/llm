@@ -388,6 +388,46 @@ class Tensor:
     __radd__ = __add__  # 2 + t  ->  t + 2
     __rmul__ = __mul__
 
+    def __matmul__(self, other: Tensor) -> Tensor:
+        assert len(self.shape) == 2 and len(other.shape) == 2
+        n, k = self.shape
+        k2, m = other.shape
+        assert k == k2, f"cannot matmul {self.shape} @ {other.shape}"
+
+        out = [0.0] * (n * m)
+        for i in range(n):
+            for j in range(m):
+                s = 0.0
+                for p in range(k):
+                    s += (
+                        self.data[self._offset((i, p))]
+                        * other.data[other._offset((p, j))]
+                    )
+                out[i * m + j] = s
+        return Tensor(out, (n, m))
+
+    @selftest(__matmul__)
+    def _(fn):
+        a = Tensor([[1, 2, 3], [4, 5, 6]])  # (2,3)
+        b = Tensor([[7, 8], [9, 10], [11, 12]])  # (3,2)
+        out = fn(a, b)
+        assert (out.shape, out.tolist()) == ((2, 2), [[58, 64], [139, 154]])
+        assert out.is_contiguous()  # always a fresh row-major result
+
+        i = Tensor([[1, 0], [0, 1]])
+        assert fn(i, i).tolist() == [[1, 0], [0, 1]]
+
+        col = Tensor([[1], [2], [3]])  # (3,1): non-square result pins (n, m) order
+        assert (fn(a, col).shape, fn(a, col).tolist()) == ((2, 1), [[14], [32]])
+
+        t = b.transpose(0, 1)  # (2,3) view: read through strides, not storage
+        assert fn(t, b).tolist() == [[251, 278], [278, 308]]
+
+        e = check_raises(AssertionError, lambda: fn(a, a))  # inner dims disagree
+        assert "cannot matmul" in str(e)
+
+        check_raises(AssertionError, lambda: fn(a, Tensor([1, 2, 3])))  # 2-D only
+
     def __repr__(self) -> str:
         return (
             f"Tensor(shape={self.shape}, strides={self.strides}, data={self.tolist()})"

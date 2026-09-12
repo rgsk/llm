@@ -1,6 +1,9 @@
+import random
+
 import first
 import torch
 from first import (
+    Shape,
     Tensor,
     broadcast_shape,
     contiguous_strides,
@@ -290,6 +293,59 @@ def t10():
     assert "cannot broadcast" in str(e)
 
 
+def rnd(shape: Shape):
+    return Tensor([random.uniform(-3, 3) for _ in range(prod(shape))], shape)
+
+
+def tt(t: Tensor):
+    return torch.tensor(t.tolist(), dtype=torch.float64)
+
+
+def t11():
+    Tensor.__matmul__.test()
+    random.seed(0)
+
+    a = Tensor([[1, 2, 3], [4, 5, 6]])  # (2,3)
+    b = Tensor([[7, 8], [9, 10], [11, 12]])  # (3,2)
+    ta, tb = torch.tensor(a.tolist()), torch.tensor(b.tolist())
+
+    assert (a @ b).shape == (2, 2)
+    assert (a @ b).tolist() == (ta @ tb).tolist()
+
+    # transposed operands: the loop must go through _offset, not raw storage
+    assert (a.transpose(0, 1) @ a).tolist() == (ta.T @ ta).tolist()
+    assert (b.transpose(0, 1) @ b).tolist() == (tb.T @ tb).tolist()
+
+    out = a @ b
+    assert out.is_contiguous()
+    assert out.data is not a.data and out.data is not b.data
+
+    e = check_raises(AssertionError, lambda: a @ a)  # (2,3) @ (2,3)
+    assert "cannot matmul" in str(e)
+
+    check_raises(AssertionError, lambda: a @ Tensor([1, 2, 3]))  # 2-D operands only
+
+    for s1, s2 in [
+        ((2, 3), (3, 4)),
+        ((1, 5), (5, 1)),
+        ((7, 7), (7, 7)),
+        ((4, 1), (1, 6)),
+    ]:
+        m1, m2 = rnd(s1), rnd(s2)
+        assert torch.allclose(tt(m1 @ m2), tt(m1) @ tt(m2)), (s1, s2)
+
+    m1, m2 = rnd((3, 4)), rnd((5, 4))
+    assert torch.allclose(tt(m1 @ m2.transpose(0, 1)), tt(m1) @ tt(m2).T)
+
+    w = rnd((30, 20))  # (out, in), torch's layout
+    bias = rnd((30,))
+    x = rnd((128, 20))
+
+    y = x @ w.transpose(0, 1) + bias  # broadcasting adds bias across all 128 rows
+    assert y.shape == (128, 30)
+    assert torch.allclose(tt(y), torch.nn.functional.linear(tt(x), tt(w), tt(bias)))
+
+
 def tests():
     run_tests(first)
     t1()
@@ -302,6 +358,7 @@ def tests():
     t8()
     t9()
     t10()
+    t11()
     print("✅ ok")
 
 
