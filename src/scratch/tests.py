@@ -18,9 +18,11 @@ def t1():
 def t2():
     contiguous_strides.test()
 
+    contiguous_strides((2, 3)) == (3, 1)
     a = Tensor([1, 2, 3, 4, 5, 6], (2, 3))
     assert a.strides == (3, 1)
 
+    contiguous_strides((2, 3, 4)) == (12, 4, 1)
     b = Tensor(list(range(24)), (2, 3, 4))
     assert b.strides == (12, 4, 1)
     assert b._offset((1, 2, 3)) == 23
@@ -77,12 +79,16 @@ def t5():
     infer_shape.test()
     flatten.test()
 
-    a = Tensor(
-        [
-            [1, 2, 3],
-            [4, 5, 6],
-        ]
-    )
+    a_list = [
+        [1, 2, 3],
+        [4, 5, 6],
+    ]
+
+    infer_shape(a_list) == (2, 3)
+
+    flatten(a_list) == [1, 2, 3, 4, 5, 6]
+
+    a = Tensor(a_list)
     assert a.shape == (2, 3)
     assert a.data == [1, 2, 3, 4, 5, 6]
 
@@ -110,6 +116,8 @@ def t6():
     Tensor.flat.test()
     Tensor.contiguous.test()
 
+    assert prod((2, 3)) == 6
+    assert prod((2, 3, 4)) == 24
     a = Tensor([[1, 2, 3], [4, 5, 6]])
     assert a.numel == 6
 
