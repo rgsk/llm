@@ -9,6 +9,7 @@ from first import (
     contiguous_strides,
     flatten,
     infer_shape,
+    iter_indices,
     prod,
 )
 from test_utils import check_raises, run_tests
@@ -223,6 +224,7 @@ def t8():
 
 
 def t9():
+    iter_indices.test()
     Tensor.indices.test()
     Tensor.expand.test()
 
@@ -301,29 +303,46 @@ def tt(t: Tensor):
     return torch.tensor(t.tolist(), dtype=torch.float64)
 
 
+def matmul2d(self: Tensor, other: Tensor) -> Tensor:
+    assert len(self.shape) == 2 and len(other.shape) == 2
+    n, k = self.shape
+    k2, m = other.shape
+    assert k == k2, f"cannot matmul {self.shape} @ {other.shape}"
+
+    out = [0.0] * (n * m)
+    for i in range(n):
+        for j in range(m):
+            s = 0.0
+            for p in range(k):
+                s += self.data[self._offset((i, p))] * other.data[other._offset((p, j))]
+            out[i * m + j] = s
+    return Tensor(out, (n, m))
+
+
 def t11():
-    Tensor.__matmul__.test()
     random.seed(0)
 
     a = Tensor([[1, 2, 3], [4, 5, 6]])  # (2,3)
     b = Tensor([[7, 8], [9, 10], [11, 12]])  # (3,2)
     ta, tb = torch.tensor(a.tolist()), torch.tensor(b.tolist())
 
-    assert (a @ b).shape == (2, 2)
-    assert (a @ b).tolist() == (ta @ tb).tolist()
+    assert matmul2d(a, b).shape == (2, 2)
+    assert matmul2d(a, b).tolist() == (ta @ tb).tolist()
 
     # transposed operands: the loop must go through _offset, not raw storage
-    assert (a.transpose(0, 1) @ a).tolist() == (ta.T @ ta).tolist()
-    assert (b.transpose(0, 1) @ b).tolist() == (tb.T @ tb).tolist()
+    assert matmul2d(a.transpose(0, 1), a).tolist() == (ta.T @ ta).tolist()
+    assert matmul2d(b.transpose(0, 1), b).tolist() == (tb.T @ tb).tolist()
 
-    out = a @ b
+    out = matmul2d(a, b)
     assert out.is_contiguous()
     assert out.data is not a.data and out.data is not b.data
 
-    e = check_raises(AssertionError, lambda: a @ a)  # (2,3) @ (2,3)
+    e = check_raises(AssertionError, lambda: matmul2d(a, a))  # (2,3) @ (2,3)
     assert "cannot matmul" in str(e)
 
-    check_raises(AssertionError, lambda: a @ Tensor([1, 2, 3]))  # 2-D operands only
+    check_raises(
+        AssertionError, lambda: matmul2d(a, Tensor([1, 2, 3]))
+    )  # 2-D operands only
 
     for s1, s2 in [
         ((2, 3), (3, 4)),
@@ -332,18 +351,43 @@ def t11():
         ((4, 1), (1, 6)),
     ]:
         m1, m2 = rnd(s1), rnd(s2)
-        assert torch.allclose(tt(m1 @ m2), tt(m1) @ tt(m2)), (s1, s2)
+        assert torch.allclose(tt(matmul2d(m1, m2)), tt(m1) @ tt(m2)), (s1, s2)
 
     m1, m2 = rnd((3, 4)), rnd((5, 4))
-    assert torch.allclose(tt(m1 @ m2.transpose(0, 1)), tt(m1) @ tt(m2).T)
+    assert torch.allclose(tt(matmul2d(m1, m2.transpose(0, 1))), tt(m1) @ tt(m2).T)
 
     w = rnd((30, 20))  # (out, in), torch's layout
     bias = rnd((30,))
     x = rnd((128, 20))
 
-    y = x @ w.transpose(0, 1) + bias  # broadcasting adds bias across all 128 rows
+    y = (
+        matmul2d(x, w.transpose(0, 1)) + bias
+    )  # broadcasting adds bias across all 128 rows
     assert y.shape == (128, 30)
     assert torch.allclose(tt(y), torch.nn.functional.linear(tt(x), tt(w), tt(bias)))
+
+
+def t12():
+    Tensor.__matmul__.test()
+    random.seed(0)
+    for s1, s2 in [
+        ((2, 3), (3, 4)),
+        ((2, 3, 5, 8), (2, 3, 8, 4)),  # matching batch
+        ((2, 3, 5, 8), (8, 4)),  # one matrix reused
+        ((5, 8), (3, 8, 4)),  # batch only on the right
+        ((1, 3, 5, 8), (2, 1, 8, 4)),  # batch dims broadcast against each other
+        ((4, 2, 3), (4, 3, 6)),
+    ]:
+        a, b = rnd(s1), rnd(s2)
+        mine, ref = a @ b, tt(a) @ tt(b)
+        assert mine.shape == tuple(ref.shape), (s1, s2)
+        assert torch.allclose(tt(mine), ref), (s1, s2)
+
+    # the shape attention actually uses: (B, nh, T, hs) @ (B, nh, hs, T)
+    q, k = rnd((2, 4, 6, 8)), rnd((2, 4, 6, 8))
+    scores = q @ k.transpose(2, 3)
+    assert scores.shape == (2, 4, 6, 6)
+    assert torch.allclose(tt(scores), tt(q) @ tt(k).transpose(2, 3))
 
 
 def tests():
@@ -359,6 +403,7 @@ def tests():
     t9()
     t10()
     t11()
+    t12()
     print("✅ ok")
 
 

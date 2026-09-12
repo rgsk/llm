@@ -105,6 +105,29 @@ def _(fn):
     assert "cannot broadcast" in str(e)
 
 
+def iter_indices(shape: Shape) -> Iterator[Index]:
+    if len(shape) == 0:
+        yield ()
+        return
+    idx = [0] * len(shape)
+    for _ in range(prod(shape)):
+        yield tuple(idx)
+        for d in reversed(range(len(shape))):
+            idx[d] += 1
+            if idx[d] < shape[d]:
+                break
+            idx[d] = 0
+
+
+@selftest(iter_indices)
+def _(fn):
+    assert list(fn((2, 3))) == [(0, 0), (0, 1), (0, 2), (1, 0), (1, 1), (1, 2)]
+    assert list(fn((3,))) == [(0,), (1,), (2,)]
+    assert list(fn(())) == [()]  # 0-d: one empty index
+    assert list(fn((2, 2, 2)))[:3] == [(0, 0, 0), (0, 0, 1), (0, 1, 0)]  # rolls right
+    assert len(list(fn((2, 3, 4)))) == 24
+
+
 class Tensor:
     def __init__(
         self,
@@ -268,31 +291,15 @@ class Tensor:
         assert fn(t, 2, 3).tolist() == [[1, 4, 2], [5, 3, 6]]
 
     def indices(self) -> Iterator[Index]:
-        """every logical index tuple, row-major order"""
-        if len(self.shape) == 0:
-            yield ()
-            return
-        idx = [0] * len(self.shape)
-        for _ in range(self.numel):
-            yield tuple(idx)
-            for d in reversed(range(len(self.shape))):  # odometer: roll from the right
-                idx[d] += 1
-                if idx[d] < self.shape[d]:
-                    break
-                idx[d] = 0
+        return iter_indices(self.shape)
 
     @selftest(indices)
     def _(fn):
         a = Tensor([1, 2, 3, 4, 5, 6], (2, 3))
-        assert list(fn(a)) == [(0, 0), (0, 1), (0, 2), (1, 0), (1, 1), (1, 2)]
-        # logical order follows the view, not storage
-        assert list(fn(a.transpose(0, 1))) == [
-            (0, 0), (0, 1),
-            (1, 0), (1, 1),
-            (2, 0), (2, 1),
-        ]  # fmt: skip
-        assert list(fn(Tensor([1, 2, 3]))) == [(0,), (1,), (2,)]
-        assert list(fn(Tensor(5))) == [()]  # 0-d: one empty index
+        assert list(fn(a)) == list(iter_indices((2, 3)))
+        # a view walks its own logical shape, not the storage it borrows
+        assert list(fn(a.transpose(0, 1))) == list(iter_indices((3, 2)))
+        assert list(fn(Tensor(5))) == [()]  # 0-d
 
     def expand(self, shape: Shape) -> Tensor:
         n = len(shape)
@@ -389,22 +396,27 @@ class Tensor:
     __rmul__ = __mul__
 
     def __matmul__(self, other: Tensor) -> Tensor:
-        assert len(self.shape) == 2 and len(other.shape) == 2
-        n, k = self.shape
-        k2, m = other.shape
+        assert len(self.shape) >= 2 and len(other.shape) >= 2
+        n, k = self.shape[-2:]
+        k2, m = other.shape[-2:]
         assert k == k2, f"cannot matmul {self.shape} @ {other.shape}"
 
-        out = [0.0] * (n * m)
-        for i in range(n):
-            for j in range(m):
-                s = 0.0
-                for p in range(k):
-                    s += (
-                        self.data[self._offset((i, p))]
-                        * other.data[other._offset((p, j))]
-                    )
-                out[i * m + j] = s
-        return Tensor(out, (n, m))
+        batch = broadcast_shape(self.shape[:-2], other.shape[:-2])
+        a = self.expand(batch + (n, k))
+        b = other.expand(batch + (k, m))
+
+        out = []
+        for bi in iter_indices(batch):
+            for i in range(n):
+                for j in range(m):
+                    s = 0.0
+                    for p in range(k):
+                        s += (
+                            a.data[a._offset(bi + (i, p))]
+                            * b.data[b._offset(bi + (p, j))]
+                        )
+                    out.append(s)
+        return Tensor(out, batch + (n, m))
 
     @selftest(__matmul__)
     def _(fn):
@@ -426,7 +438,20 @@ class Tensor:
         e = check_raises(AssertionError, lambda: fn(a, a))  # inner dims disagree
         assert "cannot matmul" in str(e)
 
-        check_raises(AssertionError, lambda: fn(a, Tensor([1, 2, 3])))  # 2-D only
+        check_raises(AssertionError, lambda: fn(a, Tensor([1, 2, 3])))  # needs 2 dims
+
+        # batched: last two dims multiply, leading dims broadcast
+        ba = Tensor(list(range(12)), (2, 2, 3))
+        bb = Tensor(list(range(12)), (2, 3, 2))
+        assert fn(ba, bb).shape == (2, 2, 2)
+        assert fn(ba, bb).tolist() == [[[10, 13], [28, 40]], [[172, 193], [244, 274]]]
+
+        sel = Tensor([[1, 0], [0, 1], [0, 0]])  # (3,2) reused across the batch
+        assert fn(ba, sel).shape == (2, 2, 2)
+        assert fn(ba, sel).tolist() == [[[0, 1], [3, 4]], [[6, 7], [9, 10]]]
+
+        wide = Tensor(list(range(40)), (2, 4, 5))
+        assert fn(Tensor(list(range(12)), (1, 3, 4)), wide).shape == (2, 3, 5)
 
     def __repr__(self) -> str:
         return (
