@@ -1,5 +1,13 @@
 import first
-from first import Tensor, contiguous_strides, flatten, infer_shape, prod
+import torch
+from first import (
+    Tensor,
+    broadcast_shape,
+    contiguous_strides,
+    flatten,
+    infer_shape,
+    prod,
+)
 from test_utils import check_raises, run_tests
 
 
@@ -188,6 +196,60 @@ def t7():
     assert tr2.tolist() == t.tolist()
 
 
+def t8():
+    broadcast_shape.test()
+
+    for s1, s2, res in [
+        ((128, 30), (30,), (128, 30)),
+        ((2, 3, 4), (3, 1), (2, 3, 4)),
+        ((5,), (), (5,)),
+        ((2, 1, 4), (3, 4), (2, 3, 4)),
+        ((1,), (7, 8), (7, 8)),
+        ((2, 3), (2, 3), (2, 3)),
+    ]:
+        assert (
+            broadcast_shape(s1, s2) == res == tuple(torch.broadcast_shapes(s1, s2))
+        ), (
+            s1,
+            s2,
+        )
+
+    # mismatched dim, neither of them 1
+    e = check_raises(ValueError, lambda: broadcast_shape((2, 3), (4, 3)))
+    assert "cannot broadcast" in str(e)
+
+
+def t9():
+    Tensor.indices.test()
+    Tensor.expand.test()
+
+    a = Tensor([1, 2, 3, 4, 5, 6], (2, 3))
+    assert list(a.indices()) == [(0, 0), (0, 1), (0, 2), (1, 0), (1, 1), (1, 2)]
+    t = a.transpose(0, 1)
+    assert list(t.indices()) == [(0, 0), (0, 1), (1, 0), (1, 1), (2, 0), (2, 1)]
+    assert list(Tensor([1, 2, 3]).indices()) == [(0,), (1,), (2,)]
+    assert list(Tensor(5).indices()) == [()]  # 0-d tensor: a single empty index
+
+    c = Tensor([[1], [2]])  # (2,1)
+    e = c.expand((2, 3))
+    assert (e.shape, e.strides) == ((2, 3), (1, 0))
+    assert e.tolist() == [[1, 1, 1], [2, 2, 2]]
+    assert e.data is c.data  # still no copy
+
+    r = Tensor([10, 20, 30])  # (3,) -> padded to (1,3)
+    assert r.expand((2, 3)).strides == (0, 1)
+    assert r.expand((2, 3)).tolist() == [[10, 20, 30], [10, 20, 30]]
+
+    b = Tensor([[[1, 2], [3, 4]]])  # (1,2,2)
+    assert (
+        b.expand((3, 2, 2)).tolist()
+        == torch.tensor(b.tolist()).expand(3, 2, 2).tolist()
+    )
+
+    e = check_raises(ValueError, lambda: Tensor([[1, 2], [3, 4]]).expand((2, 3)))
+    assert "cannot expand" in str(e)
+
+
 def tests():
     run_tests(first)
     t1()
@@ -197,6 +259,8 @@ def tests():
     t5()
     t6()
     t7()
+    t8()
+    t9()
     print("✅ ok")
 
 

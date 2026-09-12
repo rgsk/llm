@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Iterable
+from collections.abc import Iterable, Iterator
 from typing import Any, overload
 
 from test_utils import check_raises, selftest
@@ -78,6 +78,31 @@ def prod(shape: Iterable[int]) -> int:
 def _(fn):
     assert fn((2, 3)) == 6
     assert fn((2, 3, 4)) == 24
+
+
+def broadcast_shape(s1: Shape, s2: Shape) -> Shape:
+    n = max(len(s1), len(s2))
+    s1 = (1,) * (n - len(s1)) + tuple(s1)  # pad on the LEFT
+    s2 = (1,) * (n - len(s2)) + tuple(s2)
+    out = []
+    for a, b in zip(s1, s2):
+        if a == b or a == 1 or b == 1:
+            out.append(max(a, b))
+        else:
+            raise ValueError(f"cannot broadcast {s1} with {s2}")
+    return tuple(out)
+
+
+@selftest(broadcast_shape)
+def _(fn):
+    assert fn((128, 30), (30,)) == (128, 30)  # right-aligned, missing dims are 1
+    assert fn((30,), (128, 30)) == (128, 30)  # either side can be the shorter one
+    assert fn((2, 1, 4), (3, 4)) == (2, 3, 4)
+    assert fn((5,), ()) == (5,)
+    assert fn((2, 3), (2, 3)) == (2, 3)
+
+    e = check_raises(ValueError, lambda: fn((2, 3), (4, 3)))
+    assert "cannot broadcast" in str(e)
 
 
 class Tensor:
@@ -238,6 +263,67 @@ class Tensor:
         assert tr.data is not t.data  # non-contiguous: copied in logical order
         assert tr.data == [1, 4, 2, 5, 3, 6]
         assert fn(t, 2, 3).tolist() == [[1, 4, 2], [5, 3, 6]]
+
+    def indices(self) -> Iterator[Index]:
+        """every logical index tuple, row-major order"""
+        if len(self.shape) == 0:
+            yield ()
+            return
+        idx = [0] * len(self.shape)
+        for _ in range(self.numel):
+            yield tuple(idx)
+            for d in reversed(range(len(self.shape))):  # odometer: roll from the right
+                idx[d] += 1
+                if idx[d] < self.shape[d]:
+                    break
+                idx[d] = 0
+
+    @selftest(indices)
+    def _(fn):
+        a = Tensor([1, 2, 3, 4, 5, 6], (2, 3))
+        assert list(fn(a)) == [(0, 0), (0, 1), (0, 2), (1, 0), (1, 1), (1, 2)]
+        assert list(fn(a.transpose(0, 1))) == [
+            (0, 0),
+            (0, 1),
+            (1, 0),
+            (1, 1),
+            (2, 0),
+            (2, 1),
+        ]  # logical order follows the view, not storage
+        assert list(fn(Tensor([1, 2, 3]))) == [(0,), (1,), (2,)]
+        assert list(fn(Tensor(5))) == [()]  # 0-d: one empty index
+
+    def expand(self, shape: Shape) -> Tensor:
+        n = len(shape)
+        pad = n - len(self.shape)
+        assert pad >= 0
+        old_shape = (1,) * pad + tuple(self.shape)
+        old_strides = (0,) * pad + tuple(self.strides)
+
+        strides = []
+        for old, new, st in zip(old_shape, shape, old_strides):
+            if old == new:
+                strides.append(st)
+            elif old == 1:
+                strides.append(0)  # <- stay put
+            else:
+                raise ValueError(f"cannot expand {self.shape} -> {shape}")
+        return Tensor(self.data, tuple(shape), tuple(strides))
+
+    @selftest(expand)
+    def _(fn):
+        c = Tensor([[1], [2]])  # (2, 1)
+        e = fn(c, (2, 3))
+        assert (e.shape, e.strides) == ((2, 3), (1, 0))  # stride 0 = stay put
+        assert e.tolist() == [[1, 1, 1], [2, 2, 2]]
+        assert e.data is c.data  # a view, no copy
+
+        r = Tensor([10, 20, 30])  # (3,) padded to (1, 3)
+        assert fn(r, (2, 3)).strides == (0, 1)
+        assert fn(r, (2, 3)).tolist() == [[10, 20, 30], [10, 20, 30]]
+
+        err = check_raises(ValueError, lambda: fn(Tensor([[1, 2], [3, 4]]), (2, 3)))
+        assert "cannot expand" in str(err)
 
     def __repr__(self) -> str:
         return (
