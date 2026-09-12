@@ -23,5 +23,7 @@ dev = [
     # a cell -- outputs land but the spinner never resolves, needing a reload
     "ipykernel>=6.29,<7",
     "ipywidgets>=8.1.9",
+    "mypy>=2.3.1",
+    "nbqa>=1.9.1",
     "ruff>=0.16.2",
 ]
