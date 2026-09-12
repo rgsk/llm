@@ -10,7 +10,10 @@ from first import (
     flatten,
     infer_shape,
     iter_indices,
+    label_locals,
     prod,
+    topo,
+    trace,
 )
 from test_utils import check_raises, run_tests
 
@@ -390,6 +393,59 @@ def t12():
     assert torch.allclose(tt(scores), tt(q) @ tt(k).transpose(2, 3))
 
 
+def t13():
+    topo.test()
+    label_locals.test()
+    trace.test()
+
+    x = Tensor([[1.0, 2.0], [3.0, 4.0]])
+    w = Tensor([[10.0, 20.0], [30.0, 40.0]])
+    b = Tensor([100.0, 200.0])
+
+    y = x @ w + b
+    z = y * y
+    label_locals(locals())  # names the intermediates too, not just the inputs
+
+    assert topo(z)[-1] is z  # root comes last
+    assert len(topo(z)) == 6  # y feeds mul twice, but appears once
+    assert [t.label or t._op for t in topo(z)] == [
+        "x",
+        "w",
+        "matmul",
+        "b",
+        "y",
+        "z",
+    ]
+
+    assert trace(z) == [
+        "0 x (2, 2)",
+        "1 w (2, 2)",
+        "2 matmul (2, 2) <- x, w",
+        "3 b (2,)",
+        "4 y = add (2, 2) <- matmul, b",
+        "5 z = mul (2, 2) <- y, y",
+    ]
+
+    # views are graph nodes too, so the chain back to w is unbroken
+    wt = w.transpose(0, 1)
+    out = x @ wt
+    assert any(t is w for t in topo(out))
+    assert trace(out) == [
+        "0 x (2, 2)",
+        "1 w (2, 2)",
+        "2 transpose (2, 2) <- w",
+        "3 matmul (2, 2) <- x, transpose",
+    ]
+
+    # reshaping a non-contiguous view goes through a contiguous copy
+    assert [t._op or "leaf" for t in topo(wt.reshape(4))] == [
+        "leaf",
+        "transpose",
+        "contiguous",
+        "reshape",
+    ]
+
+
 def tests():
     run_tests(first)
     t1()
@@ -404,6 +460,7 @@ def tests():
     t10()
     t11()
     t12()
+    t13()
     print("✅ ok")
 
 

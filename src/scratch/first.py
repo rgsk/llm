@@ -128,12 +128,44 @@ def _(fn):
     assert len(list(fn((2, 3, 4)))) == 24
 
 
+def topo(root: Tensor) -> list[Tensor]:
+    order: list[Tensor] = []
+    seen: set[int] = set()
+
+    def visit(t: Tensor) -> None:
+        if id(t) in seen:
+            return
+        seen.add(id(t))
+        for p in t._parents:
+            visit(p)
+        order.append(t)  # appended only after all parents are in
+
+    visit(root)
+    return order  # inputs first, root last
+
+
+@selftest(topo)
+def _(fn):
+    x, w = Tensor([[1.0, 2.0]]), Tensor([[3.0], [4.0]])
+    y = x @ w
+    z = y * y
+
+    order = fn(z)
+    assert order[-1] is z  # root last
+    assert order.index(x) < order.index(y)  # parents before children
+    assert len(order) == 4  # x, w, matmul, mul: y feeds mul twice, listed once
+    assert fn(x) == [x]  # a leaf is its own whole graph
+
+
 class Tensor:
     def __init__(
         self,
         data: list,
         shape: Shape | None = None,
         strides: Strides | None = None,
+        _parents: tuple[Tensor, ...] = (),
+        _op: str = "",
+        label: str = "",
     ) -> None:
         if shape is None:
             shape = infer_shape(data)
@@ -141,6 +173,10 @@ class Tensor:
         self.data = data
         self.shape = shape
         self.strides = contiguous_strides(shape) if strides is None else strides
+        self.grad = None
+        self._parents = tuple(_parents)
+        self._op = _op
+        self.label = label
 
     @selftest(__init__)
     def _(fn):
@@ -155,6 +191,7 @@ class Tensor:
         c = Tensor.__new__(Tensor)
         fn(c, [1, 2, 3, 4, 5, 6], (2, 3), (1, 2))  # given strides kept as-is
         assert c.strides == (1, 2)
+        assert (c.label, c._op, c._parents, c.grad) == ("", "", (), None)
 
     def _offset(self, idx: Index) -> int:
         assert len(idx) == len(self.shape), (
@@ -182,7 +219,9 @@ class Tensor:
         shape, strides = list(self.shape), list(self.strides)
         shape[d0], shape[d1] = shape[d1], shape[d0]
         strides[d0], strides[d1] = strides[d1], strides[d0]
-        return Tensor(self.data, tuple(shape), tuple(strides))
+        return Tensor(
+            self.data, tuple(shape), tuple(strides), _parents=(self,), _op="transpose"
+        )
 
     @selftest(transpose)
     def _(fn):
@@ -192,9 +231,10 @@ class Tensor:
         assert t.strides == (1, 3)
         assert t.data is a.data  # a view, not a copy
         assert t.tolist() == [[1, 4], [2, 5], [3, 6]]
+        assert (t._op, t._parents) == ("transpose", (a,))  # stays in the graph
 
     def tolist(self) -> Nested:
-        def build(idx):
+        def build(idx: Index) -> Nested:
             if len(idx) == len(self.shape):
                 return self.data[self._offset(idx)]
             d = len(idx)
@@ -237,7 +277,7 @@ class Tensor:
     def contiguous(self) -> Tensor:
         if self.is_contiguous():
             return self
-        return Tensor(self.flat(), self.shape)
+        return Tensor(self.flat(), self.shape, _parents=(self,), _op="contiguous")
 
     @selftest(contiguous)
     def _(fn):
@@ -251,7 +291,8 @@ class Tensor:
             tc.tolist() == t.tolist() == [[1, 4], [2, 5], [3, 6]]
         )  # same values, different storage
         assert tc.data is not t.data
-        assert fn(tc) is tc  # already contiguous: no copy
+        assert (tc._op, tc._parents) == ("contiguous", (t,))
+        assert fn(tc) is tc  # already contiguous: same node, nothing added
 
     @overload
     def reshape(self, *shape: int) -> Tensor: ...
@@ -266,7 +307,7 @@ class Tensor:
             shape = tuple(self.numel // known if s == -1 else s for s in shape)
         assert prod(shape) == self.numel, f"cannot reshape {self.shape} -> {shape}"
         src = self.contiguous()
-        return Tensor(src.data, shape)
+        return Tensor(src.data, shape, _parents=(src,), _op="reshape")
 
     @selftest(reshape)
     def _(fn):
@@ -275,6 +316,7 @@ class Tensor:
         assert r.tolist() == [[1, 2], [3, 4], [5, 6]]
         assert (r.data, r.shape, r.strides) == ([1, 2, 3, 4, 5, 6], (3, 2), (2, 1))
         assert r.data is a.data  # already contiguous: no copy
+        assert (r._op, r._parents) == ("reshape", (a,))
 
         assert fn(a, (3, 2)).shape == (3, 2)  # shape given as a tuple
         assert fn(a, -1, 2).shape == (3, 2)  # inferred dim
@@ -288,6 +330,7 @@ class Tensor:
         tr = fn(t, 6)
         assert tr.data is not t.data  # non-contiguous: copied in logical order
         assert tr.data == [1, 4, 2, 5, 3, 6]
+        assert tr._parents[0]._op == "contiguous"  # the copy is its own node
         assert fn(t, 2, 3).tolist() == [[1, 4, 2], [5, 3, 6]]
 
     def indices(self) -> Iterator[Index]:
@@ -316,7 +359,9 @@ class Tensor:
                 strides.append(0)  # <- stay put
             else:
                 raise ValueError(f"cannot expand {self.shape} -> {shape}")
-        return Tensor(self.data, tuple(shape), tuple(strides))
+        return Tensor(
+            self.data, tuple(shape), tuple(strides), _parents=(self,), _op="expand"
+        )
 
     @selftest(expand)
     def _(fn):
@@ -325,6 +370,7 @@ class Tensor:
         assert (e.shape, e.strides) == ((2, 3), (1, 0))  # stride 0 = stay put
         assert e.tolist() == [[1, 1, 1], [2, 2, 2]]
         assert e.data is c.data  # a view, no copy
+        assert (e._op, e._parents) == ("expand", (c,))  # stays in the graph
 
         r = Tensor([10, 20, 30])  # (3,) padded to (1, 3)
         assert fn(r, (2, 3)).strides == (0, 1)
@@ -334,7 +380,7 @@ class Tensor:
         assert "cannot expand" in str(err)
 
     def _binop(
-        self, other: Tensor | Scalar, f: Callable[[Scalar, Scalar], Scalar]
+        self, other: Tensor | Scalar, f: Callable[[Scalar, Scalar], Scalar], op: str
     ) -> Tensor:
         if not isinstance(other, Tensor):
             # scalar -> shape ()
@@ -343,7 +389,7 @@ class Tensor:
         shape = broadcast_shape(self.shape, other.shape)
         a, b = self.expand(shape), other.expand(shape)
         data = [f(a.data[a._offset(i)], b.data[b._offset(i)]) for i in a.indices()]
-        return Tensor(data, shape)
+        return Tensor(data, shape, _parents=(self, other), _op=op)
 
     @selftest(_binop)
     def _(fn):
@@ -352,19 +398,25 @@ class Tensor:
 
         a = Tensor([[1, 2, 3], [4, 5, 6]])
 
-        out = fn(a, Tensor([10, 20, 30]), add)  # (2,3) with (3,): right-aligned
+        r = Tensor([10, 20, 30])
+        out = fn(a, r, add, "add")  # (2,3) with (3,): right-aligned
         assert (out.shape, out.tolist()) == ((2, 3), [[11, 22, 33], [14, 25, 36]])
-        assert fn(a, 10, add).tolist() == [[11, 12, 13], [14, 15, 16]]  # scalar operand
+        assert (out._op, out._parents) == ("add", (a, r))  # both operands, unexpanded
 
-        out = fn(a, a, lambda x, y: x * y)
+        scalar_out = fn(a, 10, add, "add")  # scalar operand
+        assert scalar_out.tolist() == [[11, 12, 13], [14, 15, 16]]
+        assert scalar_out._parents[1].shape == ()  # the scalar became a 0-d parent
+
+        out = fn(a, a, lambda x, y: x * y, "mul")
         assert out.is_contiguous()  # result is always fresh and contiguous
         assert out.data is not a.data
+        assert (out._op, out._parents) == ("mul", (a, a))  # same node twice
 
-        e = check_raises(ValueError, lambda: fn(a, Tensor([1, 2]), add))
+        e = check_raises(ValueError, lambda: fn(a, Tensor([1, 2]), add, "add"))
         assert "cannot broadcast" in str(e)
 
     def __add__(self, other: Tensor | Scalar) -> Tensor:
-        return self._binop(other, lambda x, y: x + y)
+        return self._binop(other, lambda x, y: x + y, "add")
 
     @selftest(__add__)
     def _(fn):
@@ -372,9 +424,10 @@ class Tensor:
         assert fn(a, a).tolist() == [[2, 4], [6, 8]]
         assert fn(a, 10).tolist() == [[11, 12], [13, 14]]
         assert (2 + a).tolist() == fn(a, 2).tolist()  # __radd__ is this same function
+        assert (fn(a, a)._op, fn(a, a)._parents) == ("add", (a, a))
 
     def __mul__(self, other: Tensor | Scalar) -> Tensor:
-        return self._binop(other, lambda x, y: x * y)
+        return self._binop(other, lambda x, y: x * y, "mul")
 
     @selftest(__mul__)
     def _(fn):
@@ -382,15 +435,17 @@ class Tensor:
         assert fn(a, a).tolist() == [[1, 4], [9, 16]]
         assert fn(a, Tensor([10, 100])).tolist() == [[10, 200], [30, 400]]  # row bcast
         assert (3 * a).tolist() == fn(a, 3).tolist()  # __rmul__
+        assert fn(a, a)._op == "mul"
 
     def __sub__(self, other: Tensor | Scalar) -> Tensor:
-        return self._binop(other, lambda x, y: x - y)
+        return self._binop(other, lambda x, y: x - y, "sub")
 
     @selftest(__sub__)
     def _(fn):
         a = Tensor([[5, 6], [7, 8]])
         assert fn(a, Tensor([[1, 2], [3, 4]])).tolist() == [[4, 4], [4, 4]]
         assert fn(a, 1).tolist() == [[4, 5], [6, 7]]
+        assert fn(a, 1)._op == "sub"
 
     __radd__ = __add__  # 2 + t  ->  t + 2
     __rmul__ = __mul__
@@ -416,7 +471,7 @@ class Tensor:
                             * b.data[b._offset(bi + (p, j))]
                         )
                     out.append(s)
-        return Tensor(out, batch + (n, m))
+        return Tensor(out, batch + (n, m), _parents=(self, other), _op="matmul")
 
     @selftest(__matmul__)
     def _(fn):
@@ -425,6 +480,7 @@ class Tensor:
         out = fn(a, b)
         assert (out.shape, out.tolist()) == ((2, 2), [[58, 64], [139, 154]])
         assert out.is_contiguous()  # always a fresh row-major result
+        assert (out._op, out._parents) == ("matmul", (a, b))
 
         i = Tensor([[1, 0], [0, 1]])
         assert fn(i, i).tolist() == [[1, 0], [0, 1]]
@@ -465,6 +521,51 @@ class Tensor:
             "Tensor(shape=(2, 3), strides=(3, 1), data=[[1, 2, 3], [4, 5, 6]])"
         )
         assert str(a) == repr(a) == fn(a)  # str falls back to __repr__
+
+
+def label_locals(scope: dict[str, Any]) -> None:
+    """name every still-unnamed Tensor in `scope` after the variable holding it"""
+    for name, v in scope.items():
+        if isinstance(v, Tensor) and not v.label:
+            v.label = name
+
+
+@selftest(label_locals)
+def _(fn):
+    a, b = Tensor([1.0]), Tensor([2.0])
+    c = a + b
+    fn({"a": a, "b": b, "c": c})
+    assert (a.label, b.label, c.label) == ("a", "b", "c")  # intermediates too
+
+    fn({"other": a})
+    assert a.label == "a"  # first name wins; an existing label is never overwritten
+
+
+def trace(root: Tensor) -> list[str]:
+    """one line per node of root's graph, inputs first"""
+    lines = []
+    for i, t in enumerate(topo(root)):
+        name = t.label or t._op or "leaf"
+        if t.label and t._op:
+            name = f"{t.label} = {t._op}"  # a label alone would hide the op
+        src = ", ".join(p.label or p._op or "leaf" for p in t._parents)
+        lines.append(f"{i} {name} {t.shape}" + (f" <- {src}" if src else ""))
+    return lines
+
+
+@selftest(trace)
+def _(fn):
+    x, w = Tensor([[1.0, 2.0]], label="x"), Tensor([[3.0], [4.0]], label="w")
+    y = x @ w
+    assert fn(y) == [
+        "0 x (1, 2)",
+        "1 w (2, 1)",
+        "2 matmul (1, 1) <- x, w",
+    ]
+    assert fn(x) == ["0 x (1, 2)"]  # a leaf traces to itself
+
+    y.label = "y"
+    assert fn(y)[-1] == "2 y = matmul (1, 1) <- x, w"  # label AND op, never one alone
 
 
 if __name__ == "__main__":
