@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Iterable, Iterator
+from collections.abc import Callable, Iterable, Iterator
 from typing import Any, overload
 
 from test_utils import check_raises, selftest
@@ -107,7 +107,10 @@ def _(fn):
 
 class Tensor:
     def __init__(
-        self, data: list, shape: Shape | None = None, strides: Strides | None = None
+        self,
+        data: list,
+        shape: Shape | None = None,
+        strides: Strides | None = None,
     ) -> None:
         if shape is None:
             shape = infer_shape(data)
@@ -282,14 +285,12 @@ class Tensor:
     def _(fn):
         a = Tensor([1, 2, 3, 4, 5, 6], (2, 3))
         assert list(fn(a)) == [(0, 0), (0, 1), (0, 2), (1, 0), (1, 1), (1, 2)]
+        # logical order follows the view, not storage
         assert list(fn(a.transpose(0, 1))) == [
-            (0, 0),
-            (0, 1),
-            (1, 0),
-            (1, 1),
-            (2, 0),
-            (2, 1),
-        ]  # logical order follows the view, not storage
+            (0, 0), (0, 1),
+            (1, 0), (1, 1),
+            (2, 0), (2, 1),
+        ]  # fmt: skip
         assert list(fn(Tensor([1, 2, 3]))) == [(0,), (1,), (2,)]
         assert list(fn(Tensor(5))) == [()]  # 0-d: one empty index
 
@@ -324,6 +325,68 @@ class Tensor:
 
         err = check_raises(ValueError, lambda: fn(Tensor([[1, 2], [3, 4]]), (2, 3)))
         assert "cannot expand" in str(err)
+
+    def _binop(
+        self, other: Tensor | Scalar, f: Callable[[Scalar, Scalar], Scalar]
+    ) -> Tensor:
+        if not isinstance(other, Tensor):
+            # scalar -> shape ()
+            other = Tensor(other)  # type: ignore[arg-type]
+
+        shape = broadcast_shape(self.shape, other.shape)
+        a, b = self.expand(shape), other.expand(shape)
+        data = [f(a.data[a._offset(i)], b.data[b._offset(i)]) for i in a.indices()]
+        return Tensor(data, shape)
+
+    @selftest(_binop)
+    def _(fn):
+        def add(x, y):
+            return x + y
+
+        a = Tensor([[1, 2, 3], [4, 5, 6]])
+
+        out = fn(a, Tensor([10, 20, 30]), add)  # (2,3) with (3,): right-aligned
+        assert (out.shape, out.tolist()) == ((2, 3), [[11, 22, 33], [14, 25, 36]])
+        assert fn(a, 10, add).tolist() == [[11, 12, 13], [14, 15, 16]]  # scalar operand
+
+        out = fn(a, a, lambda x, y: x * y)
+        assert out.is_contiguous()  # result is always fresh and contiguous
+        assert out.data is not a.data
+
+        e = check_raises(ValueError, lambda: fn(a, Tensor([1, 2]), add))
+        assert "cannot broadcast" in str(e)
+
+    def __add__(self, other: Tensor | Scalar) -> Tensor:
+        return self._binop(other, lambda x, y: x + y)
+
+    @selftest(__add__)
+    def _(fn):
+        a = Tensor([[1, 2], [3, 4]])
+        assert fn(a, a).tolist() == [[2, 4], [6, 8]]
+        assert fn(a, 10).tolist() == [[11, 12], [13, 14]]
+        assert (2 + a).tolist() == fn(a, 2).tolist()  # __radd__ is this same function
+
+    def __mul__(self, other: Tensor | Scalar) -> Tensor:
+        return self._binop(other, lambda x, y: x * y)
+
+    @selftest(__mul__)
+    def _(fn):
+        a = Tensor([[1, 2], [3, 4]])
+        assert fn(a, a).tolist() == [[1, 4], [9, 16]]
+        assert fn(a, Tensor([10, 100])).tolist() == [[10, 200], [30, 400]]  # row bcast
+        assert (3 * a).tolist() == fn(a, 3).tolist()  # __rmul__
+
+    def __sub__(self, other: Tensor | Scalar) -> Tensor:
+        return self._binop(other, lambda x, y: x - y)
+
+    @selftest(__sub__)
+    def _(fn):
+        a = Tensor([[5, 6], [7, 8]])
+        assert fn(a, Tensor([[1, 2], [3, 4]])).tolist() == [[4, 4], [4, 4]]
+        assert fn(a, 1).tolist() == [[4, 5], [6, 7]]
+
+    __radd__ = __add__  # 2 + t  ->  t + 2
+    __rmul__ = __mul__
 
     def __repr__(self) -> str:
         return (

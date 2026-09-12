@@ -250,6 +250,46 @@ def t9():
     assert "cannot expand" in str(e)
 
 
+def t10():
+    Tensor._binop.test()
+    Tensor.__add__.test()
+    Tensor.__mul__.test()
+    Tensor.__sub__.test()
+
+    a = Tensor([[1, 2, 3], [4, 5, 6]])
+    b = Tensor([10, 20, 30])  # (3,) -> broadcasts across rows
+    c = Tensor([[1], [2]])  # (2,1) -> broadcasts across columns
+    ta, tb, tc = (torch.tensor(t.tolist()) for t in (a, b, c))
+
+    assert (a + b).tolist() == (ta + tb).tolist()
+    assert (a * b).tolist() == (ta * tb).tolist()
+    assert (a - b).tolist() == (ta - tb).tolist()
+    assert (a + c).tolist() == (ta + tc).tolist()
+    assert (a + a).tolist() == (ta + ta).tolist()
+
+    # scalars, and the reflected forms that map to __radd__ / __rmul__
+    assert (a + 10).tolist() == (ta + 10).tolist()
+    assert (10 + a).tolist() == (10 + ta).tolist()
+    assert (a * 2).tolist() == (a + a).tolist() == (ta * 2).tolist()
+    assert (2 * a).tolist() == (2 * ta).tolist()
+    assert (a - 1).tolist() == (ta - 1).tolist()
+
+    # the result is a fresh contiguous tensor, never a view of either operand
+    out = a + b
+    assert out.shape == (2, 3)
+    assert out.is_contiguous()
+    assert out.data is not a.data and out.data is not b.data
+
+    # broadcasting still applies to a transposed (non-contiguous) operand
+    t = a.transpose(0, 1)  # (3,2)
+    assert (t + Tensor([100, 200])).tolist() == (
+        ta.T + torch.tensor([100, 200])
+    ).tolist()
+
+    e = check_raises(ValueError, lambda: a + Tensor([1, 2]))
+    assert "cannot broadcast" in str(e)
+
+
 def tests():
     run_tests(first)
     t1()
@@ -261,6 +301,7 @@ def tests():
     t7()
     t8()
     t9()
+    t10()
     print("✅ ok")
 
 
