@@ -18,11 +18,11 @@ def t1():
 def t2():
     contiguous_strides.test()
 
-    contiguous_strides((2, 3)) == (3, 1)
+    assert contiguous_strides((2, 3)) == (3, 1)
     a = Tensor([1, 2, 3, 4, 5, 6], (2, 3))
     assert a.strides == (3, 1)
 
-    contiguous_strides((2, 3, 4)) == (12, 4, 1)
+    assert contiguous_strides((2, 3, 4)) == (12, 4, 1)
     b = Tensor(list(range(24)), (2, 3, 4))
     assert b.strides == (12, 4, 1)
     assert b._offset((1, 2, 3)) == 23
@@ -84,9 +84,9 @@ def t5():
         [4, 5, 6],
     ]
 
-    infer_shape(a_list) == (2, 3)
+    assert infer_shape(a_list) == (2, 3)
 
-    flatten(a_list) == [1, 2, 3, 4, 5, 6]
+    assert flatten(a_list) == [1, 2, 3, 4, 5, 6]
 
     a = Tensor(a_list)
     assert a.shape == (2, 3)
@@ -147,6 +147,47 @@ def t6():
     assert tcc is tc
 
 
+def t7():
+    Tensor.reshape.test()
+
+    def dshst(t: Tensor):
+        return (t.data, t.shape, t.strides)
+
+    a = Tensor([[1, 2, 3], [4, 5, 6]])
+    assert dshst(a) == ([1, 2, 3, 4, 5, 6], (2, 3), (3, 1))
+    ar = a.reshape(3, 2)
+    assert ar.tolist() == [[1, 2], [3, 4], [5, 6]]
+    assert dshst(ar) == ([1, 2, 3, 4, 5, 6], (3, 2), (2, 1))
+    assert ar.data is a.data  # no copy, already contiguous
+
+    # passing shape as tuple
+    assert dshst(a.reshape((3, 2))) == dshst(ar)
+
+    # infer dim
+    assert dshst(a.reshape(-1, 2)) == dshst(ar)
+    assert dshst(a.reshape(3, -1)) == dshst(ar)
+    assert dshst(a.reshape(-1)) == dshst(a.reshape(6))
+
+    e = check_raises(
+        AssertionError,
+        lambda: a.reshape(1, 2),
+    )
+    assert "cannot reshape" in str(e)
+
+    t = a.transpose(0, 1)
+    assert t.data == [1, 2, 3, 4, 5, 6]
+    assert t.tolist() == [[1, 4], [2, 5], [3, 6]]
+    tr = t.reshape(6)
+    assert tr.data is not t.data  # copy created as non-contiguous
+    assert tr.data == [1, 4, 2, 5, 3, 6]
+
+    assert t.reshape(2, 3).tolist() == [[1, 4, 2], [5, 3, 6]]
+
+    tr2 = t.reshape(t.shape)
+    assert tr2.data is not t.data
+    assert tr2.tolist() == t.tolist()
+
+
 def tests():
     run_tests(first)
     t1()
@@ -155,6 +196,7 @@ def tests():
     t4()
     t5()
     t6()
+    t7()
     print("✅ ok")
 
 

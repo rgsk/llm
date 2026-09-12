@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from collections.abc import Iterable
+from typing import Any, overload
+
 from test_utils import check_raises, selftest
 
 type Scalar = int | float
@@ -64,7 +67,7 @@ def _(fn):
     ) == [1, 2, 3, 4, 5, 6]
 
 
-def prod(shape: Shape) -> int:
+def prod(shape: Iterable[int]) -> int:
     out = 1
     for v in shape:
         out *= v
@@ -198,6 +201,43 @@ class Tensor:
         )  # same values, different storage
         assert tc.data is not t.data
         assert fn(tc) is tc  # already contiguous: no copy
+
+    @overload
+    def reshape(self, *shape: int) -> Tensor: ...
+    @overload
+    def reshape(self, shape: Shape | list[int], /) -> Tensor: ...
+
+    def reshape(self, *shape: Any) -> Tensor:
+        if len(shape) == 1 and isinstance(shape[0], (tuple, list)):
+            shape = tuple(shape[0])
+        if -1 in shape:
+            known = prod([s for s in shape if s != -1])
+            shape = tuple(self.numel // known if s == -1 else s for s in shape)
+        assert prod(shape) == self.numel, f"cannot reshape {self.shape} -> {shape}"
+        src = self.contiguous()
+        return Tensor(src.data, shape)
+
+    @selftest(reshape)
+    def _(fn):
+        a = Tensor([[1, 2, 3], [4, 5, 6]])
+        r = fn(a, 3, 2)
+        assert r.tolist() == [[1, 2], [3, 4], [5, 6]]
+        assert (r.data, r.shape, r.strides) == ([1, 2, 3, 4, 5, 6], (3, 2), (2, 1))
+        assert r.data is a.data  # already contiguous: no copy
+
+        assert fn(a, (3, 2)).shape == (3, 2)  # shape given as a tuple
+        assert fn(a, -1, 2).shape == (3, 2)  # inferred dim
+        assert fn(a, 3, -1).shape == (3, 2)
+        assert fn(a, -1).shape == (6,)
+
+        e = check_raises(AssertionError, lambda: fn(a, 1, 2))
+        assert "cannot reshape" in str(e)
+
+        t = a.transpose(0, 1)
+        tr = fn(t, 6)
+        assert tr.data is not t.data  # non-contiguous: copied in logical order
+        assert tr.data == [1, 4, 2, 5, 3, 6]
+        assert fn(t, 2, 3).tolist() == [[1, 4, 2], [5, 3, 6]]
 
     def __repr__(self) -> str:
         return (
