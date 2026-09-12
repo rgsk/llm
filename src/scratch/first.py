@@ -586,7 +586,7 @@ class Tensor:
         a = self.expand(batch + (n, k))
         b = other.expand(batch + (k, m))
 
-        out = []
+        data = []
         for bi in iter_indices(batch):
             for i in range(n):
                 for j in range(m):
@@ -596,8 +596,21 @@ class Tensor:
                             a.data[a._offset(bi + (i, p))]
                             * b.data[b._offset(bi + (p, j))]
                         )
-                    out.append(s)
-        return Tensor(out, batch + (n, m), _parents=(self, other), _op="matmul")
+                    data.append(s)
+        out = Tensor(data, batch + (n, m), _parents=(self, other), _op="matmul")
+
+        def _backward() -> None:
+            assert out.grad is not None  # backward seeds it before calling us
+            nd = len(out.shape)
+            gc = Tensor(out.grad, out.shape)
+            ga = gc @ b.transpose(nd - 2, nd - 1)  # dC @ B.T -> batch + (n, k)
+            gb = a.transpose(nd - 2, nd - 1) @ gc  # A.T @ dC -> batch + (k, m)
+            # a/b are the expanded operands, so fold the batch dims back down
+            self._accum(unbroadcast(ga.flat(), ga.shape, self.shape))
+            other._accum(unbroadcast(gb.flat(), gb.shape, other.shape))
+
+        out._backward = _backward
+        return out
 
     @selftest(__matmul__)
     def _(fn):
@@ -634,6 +647,34 @@ class Tensor:
 
         wide = Tensor(list(range(40)), (2, 4, 5))
         assert fn(Tensor(list(range(12)), (1, 3, 4)), wide).shape == (2, 3, 5)
+
+        # backward: dA = dC @ B.T and dB = A.T @ dC, i.e. two more matmuls
+        p, q = Tensor([[1.0, 2.0]]), Tensor([[3.0], [4.0]])
+        out = fn(p, q)
+        out.grad = [10.0]  # a non-unit seed has to ride through both of them
+        out._backward()
+        assert p.grad == [30.0, 40.0]  # g @ q.T
+        assert q.grad == [10.0, 20.0]  # p.T @ g
+
+        x = Tensor([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]])
+        y = Tensor([[7.0, 8.0], [9.0, 10.0], [11.0, 12.0]])
+        fn(x, y).backward()  # seed of ones, so each grad is a plain sum
+        assert x.grad == [15.0, 19.0, 23.0] * 2  # row sums of y, once per row of x
+        assert y.grad == [5.0, 5.0, 7.0, 7.0, 9.0, 9.0]  # column sums of x
+
+        sq = Tensor([[1.0, 2.0], [3.0, 4.0]])
+        fn(sq, sq).backward()  # one node on both sides: the two grads accumulate
+        assert sq.grad == [7.0, 11.0, 9.0, 13.0]
+
+        bx = Tensor([float(v) for v in range(12)], (2, 2, 3))
+        bs = Tensor([[1.0, 0.0], [0.0, 1.0], [0.0, 0.0]])  # (3,2) shared by the batch
+        fn(bx, bs).backward()
+        assert bx.grad == [1.0, 1.0, 0.0] * 4  # row sums of bs, for every batch row
+        assert bs.grad == [18.0, 18.0, 22.0, 22.0, 26.0, 26.0]  # folded over the batch
+
+        tv = Tensor([[1.0, 2.0], [3.0, 4.0]]).transpose(0, 1)  # a strided operand
+        fn(tv, sq).backward()
+        assert tv.grad == [3.0, 7.0, 3.0, 7.0]  # lands on the view, in logical order
 
     def __repr__(self) -> str:
         return (

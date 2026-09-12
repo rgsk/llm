@@ -3,6 +3,7 @@ import random
 import first
 import torch
 from first import (
+    Grad,
     Shape,
     Tensor,
     broadcast_shape,
@@ -514,6 +515,50 @@ def t15():
     assert b.grad == [2, 2, 2]  # each value was used twice
 
 
+def close(g: Grad | None, t: torch.Tensor) -> bool:
+    assert g is not None and t.grad is not None
+    return torch.allclose(torch.tensor(g, dtype=torch.float64), t.grad.flatten())
+
+
+def t16():
+    Tensor.__matmul__.test()
+    random.seed(0)
+
+    for s1, s2 in [
+        ((2, 3), (3, 4)),
+        ((2, 3, 5, 8), (2, 3, 8, 4)),
+        ((2, 3, 5, 8), (8, 4)),
+        ((5, 8), (3, 8, 4)),
+        ((1, 3, 5, 8), (2, 1, 8, 4)),
+    ]:
+        a, b = rnd(s1), rnd(s2)
+        (a @ b).backward()
+        ta, tb = tg(a), tg(b)
+        to = ta @ tb
+        to.backward(torch.ones_like(to))
+        assert close(a.grad, ta), (s1, s2)
+        assert close(b.grad, tb), (s1, s2)
+
+    # a seed of ones hides scaling errors: put a mul below the matmul
+    x, w, s = rnd((4, 3)), rnd((3, 5)), rnd((4, 5))
+    ((x @ w) * s).backward()
+    tx, tw, ts = tg(x), tg(w), tg(s)
+    to = (tx @ tw) * ts
+    to.backward(torch.ones_like(to))
+    assert close(x.grad, tx) and close(w.grad, tw) and close(s.grad, ts)
+
+    # matmul accumulates onto the node it was handed, view or not; transpose has no
+    # backward of its own yet, so the grad stops at the view and never reaches k
+    q, k = rnd((2, 4, 6, 8)), rnd((2, 4, 6, 8))
+    kt = k.transpose(2, 3)
+    (q @ kt).backward()
+    tq = tg(q)
+    to = tq @ tg(k).transpose(2, 3)
+    to.backward(torch.ones_like(to))
+    assert close(q.grad, tq)
+    assert kt.grad is not None and k.grad is None  # flip when views get a backward
+
+
 def tests():
     run_tests(first)
     t1()
@@ -531,6 +576,7 @@ def tests():
     t13()
     t14()
     t15()
+    t16()
     print("✅ ok")
 
 
