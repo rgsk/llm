@@ -1,0 +1,20 @@
+{
+    "version": "2.0.0",
+    "options": {
+        "cwd": "${workspaceFolder}"
+    },
+    "presentation": {
+        "reveal": "always",
+        "panel": "dedicated",
+        "clear": true
+    },
+    "tasks": [
+        {
+            "label": "check: current file",
+            "detail": "ruff + mypy on the open file (.py or .ipynb)",
+            "type": "shell",
+            "command": "F=$(echo '${file}' | cut -d'#' -f1); echo \"checking $F\"; echo; echo '─── ruff ───'; uv run ruff check --output-format=concise \"$F\" && echo '✅ ruff ok'; echo; echo '─── mypy ───'; { case \"$F\" in *.ipynb) uv run nbqa mypy \"$F\";; *) uv run mypy \"$F\";; esac; } && echo '✅ mypy ok'; echo",
+            "problemMatcher": []
+        }
+    ]
+}
