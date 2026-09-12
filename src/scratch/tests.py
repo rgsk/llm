@@ -14,6 +14,7 @@ from first import (
     prod,
     topo,
     trace,
+    unbroadcast,
 )
 from test_utils import check_raises, run_tests
 
@@ -306,6 +307,10 @@ def tt(t: Tensor):
     return torch.tensor(t.tolist(), dtype=torch.float64)
 
 
+def tg(t: Tensor):
+    return torch.tensor(t.tolist(), dtype=torch.float64, requires_grad=True)
+
+
 def matmul2d(self: Tensor, other: Tensor) -> Tensor:
     assert len(self.shape) == 2 and len(other.shape) == 2
     n, k = self.shape
@@ -446,6 +451,69 @@ def t13():
     ]
 
 
+def t14():
+    Tensor._accum.test()
+    Tensor.backward.test()
+    Tensor._binop.test()
+
+    a = Tensor([[1.0, 2.0], [3.0, 4.0]])
+    b = Tensor([[10.0, 20.0], [30.0, 40.0]])
+    z = (a + b) * b
+    z.backward()
+
+    ta = torch.tensor(a.tolist(), dtype=torch.float64, requires_grad=True)
+    tb = torch.tensor(b.tolist(), dtype=torch.float64, requires_grad=True)
+    tz = (ta + tb) * tb
+    tz.backward(torch.ones_like(tz))  # same seed as ours: all 1.0
+
+    assert z.tolist() == tz.tolist()
+    assert a.grad == [10, 20, 30, 40] == ta.grad.flatten().tolist()
+    assert b.grad == [21, 42, 63, 84] == tb.grad.flatten().tolist()
+
+    # the reuse case: x feeds mul twice, so d(x*x)/dx = 2x
+    x = Tensor([2.0, 3.0])
+    (x * x).backward()
+    tx = tg(x)
+    (tx * tx).backward(torch.ones((2,)))
+    assert x.grad == [4.0, 6.0] == tx.grad.flatten().tolist()
+
+
+def t15():
+    unbroadcast.test()
+
+    for s1, s2 in [
+        ((2, 3), (3,)),
+        ((2, 3), (2, 1)),
+        ((2, 3, 4), (3, 1)),
+        ((2, 1, 4), (3, 4)),
+        ((5,), ()),
+        ((1,), (7, 8)),
+        ((2, 3), (2, 3)),
+    ]:
+        for op in [lambda p, q: p + q, lambda p, q: p * q, lambda p, q: p - q]:
+            a, b = rnd(s1), rnd(s2)
+            o = op(a, b)
+            o.backward()
+
+            ta, tb = tg(a), tg(b)
+            to = op(ta, tb)
+            to.backward(torch.ones_like(to))
+
+            assert torch.allclose(
+                torch.tensor(a.grad, dtype=torch.float64), ta.grad.flatten()
+            ), (s1, s2)
+            assert torch.allclose(
+                torch.tensor(b.grad, dtype=torch.float64), tb.grad.flatten()
+            ), (s1, s2)
+
+    x = Tensor([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]])  # (2,3)
+    b = Tensor([10.0, 20.0, 30.0])  # (3,)
+    (x + b).backward()
+
+    assert x.grad == [1, 1, 1, 1, 1, 1]  # six slots, one each
+    assert b.grad == [2, 2, 2]  # each value was used twice
+
+
 def tests():
     run_tests(first)
     t1()
@@ -461,6 +529,8 @@ def tests():
     t11()
     t12()
     t13()
+    t14()
+    t15()
     print("✅ ok")
 
 

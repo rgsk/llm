@@ -10,6 +10,8 @@ type Nested = Scalar | list[Nested]
 type Shape = tuple[int, ...]
 type Strides = tuple[int, ...]
 type Index = tuple[int, ...]
+type Grad = list[Scalar]  # flat, logical order
+type BinFn = Callable[[Scalar, Scalar], Scalar]
 
 
 def contiguous_strides(shape: Shape) -> Strides:
@@ -157,6 +159,32 @@ def _(fn):
     assert fn(x) == [x]  # a leaf is its own whole graph
 
 
+def unbroadcast(g: Grad, out_shape: Shape, shape: Shape) -> Grad:
+    """fold a gradient of shape out_shape back down to shape"""
+    if tuple(out_shape) == tuple(shape):
+        return g
+    pad = len(out_shape) - len(shape)
+    padded = (1,) * pad + tuple(shape)  # align at the right, as in broadcast_shape
+    res = [0.0] * prod(shape)
+    strides = contiguous_strides(shape)
+    for gi, idx in enumerate(iter_indices(out_shape)):
+        # wherever the input had a 1, every output position maps back to index 0
+        tgt = tuple(0 if padded[d] == 1 else idx[d] for d in range(len(out_shape)))
+        res[sum(i * s for i, s in zip(tgt[pad:], strides))] += g[gi]
+    return res
+
+
+@selftest(unbroadcast)
+def _(fn):
+    g = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]  # a (2,3) gradient
+    assert fn(g, (2, 3), (2, 3)) is g  # same shape: handed straight back
+    assert fn(g, (2, 3), (3,)) == [5.0, 7.0, 9.0]  # a row operand: columns summed
+    assert fn(g, (2, 3), (2, 1)) == [6.0, 15.0]  # a column operand: rows summed
+    assert fn(g, (2, 3), ()) == [21.0]  # a scalar: everything summed
+    assert fn([1.0, 2.0], (2,), (1,)) == [3.0]
+    assert fn([1.0] * 24, (2, 3, 4), (3, 1)) == [8.0, 8.0, 8.0]  # 2*4 per row
+
+
 class Tensor:
     def __init__(
         self,
@@ -173,10 +201,11 @@ class Tensor:
         self.data = data
         self.shape = shape
         self.strides = contiguous_strides(shape) if strides is None else strides
-        self.grad = None
+        self.grad: Grad | None = None
         self._parents = tuple(_parents)
         self._op = _op
         self.label = label
+        self._backward: Callable[[], None] = lambda: None
 
     @selftest(__init__)
     def _(fn):
@@ -192,6 +221,44 @@ class Tensor:
         fn(c, [1, 2, 3, 4, 5, 6], (2, 3), (1, 2))  # given strides kept as-is
         assert c.strides == (1, 2)
         assert (c.label, c._op, c._parents, c.grad) == ("", "", (), None)
+
+    def _accum(self, g: Grad) -> None:
+        """add g (flat, logical order) into self.grad"""
+        if self.grad is None:
+            self.grad = [0.0] * self.numel
+        for i in range(self.numel):
+            self.grad[i] += g[i]
+
+    @selftest(_accum)
+    def _(fn):
+        a = Tensor([1.0, 2.0, 3.0])
+        assert a.grad is None  # nothing until something flows back
+        fn(a, [1.0, 1.0, 1.0])
+        assert a.grad == [1.0, 1.0, 1.0]
+        fn(a, [0.5, 0.5, 0.5])
+        assert a.grad == [1.5, 1.5, 1.5]  # accumulates, never replaces
+
+    def backward(self) -> None:
+        self.grad = [1.0] * self.numel
+        for t in reversed(topo(self)):
+            t._backward()
+
+    @selftest(backward)
+    def _(fn):
+        x = Tensor([2.0, 3.0])
+        y = x * x
+        fn(y)
+        assert y.grad == [1.0, 1.0]  # the root is seeded with ones
+        assert x.grad == [4.0, 6.0]  # 2x: both edges of the same node accumulate
+
+        z = Tensor([5.0])
+        fn(z)  # a leaf: nothing to walk, just the seed
+        assert z.grad == [1.0]
+
+        a = Tensor([2.0])
+        c = a * a * a  # two levels deep: only a reverse walk propagates through
+        fn(c)
+        assert a.grad == [12.0]  # 3a^2
 
     def _offset(self, idx: Index) -> int:
         assert len(idx) == len(self.shape), (
@@ -380,72 +447,131 @@ class Tensor:
         assert "cannot expand" in str(err)
 
     def _binop(
-        self, other: Tensor | Scalar, f: Callable[[Scalar, Scalar], Scalar], op: str
+        self, other: Tensor | Scalar, f: BinFn, da: BinFn, db: BinFn, op: str
     ) -> Tensor:
         if not isinstance(other, Tensor):
             # scalar -> shape ()
             other = Tensor(other)  # type: ignore[arg-type]
-
         shape = broadcast_shape(self.shape, other.shape)
         a, b = self.expand(shape), other.expand(shape)
-        data = [f(a.data[a._offset(i)], b.data[b._offset(i)]) for i in a.indices()]
-        return Tensor(data, shape, _parents=(self, other), _op=op)
+        av = [a.data[a._offset(i)] for i in a.indices()]  # broadcast values
+        bv = [b.data[b._offset(i)] for i in b.indices()]
+        out = Tensor(
+            [f(x, y) for x, y in zip(av, bv)], shape, _parents=(self, other), _op=op
+        )
+
+        def _backward() -> None:
+            assert out.grad is not None  # backward seeds it before calling us
+            ga = [g * da(x, y) for g, x, y in zip(out.grad, av, bv)]
+            gb = [g * db(x, y) for g, x, y in zip(out.grad, av, bv)]
+            self._accum(unbroadcast(ga, shape, self.shape))
+            other._accum(unbroadcast(gb, shape, other.shape))
+
+        out._backward = _backward
+        return out
 
     @selftest(_binop)
     def _(fn):
         def add(x, y):
             return x + y
 
-        a = Tensor([[1, 2, 3], [4, 5, 6]])
+        def one(x, y):
+            return 1.0
 
-        r = Tensor([10, 20, 30])
-        out = fn(a, r, add, "add")  # (2,3) with (3,): right-aligned
+        a = Tensor([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]])
+        r = Tensor([10.0, 20.0, 30.0])
+        out = fn(a, r, add, one, one, "add")  # (2,3) with (3,): right-aligned
         assert (out.shape, out.tolist()) == ((2, 3), [[11, 22, 33], [14, 25, 36]])
-        assert (out._op, out._parents) == ("add", (a, r))  # both operands, unexpanded
+        assert (out._op, out._parents) == ("add", (a, r))  # operands, unexpanded
 
-        scalar_out = fn(a, 10, add, "add")  # scalar operand
+        out.grad = [1.0] * 6
+        out._backward()  # da/db are both 1, so the seed passes straight through
+        assert a.grad == [1.0] * 6
+        assert r.grad == [2.0, 2.0, 2.0]  # broadcast row: folded back over 2 rows
+
+        flipped = fn(r, a, add, one, one, "add")  # now `self` is the (3,) operand
+        flipped.grad = [1.0] * 6
+        r.grad = None
+        flipped._backward()
+        assert r.grad == [2.0, 2.0, 2.0]  # folded on the self side as well
+
+        scalar_out = fn(a, 10, add, one, one, "add")  # scalar operand
         assert scalar_out.tolist() == [[11, 12, 13], [14, 15, 16]]
         assert scalar_out._parents[1].shape == ()  # the scalar became a 0-d parent
 
-        out = fn(a, a, lambda x, y: x * y, "mul")
-        assert out.is_contiguous()  # result is always fresh and contiguous
-        assert out.data is not a.data
-        assert (out._op, out._parents) == ("mul", (a, a))  # same node twice
+        p, q = Tensor([2.0, 3.0]), Tensor([5.0, 7.0])
+        out = fn(p, q, lambda x, y: x * y, lambda x, y: y, lambda x, y: x, "mul")
+        out.grad = [10.0, 100.0]  # a non-unit seed: the chain rule must use it
+        out._backward()
+        assert p.grad == [50.0, 700.0]  # g * q
+        assert q.grad == [20.0, 300.0]  # g * p
 
-        e = check_raises(ValueError, lambda: fn(a, Tensor([1, 2]), add, "add"))
+        m = Tensor([[1.0, 2.0], [3.0, 4.0]])
+        out = fn(m, m, lambda x, y: x * y, lambda x, y: y, lambda x, y: x, "mul")
+        assert out.is_contiguous()  # result is always fresh and contiguous
+        assert out.data is not m.data
+        assert (out._op, out._parents) == ("mul", (m, m))  # same node twice
+        out.grad = [1.0] * 4
+        out._backward()
+        assert m.grad == [2.0, 4.0, 6.0, 8.0]  # 2x, accumulated from both sides
+
+        e = check_raises(
+            ValueError, lambda: fn(a, Tensor([1.0, 2.0]), add, one, one, "add")
+        )
         assert "cannot broadcast" in str(e)
 
     def __add__(self, other: Tensor | Scalar) -> Tensor:
-        return self._binop(other, lambda x, y: x + y, "add")
+        return self._binop(
+            other, lambda x, y: x + y, lambda x, y: 1.0, lambda x, y: 1.0, "add"
+        )
 
     @selftest(__add__)
     def _(fn):
         a = Tensor([[1, 2], [3, 4]])
+        b = Tensor([[10, 20], [30, 40]])
         assert fn(a, a).tolist() == [[2, 4], [6, 8]]
         assert fn(a, 10).tolist() == [[11, 12], [13, 14]]
         assert (2 + a).tolist() == fn(a, 2).tolist()  # __radd__ is this same function
-        assert (fn(a, a)._op, fn(a, a)._parents) == ("add", (a, a))
+        assert (fn(a, b)._op, fn(a, b)._parents) == ("add", (a, b))
+
+        p, q = Tensor([5.0]), Tensor([3.0])
+        fn(p, q).backward()
+        assert (p.grad, q.grad) == ([1.0], [1.0])  # add splits the grad evenly
 
     def __mul__(self, other: Tensor | Scalar) -> Tensor:
-        return self._binop(other, lambda x, y: x * y, "mul")
+        return self._binop(
+            other, lambda x, y: x * y, lambda x, y: y, lambda x, y: x, "mul"
+        )
 
     @selftest(__mul__)
     def _(fn):
         a = Tensor([[1, 2], [3, 4]])
+        b = Tensor([[10, 20], [30, 40]])
         assert fn(a, a).tolist() == [[1, 4], [9, 16]]
         assert fn(a, Tensor([10, 100])).tolist() == [[10, 200], [30, 400]]  # row bcast
         assert (3 * a).tolist() == fn(a, 3).tolist()  # __rmul__
-        assert fn(a, a)._op == "mul"
+        assert (fn(a, b)._op, fn(a, b)._parents) == ("mul", (a, b))
+
+        p, q = Tensor([5.0]), Tensor([3.0])
+        fn(p, q).backward()
+        assert (p.grad, q.grad) == ([3.0], [5.0])  # each side gets the other's value
 
     def __sub__(self, other: Tensor | Scalar) -> Tensor:
-        return self._binop(other, lambda x, y: x - y, "sub")
+        return self._binop(
+            other, lambda x, y: x - y, lambda x, y: 1.0, lambda x, y: -1.0, "sub"
+        )
 
     @selftest(__sub__)
     def _(fn):
         a = Tensor([[5, 6], [7, 8]])
-        assert fn(a, Tensor([[1, 2], [3, 4]])).tolist() == [[4, 4], [4, 4]]
+        b = Tensor([[1, 2], [3, 4]])
+        assert fn(a, b).tolist() == [[4, 4], [4, 4]]
         assert fn(a, 1).tolist() == [[4, 5], [6, 7]]
-        assert fn(a, 1)._op == "sub"
+        assert (fn(a, b)._op, fn(a, b)._parents) == ("sub", (a, b))
+
+        p, q = Tensor([5.0]), Tensor([3.0])
+        fn(p, q).backward()
+        assert (p.grad, q.grad) == ([1.0], [-1.0])  # the right operand flips sign
 
     __radd__ = __add__  # 2 + t  ->  t + 2
     __rmul__ = __mul__
