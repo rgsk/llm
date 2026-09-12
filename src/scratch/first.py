@@ -1,7 +1,15 @@
+from __future__ import annotations
+
 from test_utils import check_raises, selftest
 
+type Scalar = int | float
+type Nested = Scalar | list[Nested]
+type Shape = tuple[int, ...]
+type Strides = tuple[int, ...]
+type Index = tuple[int, ...]
 
-def contiguous_strides(shape):
+
+def contiguous_strides(shape: Shape) -> Strides:
     res = []
     p = 1
     for s in reversed(shape):
@@ -16,13 +24,14 @@ def _(fn):
     assert fn((2, 3, 4)) == (12, 4, 1)
 
 
-def infer_shape(nested):
+def infer_shape(nested: Nested) -> Shape:
     shape = []
-    while isinstance(nested, list):
-        shape.append(len(nested))
-        if len(nested) == 0:
+    cur: Nested = nested
+    while isinstance(cur, list):
+        shape.append(len(cur))
+        if len(cur) == 0:
             break
-        nested = nested[0]
+        cur = cur[0]
     return tuple(shape)
 
 
@@ -36,7 +45,7 @@ def _(fn):
     ) == (2, 3)
 
 
-def flatten(nested):
+def flatten(nested: Nested) -> list[Scalar]:
     if not isinstance(nested, list):
         return [nested]
     out = []
@@ -55,10 +64,10 @@ def _(fn):
     ) == [1, 2, 3, 4, 5, 6]
 
 
-def prod(xs):
+def prod(shape: Shape) -> int:
     out = 1
-    for x in xs:
-        out *= x
+    for v in shape:
+        out *= v
     return out
 
 
@@ -69,7 +78,9 @@ def _(fn):
 
 
 class Tensor:
-    def __init__(self, data, shape=None, strides=None):
+    def __init__(
+        self, data: list, shape: Shape | None = None, strides: Strides | None = None
+    ) -> None:
         if shape is None:
             shape = infer_shape(data)
             data = flatten(data)
@@ -91,7 +102,7 @@ class Tensor:
         fn(c, [1, 2, 3, 4, 5, 6], (2, 3), (1, 2))  # given strides kept as-is
         assert c.strides == (1, 2)
 
-    def _offset(self, idx):
+    def _offset(self, idx: Index) -> int:
         assert len(idx) == len(self.shape), (
             f"got {len(idx)} indices for shape {self.shape}"
         )
@@ -113,7 +124,7 @@ class Tensor:
         )
         assert "shape" in str(e)
 
-    def transpose(self, d0, d1):
+    def transpose(self, d0: int, d1: int) -> Tensor:
         shape, strides = list(self.shape), list(self.strides)
         shape[d0], shape[d1] = shape[d1], shape[d0]
         strides[d0], strides[d1] = strides[d1], strides[d0]
@@ -128,7 +139,7 @@ class Tensor:
         assert t.data is a.data  # a view, not a copy
         assert t.tolist() == [[1, 4], [2, 5], [3, 6]]
 
-    def tolist(self):
+    def tolist(self) -> Nested:
         def build(idx):
             if len(idx) == len(self.shape):
                 return self.data[self._offset(idx)]
@@ -144,14 +155,14 @@ class Tensor:
         assert fn(a.transpose(0, 1)) == [[1, 4], [2, 5], [3, 6]]
 
     @property
-    def numel(self):
+    def numel(self) -> int:
         return prod(self.shape)
 
-    @selftest(numel.fget)
+    @selftest(numel.fget)  # type: ignore[attr-defined]
     def _(fn):
         assert fn(Tensor([1, 2, 3, 4, 5, 6], (2, 3))) == 6
 
-    def is_contiguous(self):
+    def is_contiguous(self) -> bool:
         return self.strides == contiguous_strides(self.shape)
 
     @selftest(is_contiguous)
@@ -160,7 +171,7 @@ class Tensor:
         assert fn(a)
         assert not fn(a.transpose(0, 1))
 
-    def flat(self):
+    def flat(self) -> list[Scalar]:
         return flatten(self.tolist())
 
     @selftest(flat)
@@ -169,7 +180,7 @@ class Tensor:
         assert t.data == [1, 2, 3, 4, 5, 6]  # storage order
         assert fn(t) == [1, 4, 2, 5, 3, 6]  # logical order
 
-    def contiguous(self):
+    def contiguous(self) -> Tensor:
         if self.is_contiguous():
             return self
         return Tensor(self.flat(), self.shape)
@@ -188,7 +199,7 @@ class Tensor:
         assert tc.data is not t.data
         assert fn(tc) is tc  # already contiguous: no copy
 
-    def __repr__(self):
+    def __repr__(self) -> str:
         return (
             f"Tensor(shape={self.shape}, strides={self.strides}, data={self.tolist()})"
         )
