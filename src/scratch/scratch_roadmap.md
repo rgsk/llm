@@ -8,27 +8,25 @@ sample text.
 
 ## Done
 
-- strided `Tensor`: flat storage, shape, strides, `tolist`, `transpose`, `reshape`,
-  `contiguous`, `expand`
-- broadcasting, `+ - *`, batched `@`
+- strided `Tensor`: flat storage, shape, strides, storage offset, `tolist`,
+  `transpose`, `reshape`, `contiguous`, `expand`
+- broadcasting, `+ - * /`, batched `@`
 - autograd: `topo`, `backward`, broadcast-aware backward, matmul backward,
   differentiable views
+- A1 `sum` / `mean(dim, keepdim)` (t18)
+- A2 `_unop`: `neg`, `exp`, `log`, `sqrt`, `relu`; `/` (t19)
+- A3 `masked_fill` (t20)
+- A4 `cat` (t21)
+- A5 int-id lookup `weight[ids]`, negative ids, scatter-add backward (t22)
+- slicing: `x[1]`, `x[:, -1]`, `x[::2]` as views, backward into the base (t23)
 
 ## Not needed at this scope
 
-- storage offset / slicing: `tril[:T, :T]` is built per T, `logits[:, -1, :]` is
-  no-grad list math in generate
 - backward through `max` in softmax: softmax is shift-invariant, so treat it as a
   constant
 
-## A. Engine (grad-carrying ops)
+## A. Engine (remaining)
 
-1. `sum` / `mean(dim, keepdim)` — LayerNorm, softmax, loss
-2. `_unop`: `neg`, `exp`, `log`, `sqrt`, `relu`; `/`
-3. `masked_fill(mask, -inf)` — causal mask
-4. `cat(dim=-1)` — join heads
-5. integer lookup `weight[ids]`, scatter-add backward — `Embedding` and
-   `logp[arange(n), targets]`
 6. `no_grad`
 
 ## B. nn
