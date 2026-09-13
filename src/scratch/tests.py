@@ -607,6 +607,55 @@ def t17():
     assert close(b.grad, tb)
 
 
+def t18():
+    Tensor.sum.test()
+    Tensor.mean.test()
+    random.seed(0)
+
+    for reduce in [
+        lambda t: t.sum(),
+        lambda t: t.sum(0),
+        lambda t: t.sum(-1, keepdim=True),
+        lambda t: t.mean(),
+        lambda t: t.mean(1),
+        lambda t: t.mean(-1, keepdim=True),
+    ]:
+        a = rnd((2, 3, 4))
+        o = reduce(a)
+        (o * o).backward()
+
+        ta = tg(a)
+        to = reduce(ta)
+        (to * to).backward(torch.ones_like(to))
+        assert o.shape == tuple(to.shape)
+        assert torch.allclose(tt(o), to.detach())
+        assert close(a.grad, ta)
+
+    # keepdim leaves a 1 behind, so the result broadcasts back against its input
+    x = rnd((2, 4, 8))
+    m = x.mean(-1, keepdim=True)
+    assert m.shape == (2, 4, 1)
+    c = x - m
+    assert all(abs(v) < 1e-12 for v in c.mean(-1).flat())
+
+    # a scalar root: backward now matches torch's bare .backward()
+    loss = (x * x).mean()
+    assert loss.shape == ()
+    loss.backward()
+    tx = tg(x)
+    (tx * tx).mean().backward()
+    assert close(x.grad, tx)
+
+    # mean has no node of its own: it is a sum, then a mul by the 0-d leaf 1/n
+    a = Tensor([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]], label="a")
+    assert trace(a.mean(-1, keepdim=True)) == [
+        "0 a (2, 3)",
+        "1 sum (2, 1) <- a",
+        "2 leaf ()",
+        "3 mul (2, 1) <- sum, leaf",
+    ]
+
+
 def tests():
     run_tests(first)
     t1()
@@ -626,6 +675,7 @@ def tests():
     t15()
     t16()
     t17()
+    t18()
     print("✅ ok")
 
 

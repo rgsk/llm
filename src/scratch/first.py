@@ -742,6 +742,60 @@ class Tensor:
         fn(tv, sq).backward()
         assert tv.grad == [3.0, 7.0, 3.0, 7.0]  # lands on the view, in logical order
 
+    def sum(self, dim: int | None = None, keepdim: bool = False) -> Tensor:
+        nd = len(self.shape)
+        if dim is None:
+            kept: Shape = (1,) * nd
+            shape: Shape = kept if keepdim else ()
+        else:
+            assert -nd <= dim < nd, f"dim {dim} out of range for {self.shape}"
+            dim %= nd
+            kept = self.shape[:dim] + (1,) + self.shape[dim + 1 :]
+            shape = kept if keepdim else self.shape[:dim] + self.shape[dim + 1 :]
+        data = unbroadcast(self.flat(), self.shape, kept)  # fold the dim down to 1
+        out = Tensor(data, shape, _parents=(self,), _op="sum")
+
+        def _backward() -> None:
+            assert out.grad is not None
+            g = Tensor(out.grad, kept).expand(self.shape)  # stretch back out
+            self._accum(g.flat())
+
+        out._backward = _backward
+        return out
+
+    @selftest(sum)
+    def _(fn):
+        a = Tensor([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]])
+        assert (fn(a).shape, fn(a).tolist()) == ((), 21.0)  # everything
+        assert fn(a, 0).tolist() == [5.0, 7.0, 9.0]
+        assert fn(a, 1).tolist() == fn(a, -1).tolist() == [6.0, 15.0]
+        assert (fn(a, 1, True).shape, fn(a, 1, True).tolist()) == ((2, 1), [[6], [15]])
+        assert fn(a, None, True).shape == (1, 1)
+        assert fn(a.T, 0).tolist() == [6.0, 15.0]  # reads through strides
+        assert (fn(a, 0)._op, fn(a, 0)._parents) == ("sum", (a,))
+
+        out = fn(a, 1)
+        out.grad = [10.0, 100.0]
+        out._backward()
+        assert a.grad == [10.0] * 3 + [100.0] * 3  # each row's grad, per element
+
+        e = check_raises(AssertionError, lambda: fn(a, 2))
+        assert "out of range" in str(e)
+
+    def mean(self, dim: int | None = None, keepdim: bool = False) -> Tensor:
+        n = self.numel if dim is None else self.shape[dim]
+        return self.sum(dim, keepdim) * (1.0 / n)
+
+    @selftest(mean)
+    def _(fn):
+        a = Tensor([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]])
+        assert fn(a).tolist() == 3.5
+        assert fn(a, 0).tolist() == [2.5, 3.5, 4.5]
+        assert fn(a, -1, True).tolist() == [[2.0], [5.0]]
+
+        fn(a).backward()  # a scalar root: seeded with a single 1.0
+        assert a.grad == [1 / 6] * 6
+
     def __repr__(self) -> str:
         return (
             f"Tensor(shape={self.shape}, strides={self.strides}, data={self.tolist()})"
