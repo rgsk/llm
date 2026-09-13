@@ -827,6 +827,54 @@ def t21():
         assert all(close(t.grad, r) for t, r in zip(cts, tts))
 
 
+def t22():
+    Tensor.__getitem__.test()
+    random.seed(0)
+
+    # embedding: (V=4, E=2) table, (B=2, T=3) token ids -> (2, 3, 2)
+    table = Tensor([[0, 1], [10, 11], [20, 21], [30, 31]])
+    tokens = Tensor([[1, 2, 1], [0, 1, 3]])
+    x = table[tokens]
+    assert x.tolist() == [
+        [[10, 11], [20, 21], [10, 11]],
+        [[0, 1], [10, 11], [30, 31]],
+    ]
+
+    # each row's grad counts how often that token appeared
+    x.sum().backward()
+    assert table.grad == [
+        1, 1,  # token 0: once
+        3, 3,  # token 1: three times
+        1, 1,
+        1, 1,
+    ]  # fmt: skip
+
+    # cross entropy's pick: logp[row, target] is flat index row * V + target
+    logp = Tensor([[0, 1, 2, 3], [4, 5, 6, 7], [8, 9, 10, 11]])
+    targets = [2, 0, 3]
+    picked = logp.reshape(-1)[Tensor([r * 4 + t for r, t in enumerate(targets)])]
+    assert picked.tolist() == [2, 4, 11]
+    picked.sum().backward()
+    assert logp.grad == [
+        0, 0, 1, 0,
+        1, 0, 0, 0,
+        0, 0, 0, 1,
+    ]  # fmt: skip
+
+    for shape in [(10, 4), (6, 3, 2)]:
+        w = rnd(shape)
+        ids = Tensor([[random.randrange(shape[0]) for _ in range(5)] for _ in range(2)])
+        o = w[ids]
+        v = rnd(o.shape)
+        (o * v).sum().backward()
+
+        tw = tg(w)
+        to = tw[torch.tensor(ids.tolist())]
+        assert torch.allclose(tt(o), to.detach())
+        (to * tt(v)).sum().backward()
+        assert close(w.grad, tw)
+
+
 def tests():
     run_tests(first)
     t1()
@@ -850,6 +898,7 @@ def tests():
     t19()
     t20()
     t21()
+    t22()
     print("✅ ok")
 
 

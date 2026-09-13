@@ -781,6 +781,75 @@ class Tensor:
         e = check_raises(ValueError, lambda: fn(a, Tensor([True, False, True]), 0.0))
         assert "cannot expand" in str(e)
 
+    def __getitem__(self, ids: Tensor) -> Tensor:
+        if not isinstance(ids, Tensor):
+            raise TypeError(f"index with a Tensor of int ids, got {type(ids).__name__}")
+        assert len(self.shape) >= 1, "cannot index a 0-d tensor"
+        rows = self.shape[0]
+        row = prod(self.shape[1:])  # elements per row
+        idx: list[int] = []
+        for i in ids.flat():
+            assert isinstance(i, int) and 0 <= i < rows, f"id {i} out of range {rows}"
+            idx.append(i)
+        flat = self.flat()
+        data: list[Scalar] = []
+        for i in idx:
+            data += flat[i * row : (i + 1) * row]
+        out = Tensor(data, ids.shape + self.shape[1:], _parents=(self,), _op="index")
+
+        def _backward() -> None:
+            assert out.grad is not None
+            g = [0.0] * self.numel
+            for k, i in enumerate(idx):
+                for j in range(row):
+                    g[i * row + j] += out.grad[k * row + j]  # repeated ids pile up
+            self._accum(g)
+
+        out._backward = _backward
+        return out
+
+    @selftest(__getitem__)
+    def _(fn):
+        w = Tensor([[1, 2], [3, 4], [5, 6]])  # 3 rows
+        assert fn(w, Tensor([2, 0])).tolist() == [[5, 6], [1, 2]]
+        assert fn(w, Tensor([[0, 1], [2, 2]])).tolist() == [
+            [[1, 2], [3, 4]],
+            [[5, 6], [5, 6]],
+        ]  # (2, 2) ids -> (2, 2, 2)
+        assert fn(w, Tensor(1)).tolist() == [3, 4]  # a 0-d id picks one row
+        assert fn(Tensor([10, 20, 30]), Tensor([2, 1])).tolist() == [30, 20]  # 1-D
+        assert fn(w.T, Tensor([1])).tolist() == [[2, 4, 6]]  # a view
+        out = fn(w, Tensor([2, 0, 2]))
+        assert (out._op, out._parents) == ("index", (w,))  # ids are no parent
+
+        out.grad = [1] * 6
+        out._backward()
+        assert w.grad == [1, 1, 0, 0, 2, 2]  # row 2 was picked twice
+
+        w = Tensor([[1, 2], [3, 4], [5, 6]])
+        out = fn(w, Tensor([2, 0, 1, 2]))
+        out.grad = [10, 20, 1, 2, 3, 4, 5, 6]  # one grad row per id
+        out._backward()
+        assert w.grad == [
+            1, 2,    # row 0 <- id 0's grad
+            3, 4,    # row 1 <- id 1's grad
+            15, 26,  # row 2 <- picked twice: [10, 20] + [5, 6]
+        ]  # fmt: skip
+
+        w = Tensor([[1, 2], [3, 4], [5, 6]])
+        out = fn(w, Tensor([1, 2, 1]))
+        out.grad = [1, 2, 3, 4, 5, 6]
+        out._backward()
+        assert w.grad == [
+            0, 0,  # row 0 <- never picked
+            6, 8,  # row 1 <- picked twice: [1, 2] + [5, 6]
+            3, 4,  # row 2 <- picked once
+        ]  # fmt: skip
+
+        e = check_raises(AssertionError, lambda: fn(w, Tensor([3])))
+        assert "out of range" in str(e)
+        check_raises(TypeError, lambda: w[0])  # plain ints are not supported
+
     def __matmul__(self, other: Tensor) -> Tensor:
         assert len(self.shape) >= 2 and len(other.shape) >= 2
         n, k = self.shape[-2:]
