@@ -1,3 +1,4 @@
+import math
 import random
 
 import first
@@ -716,6 +717,78 @@ def t19():
     assert close(x.grad, tx)
 
 
+def t20():
+    Tensor.masked_fill.test()
+    random.seed(0)
+
+    a = Tensor([[1.0, 2.0], [3.0, 4.0]])
+    out = a.masked_fill(Tensor([[False, True], [False, False]]), 0.0)
+    assert out.tolist() == [[1.0, 0.0], [3.0, 4.0]]
+    out.grad = [1.0, 2.0, 3.0, 4.0]
+    out._backward()
+    assert a.grad == [1.0, 0.0, 3.0, 4.0]
+
+    # causal: token i may not look at j > i
+    causal = Tensor([[j > i for j in range(3)] for i in range(3)])
+    assert causal.tolist() == [
+        [False, True, True],
+        [False, False, True],
+        [False, False, False],
+    ]
+
+    scores = Tensor([[0.0] * 3] * 3)
+    e = scores.masked_fill(causal, float("-inf")).exp()
+    p = e / e.sum(-1, keepdim=True)
+    assert p.tolist() == [
+        [1.0, 0.0, 0.0],
+        [0.5, 0.5, 0.0],
+        [1 / 3, 1 / 3, 1 / 3],
+    ]
+
+    x = Tensor([10] * 18, (2, 3, 3))
+    w = x * 2
+    f = w.masked_fill(causal, 10)
+    f.sum().backward()
+    assert x.grad == [
+        2, 0, 0,
+        2, 2, 0,
+        2, 2, 2,
+
+        2, 0, 0,
+        2, 2, 0,
+        2, 2, 2,
+    ]  # fmt: skip
+    masked = causal.expand((2, 3, 3)).flat()
+    assert [g for g, m in zip(x.grad, masked) if m] == [0] * 6
+
+    # the attention shape: one (T, T) mask over a batch of (T, T) scores
+    causal = Tensor([[j > i for j in range(4)] for i in range(4)])
+    tmask = torch.tensor(causal.tolist())
+    x, w = rnd((2, 4, 4)), rnd((2, 4, 4))
+    tx = tg(x)
+
+    f = x.masked_fill(causal, float("-inf"))
+    e = f.exp()
+    p = e / e.sum(-1, keepdim=True)
+    tp = torch.softmax(tx.masked_fill(tmask, float("-inf")), -1)
+    assert torch.allclose(tt(p), tp.detach())
+
+    (p * w).sum().backward()
+    (tp * tt(w)).sum().backward()
+    assert close(x.grad, tx)
+
+    # exp(-inf) = 0 already zeroes the grad before it reaches masked_fill,
+    # so in attention its own zeroing is redundant (see next eg.)
+    assert f.grad is not None
+    masked = causal.expand((2, 4, 4)).flat()
+    assert all(g == 0.0 for g, m in zip(f.grad, masked) if m)
+
+    # exp's backward multiplies by its own output, and exp(-inf) = 0
+    z = Tensor([1.0, 2.0, float("-inf")])
+    z.exp().sum().backward()
+    assert z.grad == [math.exp(1), math.exp(2), 0.0]
+
+
 def tests():
     run_tests(first)
     t1()
@@ -737,6 +810,7 @@ def tests():
     t17()
     t18()
     t19()
+    t20()
     print("✅ ok")
 
 

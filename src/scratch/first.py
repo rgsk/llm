@@ -743,6 +743,44 @@ class Tensor:
         fn(a).backward()
         assert a.grad == [0.0, 0.0, 1.0]  # 0 at exactly 0, as torch picks
 
+    def masked_fill(self, mask: Tensor, value: Scalar) -> Tensor:
+        m = mask.expand(self.shape).flat()  # the mask broadcasts to self, not back
+        xs = self.flat()
+        ys = [value if mi else x for x, mi in zip(xs, m)]
+        out = Tensor(ys, self.shape, _parents=(self,), _op="masked_fill")
+
+        def _backward() -> None:
+            assert out.grad is not None
+            self._accum([0.0 if mi else g for g, mi in zip(out.grad, m)])
+
+        out._backward = _backward
+        return out
+
+    @selftest(masked_fill)
+    def _(fn):
+        a = Tensor([[1.0, 2.0], [3.0, 4.0]])
+        m = Tensor([[False, True], [False, False]])
+        out = fn(a, m, -math.inf)
+        assert out.tolist() == [[1.0, -math.inf], [3.0, 4.0]]
+        assert (out._op, out._parents) == ("masked_fill", (a,))  # mask is no parent
+
+        row = Tensor([True, False])  # broadcasts over both rows
+        assert fn(a, row, 0.0).tolist() == [[0.0, 2.0], [0.0, 4.0]]
+        t = Tensor(list(range(1, 9)), (2, 2, 2))
+        tm = fn(t, m, 0)
+        assert tm.shape == (2, 2, 2)
+        assert tm.tolist() == [
+            [[1, 0], [3, 4]],
+            [[5, 0], [7, 8]],
+        ]
+
+        out.grad = [1.0, 2.0, 3.0, 4.0]
+        out._backward()
+        assert a.grad == [1.0, 0.0, 3.0, 4.0]  # nothing flows into a filled slot
+
+        e = check_raises(ValueError, lambda: fn(a, Tensor([True, False, True]), 0.0))
+        assert "cannot expand" in str(e)
+
     def __matmul__(self, other: Tensor) -> Tensor:
         assert len(self.shape) >= 2 and len(other.shape) >= 2
         n, k = self.shape[-2:]
