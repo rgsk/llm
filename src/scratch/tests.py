@@ -656,6 +656,66 @@ def t18():
     ]
 
 
+def t19():
+    Tensor.__truediv__.test()
+    Tensor._unop.test()
+    Tensor.__neg__.test()
+    Tensor.exp.test()
+    Tensor.log.test()
+    Tensor.sqrt.test()
+    Tensor.relu.test()
+    random.seed(0)
+
+    for f in [
+        lambda t: -t,
+        lambda t: t.exp(),
+        lambda t: (t * t + 1.0).log(),
+        lambda t: (t * t + 1.0).sqrt(),
+        lambda t: t.relu(),
+        lambda t: t / (t * t + 1.0),
+    ]:
+        a = rnd((2, 3))
+        o = f(a)
+        (o * o).backward()
+
+        ta = tg(a)
+        to = f(ta)
+        (to * to).backward(torch.ones_like(to))
+        assert torch.allclose(tt(o), to.detach())
+        assert close(a.grad, ta)
+
+    # a (3,) divisor broadcast over 2 rows: each b[j] divides a whole column
+    a = Tensor([[2.0, 4.0, 6.0], [8.0, 10.0, 12.0]])
+    b = Tensor([1.0, 2.0, 4.0])
+    out = a / b
+    assert out.tolist() == [[2.0, 2.0, 1.5], [8.0, 5.0, 3.0]]
+    out.backward()
+    assert a.grad == [1.0, 0.5, 0.25] * 2  # 1/b, per element
+    assert b.grad == [-10.0, -3.5, -1.125]  # -a/b^2, summed down each column
+
+    # softmax and LayerNorm are now expressible. both outputs sum to a constant,
+    # so a seed of ones would give zero grad: weight the output instead
+    x, w = rnd((2, 4, 8)), rnd((2, 4, 8))
+    tx, tw = tg(x), tt(w)
+
+    e = x.exp()
+    s = e / e.sum(-1, keepdim=True)
+    assert torch.allclose(tt(s), torch.softmax(tt(x), -1))
+    (s * w).sum().backward()
+    (torch.softmax(tx, -1) * tw).sum().backward()
+    assert close(x.grad, tx)
+
+    x.grad, tx.grad = None, None
+    m = x.mean(-1, keepdim=True)
+    var = ((x - m) * (x - m)).mean(-1, keepdim=True)
+    y = (x - m) / (var + 1e-5).sqrt()
+    (y * w).sum().backward()
+    ty = torch.nn.functional.layer_norm(tx, (8,), eps=1e-5)
+    (ty * tw).sum().backward()
+    assert torch.allclose(tt(y), ty.detach())
+    assert close(x.grad, tx)
+
+
 def tests():
     run_tests(first)
     t1()
@@ -676,6 +736,7 @@ def tests():
     t16()
     t17()
     t18()
+    t19()
     print("✅ ok")
 
 

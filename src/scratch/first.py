@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from collections.abc import Callable, Iterable, Iterator
 from typing import Any, overload
 
@@ -12,6 +13,7 @@ type Strides = tuple[int, ...]
 type Index = tuple[int, ...]
 type Grad = list[Scalar]  # flat, logical order
 type BinFn = Callable[[Scalar, Scalar], Scalar]
+type UnFn = Callable[[Scalar], Scalar]
 
 
 def contiguous_strides(shape: Shape) -> Strides:
@@ -639,8 +641,107 @@ class Tensor:
         fn(p, q).backward()
         assert (p.grad, q.grad) == ([1.0], [-1.0])  # the right operand flips sign
 
+    def __truediv__(self, other: Tensor | Scalar) -> Tensor:
+        return self._binop(
+            other,
+            lambda x, y: x / y,
+            lambda x, y: 1.0 / y,
+            lambda x, y: -x / (y * y),
+            "div",
+        )
+
+    @selftest(__truediv__)
+    def _(fn):
+        a = Tensor([[2.0, 4.0], [6.0, 8.0]])
+        assert fn(a, 2.0).tolist() == [[1.0, 2.0], [3.0, 4.0]]
+        assert fn(a, Tensor([2.0, 4.0])).tolist() == [[1.0, 1.0], [3.0, 2.0]]  # bcast
+
+        p, q = Tensor([6.0]), Tensor([3.0])
+        fn(p, q).backward()
+        assert (p.grad, q.grad) == ([1 / 3], [-6 / 9])  # 1/q and -p/q^2
+
     __radd__ = __add__  # 2 + t  ->  t + 2
     __rmul__ = __mul__
+
+    def _unop(self, f: UnFn, df: BinFn, op: str) -> Tensor:
+        xs = self.flat()
+        ys = [f(x) for x in xs]
+        out = Tensor(ys, self.shape, _parents=(self,), _op=op)
+
+        def _backward() -> None:
+            assert out.grad is not None
+            self._accum([g * df(x, y) for g, x, y in zip(out.grad, xs, ys)])
+
+        out._backward = _backward
+        return out
+
+    @selftest(_unop)
+    def _(fn):
+        a = Tensor([1.0, -2.0, 3.0])
+        out = fn(a, lambda x: x * x, lambda x, y: 2 * x, "square")
+        assert out.tolist() == [1.0, 4.0, 9.0]
+        assert (out._op, out._parents) == ("square", (a,))
+
+        out.grad = [1.0, 10.0, 100.0]
+        out._backward()
+        assert a.grad == [2.0, -40.0, 600.0]  # g * 2x
+
+        t = Tensor([[1.0, 2.0], [3.0, 4.0]]).T
+        assert fn(t, lambda x: x, lambda x, y: 1.0, "id").tolist() == t.tolist()
+
+    def __neg__(self) -> Tensor:
+        return self._unop(lambda x: -x, lambda x, y: -1.0, "neg")
+
+    @selftest(__neg__)
+    def _(fn):
+        a = Tensor([1.0, -2.0])
+        assert fn(a).tolist() == (-a).tolist() == [-1.0, 2.0]
+        fn(a).backward()
+        assert a.grad == [-1.0, -1.0]
+
+    def exp(self) -> Tensor:
+        return self._unop(math.exp, lambda x, y: y, "exp")
+
+    @selftest(exp)
+    def _(fn):
+        a = Tensor([0.0, 1.0, -math.inf])
+        assert fn(a).tolist() == [1.0, math.e, 0.0]  # -inf -> 0: a masked slot
+        fn(a).backward()
+        assert a.grad == [1.0, math.e, 0.0]  # the output is its own derivative
+
+    def log(self) -> Tensor:
+        return self._unop(math.log, lambda x, y: 1.0 / x, "log")
+
+    @selftest(log)
+    def _(fn):
+        a = Tensor([1.0, math.e])
+        assert fn(a).tolist() == [0.0, 1.0]
+        fn(a).backward()
+        assert a.grad == [1.0, 1 / math.e]
+
+        check_raises(ValueError, lambda: fn(Tensor([0.0])))  # torch gives -inf
+
+    def sqrt(self) -> Tensor:
+        return self._unop(math.sqrt, lambda x, y: 0.5 / y, "sqrt")
+
+    @selftest(sqrt)
+    def _(fn):
+        a = Tensor([4.0, 9.0])
+        assert fn(a).tolist() == [2.0, 3.0]
+        fn(a).backward()
+        assert a.grad == [0.25, 1 / 6]
+
+    def relu(self) -> Tensor:
+        return self._unop(
+            lambda x: x if x > 0 else 0.0, lambda x, y: 1.0 if x > 0 else 0.0, "relu"
+        )
+
+    @selftest(relu)
+    def _(fn):
+        a = Tensor([-2.0, 0.0, 3.0])
+        assert fn(a).tolist() == [0.0, 0.0, 3.0]
+        fn(a).backward()
+        assert a.grad == [0.0, 0.0, 1.0]  # 0 at exactly 0, as torch picks
 
     def __matmul__(self, other: Tensor) -> Tensor:
         assert len(self.shape) >= 2 and len(other.shape) >= 2
