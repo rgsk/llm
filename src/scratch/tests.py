@@ -875,6 +875,80 @@ def t22():
         assert close(w.grad, tw)
 
 
+def t23():
+    Tensor.__init__.test()
+    Tensor._offset.test()
+    Tensor.transpose.test()
+    Tensor.is_contiguous.test()
+    Tensor.contiguous.test()
+    Tensor.reshape.test()
+    Tensor.expand.test()
+    Tensor._slice.test()
+    Tensor.__getitem__.test()
+    random.seed(0)
+
+    a = Tensor([[1, 2, 3], [4, 5, 6]])
+
+    # a view: the same storage read from another offset, shape and strides
+    r = a[1]
+    assert (r.tolist(), r.shape, r.strides, r.offset) == ([4, 5, 6], (3,), (1,), 3)
+    assert r.data is a.data
+
+    c = a[:, -1]  # last column
+    assert (c.tolist(), c.strides, c.offset) == ([3, 6], (3,), 2)
+
+    e = a[:, ::2]  # every other column
+    assert (e.tolist(), e.strides, e.offset) == ([[1, 3], [4, 6]], (3, 2), 0)
+
+    # a prefix reads part of a longer storage: not contiguous, so reshape copies
+    p = a[0]
+    assert (p.strides, p.offset, len(p.data)) == ((1,), 0, 6)
+    assert not p.is_contiguous()
+    q = p.reshape(3, 1)
+    assert (q.tolist(), q.data) == ([[1], [2], [3]], [1, 2, 3])
+
+    # the causal mask for T = 2, cut from a block_size = 4 one
+    tril = Tensor([[j <= i for j in range(4)] for i in range(4)])
+    assert tril[:2, :2].tolist() == [[True, False], [True, True]]
+
+    # generate reads only the last position: logits[:, -1, :]
+    logits = Tensor(list(range(12)), (1, 3, 4))
+    assert logits[:, -1, :].tolist() == [[8, 9, 10, 11]]
+
+    # backward puts the grad back where the view read, zeros elsewhere
+    x = Tensor([[1, 2, 3], [4, 5, 6]])
+    s = x[:, 1:]
+    (s * Tensor(s.flat(), s.shape)).sum().backward()  # s.flat(), not s.data
+    assert x.grad == [
+        0, 2, 3,
+        0, 5, 6,
+    ]  # fmt: skip
+
+    # iterating yields rows: Python calls a[0], a[1], ... until IndexError
+    assert [row.tolist() for row in a] == [[1, 2, 3], [4, 5, 6]]
+
+    for view in [
+        lambda t: t[1],
+        lambda t: t[:, -1],
+        lambda t: t[:, ::2],
+        lambda t: t[1:, :2],
+        lambda t: t[0, 1:3],
+        lambda t: t.transpose(0, 1)[1:],
+        lambda t: t[:, 1:].reshape(-1),
+        lambda t: t[::2].expand((3, 2, 4)),
+    ]:
+        base = rnd((3, 4))
+        v = view(base)
+        w = rnd(v.shape)
+        (v * w).sum().backward()
+
+        tb = tg(base)
+        tv = view(tb)
+        assert torch.allclose(tt(v), tv.detach())
+        (tv * tt(w)).sum().backward()
+        assert close(base.grad, tb)
+
+
 def tests():
     run_tests(first)
     t1()
@@ -899,6 +973,7 @@ def tests():
     t20()
     t21()
     t22()
+    t23()
     print("✅ ok")
 
 

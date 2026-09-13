@@ -14,6 +14,7 @@ type Index = tuple[int, ...]
 type Grad = list[Scalar]  # flat, logical order
 type BinFn = Callable[[Scalar, Scalar], Scalar]
 type UnFn = Callable[[Scalar], Scalar]
+type Key = int | slice | tuple[int | slice, ...] | list[int] | Tensor
 
 
 def contiguous_strides(shape: Shape) -> Strides:
@@ -193,6 +194,7 @@ class Tensor:
         data: list,
         shape: Shape | None = None,
         strides: Strides | None = None,
+        offset: int = 0,
         _parents: tuple[Tensor, ...] = (),
         _op: str = "",
         label: str = "",
@@ -203,6 +205,7 @@ class Tensor:
         self.data = data
         self.shape = shape
         self.strides = contiguous_strides(shape) if strides is None else strides
+        self.offset = offset  # where this view starts in data
         self.grad: Grad | None = None
         self._parents = tuple(_parents)
         self._op = _op
@@ -223,6 +226,11 @@ class Tensor:
         fn(c, [1, 2, 3, 4, 5, 6], (2, 3), (1, 2))  # given strides kept as-is
         assert c.strides == (1, 2)
         assert (c.label, c._op, c._parents, c.grad) == ("", "", (), None)
+        assert c.offset == 0
+
+        d = Tensor.__new__(Tensor)
+        fn(d, [0, 1, 2, 3], (2,), (1,), 2)  # a view starting 2 elements in
+        assert (d.offset, d.tolist()) == (2, [2, 3])
 
     def _accum(self, g: Grad) -> None:
         """add g (flat, logical order) into self.grad"""
@@ -266,7 +274,7 @@ class Tensor:
         assert len(idx) == len(self.shape), (
             f"got {len(idx)} indices for shape {self.shape}"
         )
-        return sum(i * s for i, s in zip(idx, self.strides))
+        return self.offset + sum(i * s for i, s in zip(idx, self.strides))
 
     @selftest(_offset)
     def _(fn):
@@ -276,6 +284,9 @@ class Tensor:
 
         b = Tensor(list(range(24)), (2, 3, 4))
         assert fn(b, (1, 2, 3)) == 23
+
+        v = Tensor([0, 1, 2, 3, 4, 5], (2,), (2,), 1)  # reads data[1], data[3]
+        assert (fn(v, (0,)), fn(v, (1,))) == (1, 3)
 
         e = check_raises(
             AssertionError,
@@ -289,7 +300,12 @@ class Tensor:
         shape[d0], shape[d1] = shape[d1], shape[d0]
         strides[d0], strides[d1] = strides[d1], strides[d0]
         out = Tensor(
-            self.data, tuple(shape), tuple(strides), _parents=(self,), _op="transpose"
+            self.data,
+            tuple(shape),
+            tuple(strides),
+            self.offset,
+            _parents=(self,),
+            _op="transpose",
         )
 
         def _backward() -> None:
@@ -309,6 +325,7 @@ class Tensor:
         assert t.data is a.data  # a view, not a copy
         assert t.tolist() == [[1, 4], [2, 5], [3, 6]]
         assert (t._op, t._parents) == ("transpose", (a,))  # stays in the graph
+        assert fn(a[:, 1:], 0, 1).tolist() == [[2, 5], [3, 6]]  # keeps the offset
 
         # the view reads the base's 1..6 as [1, 4, 2, 5, 3, 6]. seed each slot with
         # the value it reads, and a correct backward gives every element its own back
@@ -355,13 +372,19 @@ class Tensor:
         assert fn(Tensor([1, 2, 3, 4, 5, 6], (2, 3))) == 6
 
     def is_contiguous(self) -> bool:
-        return self.strides == contiguous_strides(self.shape)
+        return (
+            self.offset == 0
+            and len(self.data) == self.numel
+            and self.strides == contiguous_strides(self.shape)
+        )
 
     @selftest(is_contiguous)
     def _(fn):
         a = Tensor([1, 2, 3, 4, 5, 6], (2, 3))
         assert fn(a)
         assert not fn(a.transpose(0, 1))
+        assert not fn(a[1])  # starts 3 elements into data
+        assert not fn(a[0])  # reads only 3 of data's 6
 
     def flat(self) -> list[Scalar]:
         return flatten(self.tolist())
@@ -402,6 +425,10 @@ class Tensor:
         tc.grad = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]
         tc._backward()
         assert t.grad == [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]  # copy only moved the storage
+
+        s = Tensor([1, 2, 3, 4])[1:3]
+        sc = fn(s)
+        assert (sc.data, sc.offset) == ([2, 3], 0)  # a slice copies out just its part
 
     @overload
     def reshape(self, *shape: int) -> Tensor: ...
@@ -455,6 +482,10 @@ class Tensor:
         r6._backward()
         assert base.grad == [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]  # flat order is preserved
 
+        p = Tensor([1, 2, 3, 4, 5, 6])[2:]  # a slice: offset 2
+        rp = fn(p, 2, 2)  # copied out before relabeling
+        assert (rp.tolist(), rp.data) == ([[3, 4], [5, 6]], [3, 4, 5, 6])
+
     def indices(self) -> Iterator[Index]:
         return iter_indices(self.shape)
 
@@ -482,7 +513,12 @@ class Tensor:
             else:
                 raise ValueError(f"cannot expand {self.shape} -> {shape}")
         out = Tensor(
-            self.data, tuple(shape), tuple(strides), _parents=(self,), _op="expand"
+            self.data,
+            tuple(shape),
+            tuple(strides),
+            self.offset,
+            _parents=(self,),
+            _op="expand",
         )
 
         def _backward() -> None:
@@ -513,6 +549,8 @@ class Tensor:
         ex.grad = [1.0] * 6
         ex._backward()
         assert src.grad == [2.0, 2.0, 2.0]  # a stride-0 dim sums its copies back down
+
+        assert fn(Tensor([1, 2, 3, 4])[2:], (2, 2)).tolist() == [[3, 4], [3, 4]]
 
     def _binop(
         self, other: Tensor | Scalar, f: BinFn, da: BinFn, db: BinFn, op: str
@@ -781,16 +819,111 @@ class Tensor:
         e = check_raises(ValueError, lambda: fn(a, Tensor([True, False, True]), 0.0))
         assert "cannot expand" in str(e)
 
-    def __getitem__(self, ids: Tensor) -> Tensor:
+    def _slice(self, key: tuple[int | slice, ...]) -> Tensor:
+        nd = len(self.shape)
+        assert len(key) <= nd, f"too many indices for shape {self.shape}"
+        key = key + (slice(None),) * (nd - len(key))
+        offset = self.offset
+        shape: list[int] = []
+        strides: list[int] = []
+        starts: list[int] = []  # per input dim: the first index read
+        steps: list[int] = []  # per input dim: 0 where an int dropped it
+        for k, size, st in zip(key, self.shape, self.strides):
+            if isinstance(k, int):
+                if not -size <= k < size:
+                    raise IndexError(f"index {k} out of range {size}")
+                k %= size
+                offset += k * st
+                starts.append(k)
+                steps.append(0)
+            elif isinstance(k, slice):
+                start, stop, step = k.indices(size)
+                assert step > 0, "negative slice steps are not supported"
+                offset += start * st
+                shape.append(len(range(start, stop, step)))
+                strides.append(st * step)
+                starts.append(start)
+                steps.append(step)
+            else:
+                raise TypeError(f"cannot index with {type(k).__name__}")
+        out = Tensor(
+            self.data,
+            tuple(shape),
+            tuple(strides),
+            offset,
+            _parents=(self,),
+            _op="slice",
+        )
+
+        def _backward() -> None:
+            assert out.grad is not None
+            g = [0.0] * self.numel
+            cs = contiguous_strides(self.shape)
+            for k, oi in enumerate(iter_indices(out.shape)):
+                pos, j = 0, 0
+                for start, step, s in zip(starts, steps, cs):
+                    i = start
+                    if step:  # a kept dim: walk it
+                        i += oi[j] * step
+                        j += 1
+                    pos += i * s
+                g[pos] += out.grad[k]  # back to where the view read it
+            self._accum(g)
+
+        out._backward = _backward
+        return out
+
+    @selftest(_slice)
+    def _(fn):
+        a = Tensor([[1, 2, 3], [4, 5, 6]])
+        r = fn(a, (1,))  # a[1]
+        assert (r.tolist(), r.shape, r.strides, r.offset) == ([4, 5, 6], (3,), (1,), 3)
+        assert r.data is a.data  # a view: only metadata changed
+        assert (r._op, r._parents) == ("slice", (a,))
+
+        c = fn(a, (slice(None), -1))  # a[:, -1]
+        assert (c.tolist(), c.strides, c.offset) == ([3, 6], (3,), 2)
+        e = fn(a, (slice(None), slice(None, None, 2)))  # a[:, ::2]
+        assert (e.tolist(), e.strides) == ([[1, 3], [4, 6]], (3, 2))
+        assert (fn(a, (0, 1)).shape, fn(a, (0, 1)).tolist()) == ((), 2)  # a[0, 1]
+        assert fn(r, (slice(1, None),)).tolist() == [5, 6]  # offsets add up
+        assert fn(a.T, (0,)).tolist() == [1, 4]  # a view of a view
+        assert fn(a, (slice(5, 9),)).shape == (0, 3)  # clamped, empty
+
+        b = Tensor([[1, 2, 3], [4, 5, 6]])
+        s = fn(b, (slice(None), slice(1, None)))  # b[:, 1:]
+        s.grad = [10, 20, 30, 40]
+        s._backward()
+        assert b.grad == [0, 10, 20, 0, 30, 40]  # back into the positions it read
+
+        b = Tensor([[1, 2, 3], [4, 5, 6]])
+        s = fn(b, (1,))  # an int drops the dim
+        s.grad = [7, 8, 9]
+        s._backward()
+        assert b.grad == [0, 0, 0, 7, 8, 9]
+
+        check_raises(IndexError, lambda: fn(a, (2,)))
+        check_raises(AssertionError, lambda: fn(a, (0, 0, 0)))  # too many indices
+        check_raises(AssertionError, lambda: fn(a, (slice(None, None, -1),)))
+        check_raises(TypeError, lambda: fn(a, ("x",)))
+
+    def __getitem__(self, key: Key) -> Tensor:
+        if isinstance(key, (int, slice)):
+            return self._slice((key,))  # basic indexing: a view
+        if isinstance(key, tuple):
+            return self._slice(key)
+        ids = Tensor(key) if isinstance(key, list) else key  # ids: a copy
         if not isinstance(ids, Tensor):
-            raise TypeError(f"index with a Tensor of int ids, got {type(ids).__name__}")
+            raise TypeError(f"cannot index with {type(ids).__name__}")
         assert len(self.shape) >= 1, "cannot index a 0-d tensor"
         rows = self.shape[0]
         row = prod(self.shape[1:])  # elements per row
         idx: list[int] = []
         for i in ids.flat():
-            assert isinstance(i, int) and 0 <= i < rows, f"id {i} out of range {rows}"
-            idx.append(i)
+            assert isinstance(i, int), f"ids must be ints, got {i!r}"
+            if not -rows <= i < rows:
+                raise IndexError(f"id {i} out of range {rows}")
+            idx.append(i % rows)  # -1 -> rows - 1
         flat = self.flat()
         data: list[Scalar] = []
         for i in idx:
@@ -846,9 +979,15 @@ class Tensor:
             3, 4,  # row 2 <- picked once
         ]  # fmt: skip
 
-        e = check_raises(AssertionError, lambda: fn(w, Tensor([3])))
+        e = check_raises(IndexError, lambda: fn(w, Tensor([3])))
         assert "out of range" in str(e)
-        check_raises(TypeError, lambda: w[0])  # plain ints are not supported
+        assert fn(w, Tensor([-1])).tolist() == [[5, 6]]  # negative ids wrap
+        assert fn(w, [2, 0]).tolist() == [[5, 6], [1, 2]]  # a list is ids too
+
+        assert fn(w, 1).data is w.data  # an int or slice is a view, not a copy
+        assert fn(w, (slice(None), 0)).tolist() == [1, 3, 5]  # w[:, 0]
+        assert [r.tolist() for r in w] == [[1, 2], [3, 4], [5, 6]]  # w[0], w[1], ...
+        check_raises(TypeError, lambda: fn(w, "a"))
 
     def __matmul__(self, other: Tensor) -> Tensor:
         assert len(self.shape) >= 2 and len(other.shape) >= 2
