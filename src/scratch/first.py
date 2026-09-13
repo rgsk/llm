@@ -949,6 +949,73 @@ class Tensor:
         assert str(a) == repr(a) == fn(a)  # str falls back to __repr__
 
 
+def cat(tensors: list[Tensor], dim: int = 0) -> Tensor:
+    assert tensors, "cat needs at least one tensor"
+    first = tensors[0]
+    nd = len(first.shape)
+    assert -nd <= dim < nd, f"dim {dim} out of range for {first.shape}"
+    dim %= nd
+    rest = first.shape[:dim] + first.shape[dim + 1 :]
+    for t in tensors[1:]:
+        same = t.shape[:dim] + t.shape[dim + 1 :] == rest
+        assert len(t.shape) == nd and same, (
+            f"cannot cat {first.shape} with {t.shape} on dim {dim}"
+        )
+
+    outer = prod(first.shape[:dim])
+    inner = prod(first.shape[dim + 1 :])
+    sizes = [t.shape[dim] * inner for t in tensors]  # block size per tensor
+    flats = [t.flat() for t in tensors]
+    data: list[Scalar] = []
+    for o in range(outer):
+        for flat, sz in zip(flats, sizes):
+            data += flat[o * sz : (o + 1) * sz]
+    size = sum(t.shape[dim] for t in tensors)
+    shape = first.shape[:dim] + (size,) + first.shape[dim + 1 :]
+    out = Tensor(data, shape, _parents=tuple(tensors), _op="cat")
+
+    def _backward() -> None:
+        assert out.grad is not None
+        grads: list[Grad] = [[] for _ in tensors]
+        pos = 0
+        for _ in range(outer):
+            for g, sz in zip(grads, sizes):
+                g += out.grad[pos : pos + sz]  # cut the grad into the same blocks
+                pos += sz
+        for t, g in zip(tensors, grads):
+            t._accum(g)
+
+    out._backward = _backward
+    return out
+
+
+@selftest(cat)
+def _(fn):
+    a = Tensor([[1.0, 2.0], [3.0, 4.0]])
+    b = Tensor([[5.0, 6.0]])
+    c = Tensor([[7.0], [8.0]])
+    assert fn([a, b], 0).tolist() == [[1, 2], [3, 4], [5, 6]]  # rows stacked
+    assert (
+        fn([a, c], 1).tolist() == fn([a, c], -1).tolist() == [[1, 2, 7], [3, 4, 8]]
+    )  # columns side by side
+    assert fn([a, c], -1).shape == (2, 3)
+    assert fn([a.T, a], 0).tolist() == [[1, 3], [2, 4], [1, 2], [3, 4]]  # a view
+    assert (fn([a, c], 1)._op, fn([a, c], 1)._parents) == ("cat", (a, c))
+
+    out = fn([a, c], 1)
+    out.grad = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]
+    out._backward()
+    assert a.grad == [1.0, 2.0, 4.0, 5.0]  # each input gets back its own slots
+    assert c.grad == [3.0, 6.0]
+
+    d = Tensor([1.0, 2.0])
+    fn([d, d]).backward()
+    assert d.grad == [2.0, 2.0]  # the same tensor twice: both blocks accumulate
+
+    e = check_raises(AssertionError, lambda: fn([a, c], 0))
+    assert "cannot cat" in str(e)
+
+
 def label_locals(scope: dict[str, Any]) -> None:
     """name every still-unnamed Tensor in `scope` after the variable holding it"""
     for name, v in scope.items():

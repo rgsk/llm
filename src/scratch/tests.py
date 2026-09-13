@@ -8,6 +8,7 @@ from first import (
     Shape,
     Tensor,
     broadcast_shape,
+    cat,
     contiguous_strides,
     flatten,
     infer_shape,
@@ -789,6 +790,43 @@ def t20():
     assert z.grad == [math.exp(1), math.exp(2), 0.0]
 
 
+def t21():
+    cat.test()
+    random.seed(0)
+
+    # two heads of size 2 side by side -> one (B, T, 4)
+    h1 = Tensor([[[1, 2], [3, 4]]], label="h1")
+    h2 = Tensor([[[5, 6], [7, 8]]], label="h2")
+    o = cat([h1, h2], -1)
+    assert o.tolist() == [[[1, 2, 5, 6], [3, 4, 7, 8]]]
+    assert trace(o) == [
+        "0 h1 (1, 2, 2)",
+        "1 h2 (1, 2, 2)",
+        "2 cat (1, 2, 4) <- h1, h2",
+    ]
+
+    (o * Tensor(o.data, o.shape)).sum().backward()
+    assert h1.grad == [1, 2, 3, 4]
+    assert h2.grad == [5, 6, 7, 8]
+
+    for shapes, dim, res_shape in [
+        (((2, 3), (4, 3)), 0, (6, 3)),
+        (((2, 3, 4), (2, 1, 4), (2, 2, 4)), 1, (2, 6, 4)),
+        (((2, 3, 1), (2, 3, 5)), -1, (2, 3, 6)),
+    ]:
+        cts = [rnd(s) for s in shapes]
+        o = cat(cts, dim)
+        assert o.shape == res_shape
+        w = rnd(o.shape)
+        (o * w).sum().backward()
+
+        tts = [tg(t) for t in cts]
+        to = torch.cat(tts, dim)
+        assert torch.allclose(tt(o), to.detach())
+        (to * tt(w)).sum().backward()
+        assert all(close(t.grad, r) for t, r in zip(cts, tts))
+
+
 def tests():
     run_tests(first)
     t1()
@@ -811,6 +849,7 @@ def tests():
     t18()
     t19()
     t20()
+    t21()
     print("✅ ok")
 
 
