@@ -1,6 +1,8 @@
 """Weights & Biases behind one small object, so the training loop never has to
 ask whether anything is being recorded."""
 
+from pathlib import Path
+
 from checkpoint import timestamp
 
 import wandb
@@ -18,6 +20,7 @@ class Run:
         enabled: bool = True,
     ) -> None:
         self.enabled = enabled
+        self.base = name  # artifact name: every run of "big" versions one artifact
         self.name = f"{name}_{timestamp()}"
         if enabled:
             wandb.init(
@@ -36,6 +39,14 @@ class Run:
         """Single numbers for the run as a whole -- what the runs table sorts on."""
         if self.enabled:
             wandb.summary.update(kw)
+
+    def log_checkpoint(self, path: Path) -> None:
+        """Upload a file as a model artifact, so it outlives the machine that wrote
+        it. finish() blocks until the upload is done."""
+        if self.enabled:
+            art = wandb.Artifact(self.base, type="model")
+            art.add_file(str(path))
+            wandb.log_artifact(art)
 
     def finish(self) -> None:
         if self.enabled:
@@ -70,6 +81,13 @@ if __name__ == "__main__":
         assert wandb.summary["total_time_s"] == 12.5
         # "step" was stripped from every row: it is the axis, not a metric
         assert "step" not in wandb.summary.keys()
+        # a checkpoint goes up as a model artifact named after the run's base name
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as d:
+            f = Path(d) / "test.pt"
+            f.write_bytes(b"weights")
+            run.log_checkpoint(f)
 
     # 3. the context manager closed it
     assert wandb.run is None

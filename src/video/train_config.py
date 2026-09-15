@@ -18,6 +18,7 @@ class TrainConfig:
     seed: int = 1337
     name: str = "video"
     use_wandb: bool = False
+    upload_ckpt: bool = False  # best checkpoint -> wandb artifact at the end; needs use_wandb
 
 
 small_train = TrainConfig(

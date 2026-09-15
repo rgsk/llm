@@ -173,6 +173,12 @@ def train(
 
     evaluate(cfg.max_steps, opt.lr)  # final model, after every update
 
+    if cfg.upload_ckpt and ckpt_path is not None and ckpt_path.exists():
+        run.log_checkpoint(ckpt_path)  # the best one, not necessarily the last
+
+    if cfg.upload_ckpt and ckpt_path is not None and ckpt_path.exists():
+        run.log_checkpoint(ckpt_path)  # the best one, not necessarily the last
+
     run.summary(
         best_val=best_val,
         total_time_s=time.perf_counter() - t0,

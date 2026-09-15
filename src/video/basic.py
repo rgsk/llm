@@ -2,7 +2,7 @@
 torch.nn, torch.nn.functional and torch.optim appear nowhere in the model path."""
 
 import sys
-from dataclasses import asdict
+from dataclasses import asdict, replace
 
 import torch
 from checkpoint import (
@@ -50,11 +50,20 @@ train_cfg = TrainConfig(
     name="scratch",
     use_compile=True,
 )
+train_cfg = replace(
+    big_train,
+    max_steps=250,
+    warmup_steps=20,
+    eval_interval=100,
+    eval_iters=20,
+    name="runpod",
+    upload_ckpt=True,
+)
 
 # train_cfg = big_train
 
 
-def sample(model: GPT, prompt: str = "\n", max_new_tokens: int = 300, **kw) -> str:
+def sample(model: GPT, prompt: str = "\n", max_new_tokens: int = 100, **kw) -> str:
     device = next(model.parameters()).device
     idx = torch.tensor([tok.encode(prompt)], device=device)
     out = generate(model, idx, max_new_tokens, **kw)
