@@ -5,6 +5,7 @@ from module import Module
 
 class ModuleList(Module):
     def __init__(self, modules: Iterable[Module] = ()):
+        super().__init__()
         self._n = 0
         for m in modules:
             self.append(m)
@@ -31,6 +32,7 @@ if __name__ == "__main__":
 
     class MyLin(Module):
         def __init__(self, i, o):
+            super().__init__()
             self.w = Parameter(torch.randn(o, i))
             self.b = Parameter(torch.zeros(o))
 
@@ -48,6 +50,7 @@ if __name__ == "__main__":
 
     class Net(Module):
         def __init__(self):
+            super().__init__()
             self.layers = ModuleList([MyLin(4, 8), MyLin(8, 8)])
             self.head = MyLin(8, 2)
 

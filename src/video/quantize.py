@@ -107,15 +107,19 @@ class QuantizedLinear(Module):
     """
 
     def __init__(self, linear: Linear, dim: int | None = -1, bits: int = 8, qs=None):
+        super().__init__()
         self.in_features = linear.in_features
         self.out_features = linear.out_features
         self.bits = bits
         q, scale = qs or quantize_packed(linear.weight.data, dim, bits)
         self.register_buffer("qweight", q)
         self.register_buffer("scale", scale)
-        self.bias = None
+        # nn.Module.register_buffer refuses a name that already exists, so
+        # `bias` gets set on one path or the other, never both
         if linear.bias is not None:
             self.register_buffer("bias", linear.bias.data.clone())
+        else:
+            self.bias = None
 
     def forward(self, x: Tensor) -> Tensor:
         # the whole matrix is reconstructed every call: this saves memory at
@@ -138,6 +142,7 @@ class QuantizedEmbedding(Module):
     def __init__(
         self, embedding: Embedding, dim: int | None = -1, bits: int = 8, qs=None
     ):
+        super().__init__()
         self.num_embeddings = embedding.num_embeddings
         self.embedding_dim = embedding.embedding_dim
         self.bits = bits
@@ -164,7 +169,7 @@ def quantizable(model: Module) -> list[str]:
     found: list[str] = []
 
     def walk(m: Module, prefix: str) -> None:
-        for name, child in m.__dict__.items():
+        for name, child in m.named_children():
             if not isinstance(child, Module):
                 continue
             path = f"{prefix}{name}"
@@ -213,7 +218,7 @@ def quantize_model(
         return shared[key]
 
     def walk(m: Module, prefix: str) -> None:
-        for name, child in list(m.__dict__.items()):
+        for name, child in list(m.named_children()):
             if not isinstance(child, Module):
                 continue
             path = f"{prefix}{name}"

@@ -106,6 +106,7 @@ class Block(Module):
         window: int | None = None,
         ring: bool = False,
     ):
+        super().__init__()
         self.ln1 = make_norm(norm, n_embed)
         self.ln2 = make_norm(norm, n_embed)
         self.attn = make_attention(

@@ -14,6 +14,8 @@ from dataclasses import asdict
 from pathlib import Path
 
 import torch
+from torch import Tensor
+
 from checkpoint import load_checkpoint
 from embedding import Embedding
 from gpt import GPT
@@ -22,7 +24,6 @@ from linear import Linear
 from module import Module
 from parameter import Parameter
 from quantize import QuantizedEmbedding, QuantizedLinear, quantize_model
-from torch import Tensor
 
 
 def parent_of(model: Module, path: str) -> tuple[Module, str]:
@@ -45,7 +46,7 @@ def quant_plan(model: Module) -> dict[str, int]:
     plan: dict[str, int] = {}
 
     def walk(m: Module, prefix: str) -> None:
-        for name, child in m.__dict__.items():
+        for name, child in m.named_children():
             if not isinstance(child, Module):
                 continue
             path = f"{prefix}{name}"
@@ -121,12 +122,14 @@ def assign_state_dict(model: Module, sd: dict[str, Tensor], device: str) -> None
     object again instead of two views.
     """
     own = dict(model.named_parameters(remove_duplicate=False))
+    # persistent buffers are the ones state_dict() carries; nn.Module has no
+    # persistent_only, and its non-persistent set is private
+    persistent = set(model.state_dict())
     own.update(
         {
             n: b
-            for n, b in model.named_buffers(
-                remove_duplicate=False, persistent_only=True
-            )
+            for n, b in model.named_buffers(remove_duplicate=False)
+            if n in persistent
         }
     )
     assert not (missing := own.keys() - sd.keys()), f"missing: {sorted(missing)}"
@@ -270,12 +273,14 @@ if __name__ == "__main__":
         # tensors with the pair unshared: the file grows by what the tie saved.
         # (the toy model is too small to read this off the total -- zip record
         # overhead is 16% of it, which is why the claim is a difference)
+        # loose on purpose: the tie saves ~1.02x dup under OurModule, ~0.83x
+        # under nn.Module (more zip records). A lost tie would save nothing.
         unshared = dict(m.state_dict())
         for k in ("lm_head.qweight", "lm_head.scale"):
             unshared[k] = unshared[k].clone()
         torch.save(m.state_dict(), tied_path := d / "tied.pt")
         torch.save(unshared, untied_path := d / "untied.pt")
-        assert untied_path.stat().st_size - tied_path.stat().st_size > 0.9 * dup
+        assert untied_path.stat().st_size - tied_path.stat().st_size > 0.75 * dup
         print(
             f"toy model: fp32 {fp32_path.stat().st_size / 2**10:.0f} KB -> "
             f"int8 {path.stat().st_size / 2**10:.0f} KB "

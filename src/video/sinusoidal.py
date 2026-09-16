@@ -36,6 +36,7 @@ class SinusoidalEmbedding(Module):
     """
 
     def __init__(self, block_size: int, n_embed: int):
+        super().__init__()
         assert n_embed % 2 == 0, "n_embed must be even: the columns come in pairs"
         self.block_size = block_size
         self.n_embed = n_embed

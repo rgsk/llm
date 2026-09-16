@@ -15,6 +15,7 @@ class Dropout(Module):
     """
 
     def __init__(self, p: float = 0.5):
+        super().__init__()
         assert 0.0 <= p < 1.0, "p is the DROP probability; p=1 would zero everything"
         self.p = p
 
@@ -95,6 +96,7 @@ if __name__ == "__main__":
     #    is the ONLY thing that makes it behave differently at inference
     class Net(Module):
         def __init__(self):
+            super().__init__()
             self.drop = Dropout(0.5)
 
         def forward(self, x):
@@ -122,6 +124,7 @@ if __name__ == "__main__":
         """The same layer written with `>`."""
 
         def __init__(self, p):
+            super().__init__()
             self.p = p
 
         def forward(self, x):

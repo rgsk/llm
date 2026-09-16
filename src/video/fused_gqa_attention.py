@@ -56,6 +56,7 @@ class FusedGQAttention(Module):
         dropout: float = 0.0,
         n_kv_head: int | None = None,
     ):
+        super().__init__()
         assert n_embed % n_head == 0, "n_embed must divide by n_head"
         n_kv_head = n_head if n_kv_head is None else n_kv_head
         assert n_head % n_kv_head == 0, (

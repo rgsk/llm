@@ -24,6 +24,7 @@ class GatedFeedForward(Module):
     def __init__(self, n_embed: int, dropout: float = 0.0):
         # param-matched to the ReLU FFN: that has 2 * E * 4E weights, SwiGLU has
         # 3 * E * h, so h = 8E/3. Rounded to a multiple of 64 for GEMM shapes.
+        super().__init__()
         hidden = round(8 * n_embed / 3 / 64) * 64  # E=512 -> 1344
         self.gate_up = Linear(n_embed, 2 * hidden, bias=False)
         self.activation = SiLU()

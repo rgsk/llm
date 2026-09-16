@@ -6,6 +6,7 @@ from torch import Tensor
 
 class LayerNorm(Module):
     def __init__(self, normalized_shape: int, eps: float = 1e-5):
+        super().__init__()
         self.normalized_shape = normalized_shape
         self.eps = eps
         self.weight = Parameter(torch.ones(normalized_shape))

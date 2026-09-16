@@ -58,6 +58,7 @@ class SDPAttention(Module):
         use_rope: bool = False,
         window: int | None = None,
     ):
+        super().__init__()
         assert n_embed % n_head == 0, "n_embed must divide by n_head"
         assert window is None or window >= 1, "a window has to include the query itself"
         self.n_head = n_head

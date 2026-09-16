@@ -19,6 +19,7 @@ if __name__ == "__main__":
 
     class MyLin(Module):
         def __init__(self, i, o):
+            super().__init__()
             self.w = Parameter(torch.randn(o, i))
             self.b = Parameter(torch.zeros(o))
 

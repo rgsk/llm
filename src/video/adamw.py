@@ -152,6 +152,7 @@ if __name__ == "__main__":
     #    (1 - lr*wd) per step -- no adaptive scaling involved
     class One(Module):
         def __init__(self):
+            super().__init__()
             self.w = Parameter(torch.ones(3))
 
     o = One()

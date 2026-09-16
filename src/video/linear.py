@@ -1,13 +1,16 @@
 import math
+from typing import TYPE_CHECKING
 
 import torch
+from backend import USE_TORCH
 from module import Module
 from parameter import Parameter
-from torch import Tensor
+from torch import Tensor, nn
 
 
-class Linear(Module):
+class OurLinear(Module):
     def __init__(self, in_features: int, out_features: int, bias: bool = True):
+        super().__init__()
         self.in_features = in_features
         self.out_features = out_features
         # torch inits with kaiming_uniform_(a=sqrt(5)), which reduces to U(+-1/sqrt(fan_in))
@@ -28,12 +31,21 @@ class Linear(Module):
         return out
 
 
+# What every other file imports. Same layer either way -- same init, keys and
+# forward, asserted below. See backend.py.
+if TYPE_CHECKING:
+    Linear = nn.Linear  # same shape as module.py's export
+else:
+    Linear = nn.Linear if USE_TORCH else OurLinear
+
+
 if __name__ == "__main__":
-    from torch import nn
+    # OurLinear by name: under VIDEO_BACKEND=torch the alias IS nn.Linear, so
+    # asserts against `Linear` would compare torch to torch.
 
     # 1. same init, draw for draw, from the same seed
     torch.manual_seed(0)
-    mine = Linear(4, 8)
+    mine = OurLinear(4, 8)
     torch.manual_seed(0)
     ref = nn.Linear(4, 8)
     assert torch.equal(mine.weight, ref.weight)
@@ -41,7 +53,7 @@ if __name__ == "__main__":
     print("init matches exactly")
 
     # ...and the derivation is right: std of U(-b, b) is b/sqrt(3)
-    big = Linear(10000, 1).weight
+    big = OurLinear(10000, 1).weight
     assert abs(big.std().item() / (1 / math.sqrt(10000) / math.sqrt(3)) - 1) < 0.05
 
     # 2. same names and shapes
@@ -66,7 +78,7 @@ if __name__ == "__main__":
 
     # 5. bias=False: no bias key at all, matching torch
     torch.manual_seed(1)
-    nb = Linear(4, 8, bias=False)
+    nb = OurLinear(4, 8, bias=False)
     torch.manual_seed(1)
     nbref = nn.Linear(4, 8, bias=False)
     assert nb.bias is None and nbref.bias is None
@@ -75,4 +87,15 @@ if __name__ == "__main__":
     x = torch.randn(5, 4)
     assert (nb(x) - nbref(x)).abs().max() == 0
 
+    # 6. weights cross the boundary both ways: flipping VIDEO_BACKEND must not
+    #    strand a checkpoint on the wrong side of it
+    a, b = OurLinear(6, 3), nn.Linear(6, 3)
+    x = torch.randn(4, 6)
+    b.load_state_dict(a.state_dict())  # ours -> torch
+    assert (a(x) - b(x)).abs().max() == 0
+    c = OurLinear(6, 3)
+    c.load_state_dict(b.state_dict())  # torch -> ours
+    assert (c(x) - b(x)).abs().max() == 0
+
+    print(f"exported Linear -> {Linear.__module__}.{Linear.__name__}")
     print("ok")

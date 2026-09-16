@@ -1,11 +1,14 @@
 from collections.abc import Iterator
+from typing import TYPE_CHECKING
 
 import torch
+from torch import Tensor, nn
+
+from backend import USE_TORCH
 from parameter import Parameter
-from torch import Tensor
 
 
-class Module:
+class OurModule:
     training: bool = True
 
     def __call__(self, *args, **kwargs):
@@ -14,10 +17,18 @@ class Module:
     def forward(self, *args, **kwargs):
         raise NotImplementedError
 
-    def children(self) -> Iterator["Module"]:
+    def children(self) -> Iterator["OurModule"]:
         for v in self.__dict__.values():
-            if isinstance(v, Module):
+            if isinstance(v, OurModule):
                 yield v
+
+    def named_children(self) -> Iterator[tuple[str, "OurModule"]]:
+        """Immediate submodules with their names. Layer-swapping code needs the
+        name to setattr the replacement back; nn.Module keeps children in
+        _modules, so a __dict__ walk finds nothing there."""
+        for name, v in self.__dict__.items():
+            if isinstance(v, OurModule):
+                yield name, v
 
     def _walk(self, prefix: str = "") -> Iterator[tuple[str, Parameter]]:
         """Every Parameter under this module, with torch-style dotted names."""
@@ -25,7 +36,7 @@ class Module:
             path = f"{prefix}{name}"
             if isinstance(v, Parameter):
                 yield path, v
-            elif isinstance(v, Module):
+            elif isinstance(v, OurModule):
                 yield from v._walk(f"{path}.")
 
     def register_buffer(self, name: str, tensor: Tensor, persistent: bool = True):
@@ -46,7 +57,7 @@ class Module:
             path = f"{prefix}{name}"
             if name in registered:
                 yield path, v, registered[name]
-            elif isinstance(v, Module):
+            elif isinstance(v, OurModule):
                 yield from v._walk_buffers(f"{path}.")
 
     def named_buffers(self, prefix="", remove_duplicate=True, persistent_only=False):
@@ -75,16 +86,16 @@ class Module:
         for _, p in self.named_parameters():
             yield p
 
-    def train(self, mode: bool = True) -> "Module":
+    def train(self, mode: bool = True) -> "OurModule":
         self.training = mode
         for child in self.children():
             child.train(mode)
         return self
 
-    def eval(self) -> "Module":
+    def eval(self) -> "OurModule":
         return self.train(False)
 
-    def to(self, *args, **kwargs) -> "Module":
+    def to(self, *args, **kwargs) -> "OurModule":
         for p in self.parameters():
             p.data = p.data.to(*args, **kwargs)  # rebind in place: ties survive
 
@@ -139,29 +150,43 @@ class Module:
                     )
                 p.copy_(sd[name])
 
-    def apply(self, fn) -> "Module":
+    def apply(self, fn) -> "OurModule":
         for child in self.children():
             child.apply(fn)
         fn(self)  # children first, then self -- same order as torch
         return self
 
 
+# What every other file imports. Base and leaves must come from the same side:
+# OurModule finds children with isinstance(v, OurModule), so a torch leaf under
+# an OurModule parent is invisible to parameters() and apply().
+if TYPE_CHECKING:
+    Module = nn.Module  # a name bound to two classes is a variable, not a type
+else:
+    Module = nn.Module if USE_TORCH else OurModule
+
+
 if __name__ == "__main__":
+    # OurModule by name, not a `Module = OurModule` rebind: a second
+    # module-scope assignment makes the exported name a variable to pyright.
+
     import tempfile
     from pathlib import Path
 
     from torch import nn
 
-    class MyLin(Module):
+    class MyLin(OurModule):
         def __init__(self, i, o):
+            super().__init__()
             self.w = Parameter(torch.randn(o, i))
             self.b = Parameter(torch.zeros(o))
 
         def forward(self, x):
             return x @ self.w.T + self.b
 
-    class Net(Module):
+    class Net(OurModule):
         def __init__(self):
+            super().__init__()
             self.a = MyLin(4, 8)
             self.b = MyLin(8, 2)
 
@@ -194,8 +219,9 @@ if __name__ == "__main__":
     assert all(p.grad is None for p in net.parameters())
 
     # tied weight: one object, two names -- and to() keeps them tied
-    class Tied(Module):
+    class Tied(OurModule):
         def __init__(self):
+            super().__init__()
             self.a = MyLin(4, 4)
             self.b = MyLin(4, 4)
             self.b.w = self.a.w
@@ -257,8 +283,9 @@ if __name__ == "__main__":
         assert (fresh(x) - out_m).abs().max() == 0
 
     # tied: deduped in named_parameters, both names in state_dict
-    class Tied(Module):
+    class Tied(OurModule):
         def __init__(self):
+            super().__init__()
             self.a = MyLin(4, 4)
             self.b = MyLin(4, 4)
             self.b.w = self.a.w
@@ -307,8 +334,9 @@ if __name__ == "__main__":
     assert all(p.dtype == torch.float64 for p in m64.parameters())
 
     # an untied model must stay untied after loading a tied checkpoint
-    class Two(Module):
+    class Two(OurModule):
         def __init__(self, tie: bool):
+            super().__init__()
             self.a = MyLin(4, 4)
             self.c = MyLin(4, 4)
             if tie:
@@ -319,8 +347,9 @@ if __name__ == "__main__":
     assert untied.a.w.data_ptr() != untied.c.w.data_ptr()
 
     # ---- buffers ----
-    class WithBuf(Module):
+    class WithBuf(OurModule):
         def __init__(self):
+            super().__init__()
             self.lin = MyLin(4, 4)
             self.register_buffer("tril", torch.ones(4, 4, dtype=torch.bool).tril())
             self.register_buffer("running", torch.zeros(4))

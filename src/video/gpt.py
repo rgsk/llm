@@ -57,6 +57,7 @@ class GPT(Module):
         window: int | None = None,
         ring: bool = False,
     ):
+        super().__init__()
         self.block_size = block_size
         self.n_layer = n_layer
         self.token_embedding_table = Embedding(vocab_size, n_embed)

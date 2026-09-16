@@ -80,6 +80,7 @@ class GQAttention(Module):
         window: int | None = None,
         ring: bool = False,
     ):
+        super().__init__()
         assert n_embed % n_head == 0, "n_embed must divide by n_head"
         assert window is None or window >= 1, "a window has to include the query itself"
         assert not ring or window is not None, (

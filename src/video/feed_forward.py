@@ -9,6 +9,7 @@ from torch import Tensor
 
 class FeedForward(Module):
     def __init__(self, n_embed: int, dropout: float = 0.0):
+        super().__init__()
         self.net = Sequential(
             Linear(n_embed, 4 * n_embed),
             ReLU(),

@@ -12,6 +12,7 @@ class Head(Module):
     def __init__(
         self, n_embed: int, head_size: int, block_size: int, dropout: float = 0.0
     ):
+        super().__init__()
         self.head_size = head_size
         self.query = Linear(n_embed, head_size, bias=False)
         self.key = Linear(n_embed, head_size, bias=False)
@@ -39,6 +40,7 @@ class MultiHeadAttention(Module):
     def __init__(
         self, n_embed: int, n_head: int, block_size: int, dropout: float = 0.0
     ):
+        super().__init__()
         assert n_embed % n_head == 0, "n_embed must divide by n_head"
         head_size = n_embed // n_head
         self.heads = ModuleList(

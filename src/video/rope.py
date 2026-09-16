@@ -90,6 +90,7 @@ class RopeAttention(Module):
     """
 
     def __init__(self, n_embed: int, n_head: int, block_size: int):
+        super().__init__()
         assert n_embed % n_head == 0, "n_embed must divide by n_head"
         self.n_head = n_head
         self.head_size = n_embed // n_head
@@ -151,6 +152,7 @@ class RopeKVAttention(Module):
     """
 
     def __init__(self, n_embed: int, n_head: int, base: float = 10000.0):
+        super().__init__()
         assert n_embed % n_head == 0, "n_embed must divide by n_head"
         self.n_head = n_head
         self.head_size = n_embed // n_head
