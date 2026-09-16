@@ -1,10 +1,11 @@
+from torch import Tensor
+
 from dropout import Dropout
 from linear import Linear
 from module import Module
 from relu import ReLU
 from residual_proj import ResidualProj
 from sequential import Sequential
-from torch import Tensor
 
 
 class FeedForward(Module):

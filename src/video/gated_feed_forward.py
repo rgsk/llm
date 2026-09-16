@@ -1,9 +1,10 @@
+from torch import Tensor
+
 from dropout import Dropout
 from linear import Linear
 from module import Module
 from residual_proj import ResidualProj
 from silu import SiLU
-from torch import Tensor
 
 
 class GatedFeedForward(Module):
@@ -39,8 +40,9 @@ class GatedFeedForward(Module):
 if __name__ == "__main__":
     import torch
     import torch.nn.functional as F
-    from feed_forward import FeedForward
     from torch import nn
+
+    from feed_forward import FeedForward
 
     torch.manual_seed(0)
     B, T, E = 2, 8, 512

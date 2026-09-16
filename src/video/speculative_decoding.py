@@ -1,10 +1,11 @@
 import torch
+from torch import Tensor
+
 from generate import filter_min_p, filter_top_k, filter_top_p
 from gpt import GPT
 from kv_cache import KVCache
 from multinomial import multinomial
 from softmax import softmax
-from torch import Tensor
 
 
 def rollback(caches: list, pos: int) -> list:

@@ -1,8 +1,9 @@
 import math
 
 import torch
-from module import Module
 from torch import Tensor
+
+from module import Module
 
 
 class SinusoidalEmbedding(Module):

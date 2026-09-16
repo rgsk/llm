@@ -1,8 +1,9 @@
 import torch
+from torch import Tensor
+
 from gpt import GPT
 from multinomial import multinomial
 from softmax import softmax
-from torch import Tensor
 
 
 def filter_top_k(logits: Tensor, top_k: int) -> Tensor:

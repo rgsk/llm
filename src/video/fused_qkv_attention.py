@@ -1,11 +1,12 @@
 import torch
+from torch import Tensor
+
 from common import KVCache
 from dropout import Dropout
 from linear import Linear
 from module import Module
 from residual_proj import ResidualProj
 from softmax import softmax
-from torch import Tensor
 
 
 class FusedQKVAttention(Module):
@@ -103,8 +104,9 @@ if __name__ == "__main__":
     import time
 
     import torch.nn.functional as F
-    from multi_head_attention import MultiHeadAttention
     from torch import nn
+
+    from multi_head_attention import MultiHeadAttention
 
     torch.manual_seed(0)
     B, T, E, NH = 2, 8, 32, 4

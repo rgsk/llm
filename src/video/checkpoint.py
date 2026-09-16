@@ -3,6 +3,7 @@ from datetime import datetime
 from pathlib import Path
 
 import torch
+
 from gpt import GPT
 from gpt_config import GPTConfig
 from paths import CKPT_DIR

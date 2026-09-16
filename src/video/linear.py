@@ -2,10 +2,11 @@ import math
 from typing import TYPE_CHECKING
 
 import torch
+from torch import Tensor, nn
+
 from backend import USE_TORCH
 from module import Module
 from parameter import Parameter
-from torch import Tensor, nn
 
 
 class OurLinear(Module):

@@ -1,10 +1,11 @@
 import torch
 import torch.nn.functional as F
+from torch import Tensor
+
 from kv_cache import KVCache
 from linear import Linear
 from module import Module
 from residual_proj import ResidualProj
-from torch import Tensor
 
 
 def rope_inv_freq(head_size: int, base: float = 10000.0, device=None) -> Tensor:
@@ -217,9 +218,10 @@ class RopeKVAttention(Module):
 if __name__ == "__main__":
     import math
 
+    from torch import nn
+
     from fused_qkv_attention import FusedQKVAttention
     from sinusoidal import SinusoidalEmbedding
-    from torch import nn
 
     torch.manual_seed(0)
     B, T, E, NH = 2, 16, 32, 4

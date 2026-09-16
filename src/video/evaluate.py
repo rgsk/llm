@@ -1,6 +1,7 @@
 import math
 
 import torch
+
 from amp import autocast
 from cross_entropy import cross_entropy
 from dataset import BinDataset, get_batch, meta

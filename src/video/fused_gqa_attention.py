@@ -1,11 +1,12 @@
 import torch
+from torch import Tensor
+
 from common import KVCache
 from dropout import Dropout
 from linear import Linear
 from module import Module
 from residual_proj import ResidualProj
 from softmax import softmax
-from torch import Tensor
 
 
 class FusedGQAttention(Module):
