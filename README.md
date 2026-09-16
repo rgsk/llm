@@ -126,6 +126,49 @@ Note `block_size` now does double duty in `GQAttention`: it sizes the rope
 tables and selects the preallocated cache, so `use_rope=True` implies buffer
 mode. Harmless today; a separate flag if it ever stops being.
 
+**Attention sinks (rung 3).** `attention_sinks.py` — `SinkKVCache(RingKVCache)`
+pins the first `S` slots and rings the rest, capacity `S + window`. Wired into
+`GQAttention` as `sinks=S` and through `Block` / `GPT` / `GPTConfig`, gated to
+`ring=True` and `position="rope"`.
+
+Pinning is four lines. What it drags in is positions, which is the bend the
+roadmap parked this for. Once a run outlives `block_size` the rope table is
+exhausted, so a cached key is rotated by its **rank inside the cache** rather
+than by where its token sat in the text (StreamingLLM, Xiao et al. 2024). Keys
+can therefore no longer be rotated once on the way in — the rank changes every
+time something is evicted. **They go in unrotated and are rotated on the way
+out, the whole cache, every step.** That is rung 3's cost and it is the point:
+rungs 1–2 rotate one key per decode step, rung 3 rotates `S + W`.
+
+What that buys is the assert. `GPT.forward` capped a cached run at
+`T_past + T <= block_size`; for a streaming model it now caps only the chunk,
+because ranks never exceed capacity. `gpt.py` test 22 decodes 40 tokens through
+a `block_size` of 8, every layer still holding position 0, and `generate.py`
+generates 65 on a 16-row table. The same model without sinks asserts at token 9
+— and a sinkless *ring* cannot even be run that far under rope, because
+write-time rotation indexes the table by absolute position and step `block_size`
+finds the slice empty (`gqa_attention.py` test 13).
+
+Three things pinned by test, since none of them is obvious:
+
+- **Rung 3 is a no-op until something is evicted.** With fewer tokens than
+  `S + W`, ranks *are* absolute positions, so a sink layer is byte-for-byte a
+  plain rope layer. Without that, the oracle test below proves nothing.
+- **Re-indexing preserves distances inside the window and only lies about the
+  gap.** For a window key, rank distance == absolute distance exactly; for a
+  sink it is compressed, which is the same approximation the mask already made.
+- **The oracle.** A sink decode reproduces, to `1e-6`, a reference that keeps
+  every key, picks the visible set by hand and rotates by rank
+  (`attention_sinks.py` test 7 at cache level, `gqa_attention.py` test 13 at
+  layer level). That is what catches `q` and `k` being ranked differently, which
+  no shape check would.
+
+Not measured here, deliberately: the *quality* claim. An untrained model has no
+sink behaviour to lose, so "evicting position 0 wrecks perplexity" is the
+paper's result, not this file's — it needs a checkpoint, and belongs in a
+notebook. What is testable in the `.py` is the mechanism, and that is what the
+tests cover.
+
 **Online softmax.** `online_softmax.py` — the streaming `(m, l)` recurrence and
 a `flash_attention` built on it, tiled over both queries and keys. Closes the
 one place the series said *trust the kernel*: `sdpa_attention.py` measured the
@@ -427,33 +470,10 @@ KL control. It is the first thing in the series that can silently fail to learn.
   delivers the 4x. Probably not an episode.
 - **Chat templates and special tokens** — cheap, high payoff, pairs with SFT.
   The difference between a continuer and an assistant is mostly a format contract.
-- **Attention sinks (rung 3)** — sidestepped 2026-09-07 for quantization, not
-  abandoned. Rungs 1 and 2 shipped; the plan is kept verbatim below.
 - **MoE** — routing, top-k experts, load-balancing loss. Self-contained.
 - **An eval beyond val loss** — bpc is there; something task-shaped makes the SFT
   and RL episodes legible.
 - **YaRN / NTK context extension** — only as a RoPE sequel, if RoPE lands well.
-
-### Attention sinks (rung 3), parked
-
-Rungs 1 and 2 shipped — see *Sliding window* and *Ring buffer* above. Rung 3 is
-attention sinks: pin the first `S` slots, ring the rest. This is the
-rung that forces the bend — once generation runs past `block_size` the rope
-table is exhausted, and StreamingLLM's fix is to **re-index positions within the
-cache**, which needs keys stored *unrotated* and rotated at read time. Keep
-write-time rotation for rungs 1–2 and introduce read-time rotation as rung 3's
-lesson: rotating the whole window every step is the cost, and the cost is the
-point.
-
-Concretely, what rung 3 has to change: `RingKVCache` gains `S` pinned slots the
-cursor skips, so the wrap is over `slots[S:]` rather than all of them —
-`positions` already carries everything the mask needs, so that side is done.
-Then `GPT.forward`'s `T_past + T <= block_size` assert becomes the binding
-constraint, because it is the rope table, not the cache, that runs out. That is
-where write-time rotation has to give.
-
-Also unblocked and unrun: the reverse-string probe below. Do it before or after,
-but do not let it silently not happen.
 
 ## Skip
 

@@ -48,16 +48,26 @@ def generate(
     assert top_k is None or top_k > 0
     assert top_p is None or 0.0 <= top_p <= 1.0
     assert min_p is None or 0.0 <= min_p <= 1.0
-    if use_cache:
+    if use_cache and not model.streaming:
         # the uncached loop crops to the last block_size tokens and recomputes,
         # so it generates forever. the cached one cannot: cropping would throw
         # away keys it can never rebuild, and positions come from a table with
         # exactly block_size rows. so the whole run has to fit.
+        #
+        # unless the model streams -- sinks + a ring evict on their own terms
+        # and rotate by rank, so neither the cache nor the table runs out. the
+        # prompt still has to fit, because a prefill is one chunk.
         fed = idx.size(1) + max_new_tokens - 1  # the last token is never fed back
         assert fed <= model.block_size, (
             f"use_cache needs prompt+max_new_tokens-1 ({idx.size(1)}+"
             f"{max_new_tokens}-1={fed}) <= block_size ({model.block_size}). "
             f"Use use_cache=False to crop+recompute."
+        )
+
+    if use_cache and model.streaming:
+        assert idx.size(1) <= model.block_size, (
+            f"a streaming prefill is still one chunk: prompt {idx.size(1)} > "
+            f"block_size {model.block_size}"
         )
 
     was_training = model.training
@@ -184,6 +194,33 @@ if __name__ == "__main__":
         assert "block_size" in str(e)
     # the uncached path still runs well past block_size, by forgetting
     assert generate(cm, p5, 40, temperature=0.0).shape == (2, 45)
+
+    #    ...and so does the cached path, once the model streams: sinks + a ring
+    #    evict on their own terms and rope rows are ranks inside the cache, so
+    #    the ceiling above is not a fact about caching, it is a fact about
+    #    keeping every key and numbering it where it stood
+    sk = GPT(
+        vocab_size=64,
+        block_size=16,
+        n_embed=32,
+        n_head=4,
+        n_layer=2,
+        attention="gqa",
+        n_kv_head=2,
+        position="rope",
+        window=12,
+        ring=True,
+        sinks=4,
+    )
+    out = generate(sk, p5, 60, temperature=0.0, use_cache=True)
+    assert out.shape == (2, 65) and out.max() < 64  # 65 >> block_size 16
+    #    the prompt is still one chunk, and a chunk still has to fit the table
+    try:
+        generate(sk, torch.randint(0, 64, (2, 20)), 5, use_cache=True)
+        raise SystemExit("should have failed")
+    except AssertionError as e:
+        assert "one chunk" in str(e)
+    print(f"a streaming model generates {out.size(1)} tokens on a block_size 16 table")
 
     # 9. the two ways a cache can be stored, end to end. Same model, same
     #    weights, same tokens -- the only difference is whether each layer's

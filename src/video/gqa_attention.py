@@ -2,6 +2,7 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor
 
+from attention_sinks import SinkKVCache, sink_mask_from_positions
 from dropout import Dropout
 from kv_cache import KVCache
 from linear import Linear
@@ -9,7 +10,7 @@ from module import Module
 from residual_proj import ResidualProj
 from ring_kv_cache import RingKVCache
 from rope import apply_rope, rope_tables
-from sliding_window import sliding_window_mask, window_mask_from_positions
+from sliding_window import sliding_window_mask
 
 
 class GQAttention(Module):
@@ -67,6 +68,11 @@ class GQAttention(Module):
     query needs no mask AT ALL -- every slot the ring still holds is inside its
     window by construction -- so rung 2 takes back out of the decode path the
     mask rung 1 put into it.
+
+    sinks=S pins the first S slots (attention_sinks.py). The cache becomes a
+    SinkKVCache of capacity S + window, and rope moves from write time to read
+    time: keys go in unrotated and are rotated by their RANK in the cache on
+    every step, so the rope table bounds the cache rather than the run.
     """
 
     def __init__(
@@ -79,6 +85,7 @@ class GQAttention(Module):
         use_rope: bool = False,
         window: int | None = None,
         ring: bool = False,
+        sinks: int = 0,
     ):
         super().__init__()
         assert n_embed % n_head == 0, "n_embed must divide by n_head"
@@ -86,6 +93,8 @@ class GQAttention(Module):
         assert not ring or window is not None, (
             "a ring buffer's capacity IS the window, so ring=True needs one"
         )
+        assert sinks >= 0, "sinks counts pinned slots"
+        assert not sinks or ring, "sinks pin slots in a ring, so they need ring=True"
         n_kv_head = n_head if n_kv_head is None else n_kv_head
         assert n_head % n_kv_head == 0, (
             "n_kv_head must divide n_head: every kv head serves the same group size"
@@ -102,12 +111,20 @@ class GQAttention(Module):
         self.resid_dropout = Dropout(dropout)
         self.window = window
         self.ring = ring
+        self.sinks = sinks
         # only needed to size a preallocated cache. None keeps the old
         # grow-by-copying behaviour, which is what training uses anyway
         self.block_size = block_size
         self.use_rope = use_rope
         if use_rope:
             assert block_size is not None, "rope needs block_size to size its tables"
+            if sinks:
+                # read-time rotation indexes the table by rank, so it has to be
+                # as tall as the cache, not as tall as the run
+                assert window is not None and sinks + window <= block_size, (
+                    f"sinks + window ({sinks} + {window}) must fit block_size "
+                    f"{block_size}"
+                )
             cos, sin = rope_tables(block_size, self.head_size)
             self.register_buffer("rope_cos", cos, persistent=False)
             self.register_buffer("rope_sin", sin, persistent=False)
@@ -131,7 +148,10 @@ class GQAttention(Module):
         # counting tokens past its capacity, so this stays the absolute position
         # of the first new token however many times the buffer has been round
         T_past = 0 if kv_cache is None else kv_cache.pos
-        if self.use_rope:
+        # a sink cache re-indexes its keys, so the position to rotate them by is
+        # not known until after the append. they go in raw; see below
+        read_time_rope = self.sinks > 0 and (use_cache or kv_cache is not None)
+        if self.use_rope and not read_time_rope:
             # q is [B, nh, T, hs] and k is [B, nkv, T, hs], and the rotation
             # does not care: it acts on (T, hs) and broadcasts over whatever
             # head axis it is handed. grouping is a fact about heads, rotation
@@ -147,7 +167,11 @@ class GQAttention(Module):
             # head_size; B, device and dtype come from the data on first write.
             # capacity is block_size, and without one this falls back to the
             # tuple's grow-by-copying
-            if self.ring:
+            if self.sinks:
+                # capacity is the window PLUS the pinned slots
+                cap = self.sinks + self.window
+                kv_cache = SinkKVCache((B, nkv, cap, hs), self.sinks)
+            elif self.ring:
                 # capacity is the WINDOW, not block_size: the cache stops
                 # sizing itself to the run and starts sizing itself to what the
                 # mask can still reach
@@ -160,6 +184,17 @@ class GQAttention(Module):
         if kv_cache is not None:
             # the NARROW k and v go in -- [B, nkv, T_kv, hs], n_rep smaller
             k, v = kv_cache.append(k, v)
+
+        if self.use_rope and read_time_rope:
+            # the whole attend set, rotated by rank rather than by where its
+            # tokens actually sat. this is the work rungs 1-2 did once per key
+            q_rows, k_rows = kv_cache.read_positions(T)
+            assert int(k_rows.max()) < self.rope_cos.size(0), (
+                "read-time rope indexes the table by rank, so the attend set "
+                f"({k_rows.size(0)}) has to fit block_size {self.rope_cos.size(0)}"
+            )
+            q = apply_rope(q, self.rope_cos[q_rows], self.rope_sin[q_rows])
+            k = apply_rope(k, self.rope_cos[k_rows], self.rope_sin[k_rows])
 
         T_kv = k.size(2)
         ring = isinstance(kv_cache, RingKVCache)
@@ -178,10 +213,11 @@ class GQAttention(Module):
             # nothing needs un-permuting: softmax is permutation-equivariant
             # over the key axis, and rope baked each key's position into it
             is_causal = False
-            attn_mask = window_mask_from_positions(
+            attn_mask = sink_mask_from_positions(
                 torch.arange(T_past, T_past + T, device=x.device),
                 kv_cache.key_positions,
                 self.window,
+                self.sinks,
             )
         else:
             # queries sit at T_past .. T_kv-1, and is_causal aligns top-left --
@@ -189,7 +225,15 @@ class GQAttention(Module):
             # is set. neither is a statement about heads, so grouping changes
             # nothing here: the mask broadcasts over the head axis either way
             is_causal = False
-            attn_mask = sliding_window_mask(T, T_kv, self.window, x.device)
+            if self.sinks:  # pinned columns stay visible from every query past them
+                attn_mask = sink_mask_from_positions(
+                    torch.arange(T_past, T_kv, device=x.device),
+                    torch.arange(T_kv, device=x.device),
+                    self.window,
+                    self.sinks,
+                )
+            else:
+                attn_mask = sliding_window_mask(T, T_kv, self.window, x.device)
 
         # k and v stay narrow. enable_gqa tells the kernel that q has n_rep
         # times more heads and to broadcast kv head g across the contiguous q
@@ -556,7 +600,94 @@ if __name__ == "__main__":
         f"kept cache {Nl}, identical logits"
     )
 
-    # 12. the payoff, measured on the real config: 8 layers, E=512, 8 heads,
+    # ------------------------------------------------------ attention sinks
+    # 12. rung 3 changes nothing until something is evicted: with S + W slots
+    #     and fewer tokens than that, ranks ARE absolute positions, so a sink
+    #     layer is a plain rope layer. If this drifts, test 13 is meaningless
+    S_, W_ = 2, 6
+    BSs = S_ + W_  # block_size is the size of the CACHE now, not of the run
+    Ns = 40  # ...and the run is five times the rope table
+    torch.manual_seed(3)
+    xs = torch.randn(B, Ns, E)
+    sink_m = GQAttention(
+        E, NH, 2, block_size=BSs, use_rope=True, window=W_, ring=True, sinks=S_
+    )
+    plain_m = GQAttention(E, NH, 2, block_size=BSs, use_rope=True)
+    plain_m.load_state_dict(sink_m.state_dict())  # same weights, same keys
+    with torch.no_grad():
+        cs = cp = None
+        for t in range(BSs):
+            a, cs = sink_m(xs[:, t : t + 1], cs, use_cache=True)
+            b, cp = plain_m(xs[:, t : t + 1], cp, use_cache=True)
+            assert (a - b).abs().max() < 1e-6, t
+    print(f"the first {BSs} tokens are a plain rope decode -- nothing evicted yet")
+
+    #     and the two mask paths agree. A chunk wider than the window builds its
+    #     mask from aranges when there is no cache and from the cache's
+    #     positions when there is one -- different code, same visible set, and
+    #     nothing is evicted mid-chunk so both rotate by absolute position
+    chunk = xs[:, :BSs]
+    with torch.no_grad():
+        prefill, _ = sink_m(chunk, None, use_cache=True)
+    assert (sink_m(chunk) - prefill).abs().max() < 1e-6
+    #     a sink column is what separates it from the plain window
+    win_only = GQAttention(E, NH, 2, block_size=BSs, use_rope=True, window=W_)
+    win_only.load_state_dict(sink_m.state_dict())
+    assert (win_only(chunk) - sink_m(chunk)).abs().max() > 1e-3
+
+    # 13. THE test: past the table, against an oracle that keeps every key and
+    #     re-indexes by hand. This is what catches q and k being rotated by
+    #     different rankings, which a shape check never would
+    def sink_oracle(t: int) -> Tensor:
+        q, k, v = sink_m.qkv(xs[:, : t + 1]).split([E, 2 * HS, 2 * HS], dim=-1)
+        q = q.view(B, t + 1, NH, HS).transpose(1, 2)[:, :, -1:]
+        k = k.view(B, t + 1, 2, HS).transpose(1, 2)
+        v = v.view(B, t + 1, 2, HS).transpose(1, 2)
+        vis = sorted(set(range(min(S_, t + 1))) | set(range(max(0, t + 1 - W_), t + 1)))
+        rank = torch.arange(len(vis))
+        kr = apply_rope(k[:, :, vis], sink_m.rope_cos[rank], sink_m.rope_sin[rank])
+        qr = apply_rope(q, sink_m.rope_cos[rank[-1:]], sink_m.rope_sin[rank[-1:]])
+        o = F.scaled_dot_product_attention(qr, kr, v[:, :, vis], enable_gqa=True)
+        return sink_m.proj(o.transpose(1, 2).reshape(B, 1, E))
+
+    with torch.no_grad():
+        cs = None
+        for t in range(Ns):
+            step, cs = sink_m(xs[:, t : t + 1], cs, use_cache=True)
+            assert (step - sink_oracle(t)).abs().max() < 1e-5, t
+            assert cs.k.size(2) == BSs  # flat, and it is the whole rope table
+    assert cs.pos == Ns and 0 in cs.key_positions.tolist()
+    print(f"{Ns} tokens decoded through a {BSs}-row rope table, position 0 still held")
+
+    #     the policy is not free: a sinkless ring of the same capacity drops
+    #     position 0 and answers differently. Note what it takes to run one this
+    #     far -- a block_size of Ns, because write-time rotation indexes the
+    #     table by absolute position and step BSs finds it empty
+    try:
+        rope_ring = GQAttention(
+            E, NH, 2, block_size=BSs, use_rope=True, window=BSs, ring=True
+        )
+        with torch.no_grad():
+            c_bad = None
+            for t in range(Ns):
+                _, c_bad = rope_ring(xs[:, t : t + 1], c_bad, use_cache=True)
+        raise SystemExit("should have run out of rope table")
+    except RuntimeError as e:
+        assert "size" in str(e)
+
+    ring_s = GQAttention(E, NH, 2, block_size=Ns, use_rope=True, window=BSs, ring=True)
+    ring_s.load_state_dict(sink_m.state_dict())  # rope tables are not state
+    with torch.no_grad():
+        cr2 = None
+        for t in range(Ns):
+            no_sink, cr2 = ring_s(xs[:, t : t + 1], cr2, use_cache=True)
+    assert 0 not in cr2.key_positions.tolist()
+    assert (no_sink - step).abs().max() > 1e-3
+    print(
+        f"a sinkless ring needs a {Ns}-row table to get here, and answers differently"
+    )
+
+    # 14. the payoff, measured on the real config: 8 layers, E=512, 8 heads,
     #    a full 512-token context. cache bytes are counted off the tensors the
     #    layer actually handed back, then multiplied by n_layer
     n_layer, Tb, Eb, nhb = 8, 512, 512, 8
@@ -579,7 +710,7 @@ if __name__ == "__main__":
         )
         assert total == 2 * n_layer * 1 * Tb * nkv * (Eb // nhb) * 2
 
-    # 13. ...and why anyone bothered, at a size this repo will not run. the same
+    # 15. ...and why anyone bothered, at a size this repo will not run. the same
     #    arithmetic on Llama-2-70B's geometry, for ONE sequence
     L, NHL, HSL, CTX = 80, 64, 128, 4096
 

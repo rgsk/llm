@@ -22,6 +22,7 @@ class GPTConfig:
     position: Position = "learned"
     window: int | None = None  # sliding window; None attends to the whole past
     ring: bool = False  # evict past the window instead of keeping everything
+    sinks: int = 0  # ring slots pinned against eviction; needs rope
 
     def __post_init__(self):
         assert self.n_embed % self.n_head == 0, "n_embed must divide by n_head"
@@ -50,6 +51,18 @@ class GPTConfig:
             # window, so there is no ring without one
             assert self.attention == "gqa", "ring needs attention='gqa'"
             assert self.window is not None, "a ring buffer's capacity IS the window"
+        if self.sinks:
+            # pinning slots only means something in a cache that evicts, and the
+            # rank re-indexing that lets a run outlive block_size is a rope
+            # operation -- a learned table has no rows past block_size to re-use
+            assert self.ring, "sinks pin ring slots, so they need ring=True"
+            assert self.position == "rope", (
+                "sinks re-index positions inside the cache, which needs position='rope'"
+            )
+            assert self.sinks + self.window <= self.block_size, (
+                f"sinks + window ({self.sinks} + {self.window}) is the cache, and "
+                f"read-time rope indexes a block_size {self.block_size} table by rank"
+            )
         if self.n_kv_head is not None:
             assert self.attention == "gqa", "n_kv_head needs attention='gqa'"
             assert self.n_head % self.n_kv_head == 0, (
@@ -156,6 +169,37 @@ if __name__ == "__main__":
     for bad, msg in [
         ({"window": 8}, "attention='sdpa'"),  # default attention is mha
         ({"attention": "sdpa", "window": 0}, "include the query"),
+    ]:
+        try:
+            replace(small_cfg, **bad)
+            raise SystemExit(f"should have failed: {bad}")
+        except AssertionError as e:
+            assert msg in str(e), (bad, str(e))
+
+    # 3d. sinks are the third, and the narrowest: they pin slots in a ring, and
+    #     the re-indexing that makes them worth having is rope's
+    assert (
+        replace(
+            small_cfg, attention="gqa", position="rope", window=8, ring=True, sinks=2
+        ).sinks
+        == 2
+    )
+    for bad, msg in [
+        ({"sinks": 2}, "ring=True"),  # no ring to pin anything in
+        (
+            {"attention": "gqa", "window": 8, "ring": True, "sinks": 2},
+            "position='rope'",
+        ),
+        (
+            {
+                "attention": "gqa",
+                "position": "rope",
+                "window": 31,
+                "ring": True,
+                "sinks": 2,
+            },
+            "by rank",  # 2 + 31 > block_size 32
+        ),
     ]:
         try:
             replace(small_cfg, **bad)

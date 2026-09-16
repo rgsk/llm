@@ -28,6 +28,7 @@ def make_attention(
     use_rope: bool = False,
     window: int | None = None,
     ring: bool = False,
+    sinks: int = 0,
 ) -> Module:
     """All four write the same residual stream; only "mha" has different keys.
 
@@ -50,6 +51,8 @@ def make_attention(
     # ring is narrower still: "sdpa" grows its cache by concatenation and never
     # held a KVCache to wrap, so only "gqa" can evict
     assert not ring or kind == "gqa", f"ring needs attention='gqa', not {kind!r}"
+    # and sinks are a policy about which of a ring's slots never get evicted
+    assert not sinks or ring, f"sinks need ring=True, not ring={ring!r}"
     match kind:
         case "mha":
             return MultiHeadAttention(n_embed, n_head, block_size, dropout)
@@ -63,7 +66,15 @@ def make_attention(
             # block_size is passed for the cache buffer, not for a mask: this is
             # the only attention that preallocates instead of growing by copying
             return GQAttention(
-                n_embed, n_head, n_kv_head, dropout, block_size, use_rope, window, ring
+                n_embed,
+                n_head,
+                n_kv_head,
+                dropout,
+                block_size,
+                use_rope,
+                window,
+                ring,
+                sinks,
             )
         case _:
             raise ValueError(f"unknown attention: {kind}")
@@ -105,6 +116,7 @@ class Block(Module):
         use_rope: bool = False,
         window: int | None = None,
         ring: bool = False,
+        sinks: int = 0,
     ):
         super().__init__()
         self.ln1 = make_norm(norm, n_embed)
@@ -119,6 +131,7 @@ class Block(Module):
             use_rope,
             window,
             ring,
+            sinks,
         )
         self.ffwd = make_ffwd(ffn, n_embed, dropout)
 

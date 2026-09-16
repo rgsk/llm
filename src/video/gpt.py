@@ -56,10 +56,14 @@ class GPT(Module):
         n_kv_head: int | None = None,
         window: int | None = None,
         ring: bool = False,
+        sinks: int = 0,
     ):
         super().__init__()
         self.block_size = block_size
         self.n_layer = n_layer
+        # with pinned sinks under rope the caches re-index their own positions,
+        # so block_size stops bounding the run and bounds only the chunk
+        self.streaming = sinks > 0 and position == "rope"
         self.token_embedding_table = Embedding(vocab_size, n_embed)
         # kept under the old name: "learned" writes the same state_dict key it
         # always did, so existing checkpoints load untouched. "sinusoidal"
@@ -79,6 +83,7 @@ class GPT(Module):
                     position == "rope",
                     window,
                     ring,
+                    sinks,
                 )
                 for _ in range(n_layer)
             ]
@@ -122,6 +127,10 @@ class GPT(Module):
         With position="rope" there is nothing to add here at all; the attention
         layers do the same T_past arithmetic on their own tables instead.
 
+        And with sinks it is block_size itself that gives. A sink cache rotates
+        its keys by their rank inside it, so the rope table bounds the cache,
+        not the run -- what still has to fit is the chunk being fed.
+
         T_past used to be read off the cache's width, which was the same number
         right up until a cache learned to evict. A ring's width saturates at its
         capacity while the sequence keeps going, so ask it for `pos` -- the
@@ -131,8 +140,9 @@ class GPT(Module):
         _, T = idx.shape
         past = None if kv_caches is None else kv_caches[0]
         T_past = 0 if past is None else getattr(past, "pos", past[0].size(2))
-        assert T_past + T <= self.block_size, (
-            f"sequence of {T_past + T} > block_size {self.block_size}"
+        span = T if self.streaming else T_past + T
+        assert span <= self.block_size, (
+            f"sequence of {span} > block_size {self.block_size}"
         )
         x = self.token_embedding_table(idx)
         if self.position_embedding_table is not None:
@@ -499,6 +509,69 @@ if __name__ == "__main__":
         raise SystemExit("should have failed")
     except AssertionError as e:
         assert "capacity IS the window" in str(e)
+
+    # ----------------------------------------------------- attention sinks
+    # 22. rung 3, end to end, and the claim is the one GPT.forward's assert used
+    #     to forbid: decode further than block_size. The cache is S + W wide,
+    #     rope rows are ranks inside it, and neither runs out
+    Sk, Wk, BSk = 2, 6, 8  # block_size IS the cache now
+    sm = GPT(
+        V,
+        BSk,
+        E,
+        NH,
+        NL,
+        attention="gqa",
+        n_kv_head=2,
+        position="rope",
+        window=Wk,
+        ring=True,
+        sinks=Sk,
+    )
+    assert sm.streaming
+    long_idx = torch.randint(0, V, (B, 5 * BSk))
+    with torch.no_grad():
+        logits_s, caches_s = sm(long_idx[:, :1], use_cache=True)
+        for t in range(1, long_idx.size(1)):
+            logits_s, caches_s = sm(long_idx[:, t : t + 1], caches_s, use_cache=True)
+    assert caches_s[0].pos == long_idx.size(1) > sm.block_size
+    assert all(c.k.size(2) == Sk + Wk for c in caches_s)
+    assert all(0 in c.key_positions.tolist() for c in caches_s)  # sinks held
+    assert logits_s.shape == (B, 1, V) and logits_s.isfinite().all()
+    print(
+        f"sink GPT: {long_idx.size(1)} tokens decoded through block_size {BSk}, "
+        f"every layer holding position 0"
+    )
+
+    #     the same model without sinks cannot get there at all -- its assert is
+    #     the one rung 3 relaxes, and only for a model that re-indexes
+    nm = GPT(
+        V,
+        BSk,
+        E,
+        NH,
+        NL,
+        attention="gqa",
+        n_kv_head=2,
+        position="rope",
+        window=Wk,
+        ring=True,
+    )
+    assert not nm.streaming
+    with torch.no_grad():
+        _, cn = nm(long_idx[:, :BSk], use_cache=True)
+        try:
+            nm(long_idx[:, BSk : BSk + 1], cn, use_cache=True)
+            raise SystemExit("should have failed")
+        except AssertionError as e:
+            assert "block_size" in str(e)
+
+    #     and streaming is gated on rope: a learned table has no rows to re-use
+    try:
+        GPT(V, BSk, E, NH, NL, attention="gqa", window=Wk, sinks=Sk)
+        raise SystemExit("should have failed")
+    except AssertionError as e:
+        assert "ring" in str(e)
 
     # ---------------------------------------------------------------- KV cache
 
