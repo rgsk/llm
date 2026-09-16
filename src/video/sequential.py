@@ -1,7 +1,12 @@
-from module_list import ModuleList
+from typing import TYPE_CHECKING
+
+from torch import nn
+
+from backend import USE_TORCH
+from module_list import OurModuleList
 
 
-class Sequential(ModuleList):
+class OurSequential(OurModuleList):
     def __init__(self, *modules):
         super().__init__(modules)
 
@@ -11,11 +16,19 @@ class Sequential(ModuleList):
         return x
 
 
+if TYPE_CHECKING:
+    Sequential = nn.Sequential  # see backend.py
+else:
+    Sequential = nn.Sequential if USE_TORCH else OurSequential
+
+
 if __name__ == "__main__":
+    # OurSequential by name: under VIDEO_BACKEND=torch the alias is nn.Sequential
     import torch
+    from torch import nn
+
     from module import Module
     from parameter import Parameter
-    from torch import nn
 
     class MyLin(Module):
         def __init__(self, i, o):
@@ -35,7 +48,7 @@ if __name__ == "__main__":
         def forward(self, x):
             return x @ self.w.T + self.b
 
-    seq = Sequential(MyLin(4, 8), MyLin(8, 2))
+    seq = OurSequential(MyLin(4, 8), MyLin(8, 2))
     ref = nn.Sequential(RefLin(4, 8), RefLin(8, 2))
 
     assert seq.state_dict().keys() == ref.state_dict().keys()

@@ -1,8 +1,12 @@
+from typing import TYPE_CHECKING
+
+from torch import Tensor, nn
+
+from backend import USE_TORCH
 from module import Module
-from torch import Tensor
 
 
-class SiLU(Module):
+class OurSiLU(Module):
     """x * sigmoid(x), also called Swish.
 
     ReLU throws away everything below zero, and the gradient there is exactly 0:
@@ -15,14 +19,22 @@ class SiLU(Module):
         return x * x.sigmoid()
 
 
+if TYPE_CHECKING:
+    SiLU = nn.SiLU  # see backend.py
+else:
+    SiLU = nn.SiLU if USE_TORCH else OurSiLU
+
+
 if __name__ == "__main__":
+    # OurSiLU by name: under VIDEO_BACKEND=torch the alias is nn.SiLU
     import torch
-    from relu import ReLU
     from torch import nn
+
+    from relu import ReLU
 
     torch.manual_seed(0)
     x = torch.randn(4, 8, 32)
-    s = SiLU()
+    s = OurSiLU()
 
     # 1. matches torch, forward and backward. nn.SiLU is a fused kernel, so it
     #    rounds differently -- the gap is ~8 float32 ulps, not a disagreement

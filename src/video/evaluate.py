@@ -167,7 +167,8 @@ if __name__ == "__main__":
     # 2. full_loss is deterministic, and independent of batch_size
     assert full_loss(m, val, 64, BS, device=dev, max_windows=4000) == full
     b2 = full_loss(m, val, 32, BS, device=dev, max_windows=4000)
-    assert abs(full - b2) < 1e-6  # token-weighting is what makes this true
+    # token-weighting is what makes this true; torch's reduction lands ~2e-6 out
+    assert abs(full - b2) < 1e-5
 
     # 3. the model's mode is restored, and no gradients are built
     m.train()

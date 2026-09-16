@@ -164,9 +164,9 @@ if __name__ == "__main__":
 
         # 9. the resume payload rides along in **meta: optimizer moments and the
         #    position of the batch stream, back out of load_checkpoint untouched
-        from adamw import AdamW, decay_groups
+        from adamw import OurAdamW, decay_groups
 
-        opt = AdamW(decay_groups(model, 0.1), lr=1e-3)
+        opt = OurAdamW(decay_groups(model, 0.1), lr=1e-3)
         model(x).sum().backward()
         opt.step()
         gen = torch.Generator().manual_seed(1337)
@@ -178,7 +178,7 @@ if __name__ == "__main__":
         )
         loaded, meta = load_checkpoint(rpath)
 
-        opt2 = AdamW(decay_groups(loaded, 0.1), lr=1e-3)
+        opt2 = OurAdamW(decay_groups(loaded, 0.1), lr=1e-3)
         opt2.load_state_dict(meta["opt"])
         assert opt2.t == opt.t == 1
         assert len(opt2.state) == len(opt.state)

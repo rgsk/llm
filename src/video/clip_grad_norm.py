@@ -1,12 +1,15 @@
 from collections.abc import Iterable
+from typing import TYPE_CHECKING
 
 import torch
-from parameter import Parameter
 from torch import Tensor
+
+from backend import USE_TORCH
+from parameter import Parameter
 
 
 @torch.no_grad()
-def clip_grad_norm(params: Iterable[Parameter], max_norm: float) -> Tensor:
+def our_clip_grad_norm(params: Iterable[Parameter], max_norm: float) -> Tensor:
     """Rescale all gradients so their combined L2 norm is at most max_norm.
     Returns the norm BEFORE clipping -- the number worth logging."""
     grads = [p.grad for p in params if p.grad is not None]
@@ -18,7 +21,14 @@ def clip_grad_norm(params: Iterable[Parameter], max_norm: float) -> Tensor:
     return total_norm
 
 
+if TYPE_CHECKING:
+    clip_grad_norm = torch.nn.utils.clip_grad_norm_  # see backend.py
+else:
+    clip_grad_norm = torch.nn.utils.clip_grad_norm_ if USE_TORCH else our_clip_grad_norm
+
+
 if __name__ == "__main__":
+    # our_clip_grad_norm by name: under VIDEO_BACKEND=torch the alias is torch.nn.utils.clip_grad_norm_
     from linear import Linear
     from relu import ReLU
     from sequential import Sequential
@@ -37,7 +47,7 @@ if __name__ == "__main__":
         ((mine(x) - y) * scale).square().mean().backward()
         ((ref(x) - y) * scale).square().mean().backward()
 
-        n_mine = clip_grad_norm(mine.parameters(), max_norm)
+        n_mine = our_clip_grad_norm(mine.parameters(), max_norm)
         n_ref = torch.nn.utils.clip_grad_norm_(ref.parameters(), max_norm)
 
         after = torch.sqrt(sum((p.grad * p.grad).sum() for p in mine.parameters()))
@@ -55,6 +65,6 @@ if __name__ == "__main__":
     mine.zero_grad()
     (mine(x) - y).square().mean().mul(1e-6).backward()
     before = [p.grad.clone() for p in mine.parameters()]
-    clip_grad_norm(mine.parameters(), 1.0)
+    our_clip_grad_norm(mine.parameters(), 1.0)
     assert all(torch.equal(a, p.grad) for a, p in zip(before, mine.parameters()))
     print("ok")

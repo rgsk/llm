@@ -1,10 +1,14 @@
+from typing import TYPE_CHECKING
+
 import torch
+from torch import Tensor, nn
+
+from backend import USE_TORCH
 from module import Module
 from parameter import Parameter
-from torch import Tensor
 
 
-class LayerNorm(Module):
+class OurLayerNorm(Module):
     def __init__(self, normalized_shape: int, eps: float = 1e-5):
         super().__init__()
         self.normalized_shape = normalized_shape
@@ -19,11 +23,18 @@ class LayerNorm(Module):
         return xhat * self.weight + self.bias
 
 
+if TYPE_CHECKING:
+    LayerNorm = nn.LayerNorm  # see backend.py
+else:
+    LayerNorm = nn.LayerNorm if USE_TORCH else OurLayerNorm
+
+
 if __name__ == "__main__":
+    # OurLayerNorm by name: under VIDEO_BACKEND=torch the alias is nn.LayerNorm
     from torch import nn
 
     E = 32
-    mine, ref = LayerNorm(E), nn.LayerNorm(E)
+    mine, ref = OurLayerNorm(E), nn.LayerNorm(E)
 
     # 1. init is deterministic: ones and zeros, no RNG
     assert torch.equal(mine.weight, torch.ones(E))
@@ -46,16 +57,16 @@ if __name__ == "__main__":
     ref.float()
 
     # 3. it actually normalizes: mean 0, var 1 per row
-    out = LayerNorm(E)(x)
+    out = OurLayerNorm(E)(x)
     assert out.mean(dim=-1).abs().max() < 1e-6
     assert (out.var(dim=-1, unbiased=False) - 1).abs().max() < 1e-3
 
     # 4. affine params do what they say
-    ln = LayerNorm(E)
+    ln = OurLayerNorm(E)
     with torch.no_grad():
         ln.weight.fill_(2.0)
         ln.bias.fill_(5.0)
-    assert ((ln(x) - 5.0) / 2.0 - LayerNorm(E)(x)).abs().max() < 1e-5
+    assert ((ln(x) - 5.0) / 2.0 - OurLayerNorm(E)(x)).abs().max() < 1e-5
 
     # 5. grads match, w.r.t. params and input
     xm = torch.randn(4, 8, E, requires_grad=True)
@@ -68,7 +79,7 @@ if __name__ == "__main__":
     assert (xm.grad - xr.grad).abs().max() < 1e-5
 
     # 6. biased vs unbiased variance really matters
-    class Wrong(LayerNorm):
+    class Wrong(OurLayerNorm):
         def forward(self, x):
             var = x.var(dim=-1, keepdim=True)  # torch defaults to unbiased=True
             xhat = (x - x.mean(-1, keepdim=True)) / torch.sqrt(var + self.eps)

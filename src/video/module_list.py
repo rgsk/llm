@@ -1,16 +1,20 @@
 from collections.abc import Iterable, Iterator
+from typing import TYPE_CHECKING
 
+from torch import nn
+
+from backend import USE_TORCH
 from module import Module
 
 
-class ModuleList(Module):
+class OurModuleList(Module):
     def __init__(self, modules: Iterable[Module] = ()):
         super().__init__()
         self._n = 0
         for m in modules:
             self.append(m)
 
-    def append(self, m: Module) -> "ModuleList":
+    def append(self, m: Module) -> "OurModuleList":
         setattr(self, str(self._n), m)  # attribute name "0", "1", ... -> "blocks.0.w"
         self._n += 1
         return self
@@ -25,10 +29,18 @@ class ModuleList(Module):
         return (self[i] for i in range(self._n))
 
 
+if TYPE_CHECKING:
+    ModuleList = nn.ModuleList  # see backend.py
+else:
+    ModuleList = nn.ModuleList if USE_TORCH else OurModuleList
+
+
 if __name__ == "__main__":
+    # OurModuleList by name: under VIDEO_BACKEND=torch the alias is nn.ModuleList
     import torch
-    from parameter import Parameter
     from torch import nn
+
+    from parameter import Parameter
 
     class MyLin(Module):
         def __init__(self, i, o):
@@ -51,7 +63,7 @@ if __name__ == "__main__":
     class Net(Module):
         def __init__(self):
             super().__init__()
-            self.layers = ModuleList([MyLin(4, 8), MyLin(8, 8)])
+            self.layers = OurModuleList([MyLin(4, 8), MyLin(8, 8)])
             self.head = MyLin(8, 2)
 
         def forward(self, x):

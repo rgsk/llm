@@ -1,12 +1,15 @@
 from collections.abc import Iterable
+from typing import TYPE_CHECKING
 
 import torch
-from module import Module
-from parameter import Parameter
 from torch import Tensor
 
+from backend import USE_TORCH
+from module import Module
+from parameter import Parameter
 
-class AdamW:
+
+class OurAdamW:
     def __init__(
         self,
         params: Iterable[Parameter] | Iterable[dict],
@@ -105,7 +108,27 @@ def decay_groups(model: Module, weight_decay: float) -> list[dict]:
     ]
 
 
+class TorchAdamW(torch.optim.AdamW):
+    """torch's AdamW plus the .lr the train loop assigns each step."""
+
+    @property
+    def lr(self) -> float:
+        return self.param_groups[0]["lr"]
+
+    @lr.setter
+    def lr(self, value: float) -> None:
+        for g in self.param_groups:
+            g["lr"] = value
+
+
+if TYPE_CHECKING:
+    AdamW = TorchAdamW  # see backend.py
+else:
+    AdamW = TorchAdamW if USE_TORCH else OurAdamW
+
+
 if __name__ == "__main__":
+    # OurAdamW by name: under VIDEO_BACKEND=torch the alias is TorchAdamW
     import math
 
     from linear import Linear
@@ -121,7 +144,7 @@ if __name__ == "__main__":
     )
     mine.load_state_dict({k: v.clone() for k, v in ref.state_dict().items()})
 
-    opt_m = AdamW(mine.parameters(), lr=1e-2, weight_decay=0.1)
+    opt_m = OurAdamW(mine.parameters(), lr=1e-2, weight_decay=0.1)
     opt_r = torch.optim.AdamW(ref.parameters(), lr=1e-2, weight_decay=0.1)
 
     x, y = torch.randn(32, 8), torch.randn(32, 4)
@@ -156,7 +179,7 @@ if __name__ == "__main__":
             self.w = Parameter(torch.ones(3))
 
     o = One()
-    opt = AdamW(o.parameters(), lr=0.1, weight_decay=0.5)
+    opt = OurAdamW(o.parameters(), lr=0.1, weight_decay=0.5)
     o.w.grad = torch.zeros(3)
     for _ in range(3):
         opt.step()
@@ -166,7 +189,7 @@ if __name__ == "__main__":
     #    gradient scale -- and in the direction that decreases the loss
     for scale in (1e-4, 1.0, 1e4, -1.0, -1e4):
         o = One()
-        opt = AdamW(o.parameters(), lr=0.1, weight_decay=0.0)
+        opt = OurAdamW(o.parameters(), lr=0.1, weight_decay=0.0)
         o.w.grad = torch.full((3,), scale)
         opt.step()
         moved = (1.0 - o.w[0]).item()
@@ -182,7 +205,7 @@ if __name__ == "__main__":
     mine2.load_state_dict({k: v.clone() for k, v in ref2.state_dict().items()})
 
     rp = list(ref2.parameters())
-    opt_m = AdamW(decay_groups(mine2, 0.1), lr=1e-2)
+    opt_m = OurAdamW(decay_groups(mine2, 0.1), lr=1e-2)
     opt_r = torch.optim.AdamW(
         [
             {"params": [p for p in rp if p.dim() >= 2], "weight_decay": 0.1},
@@ -215,7 +238,7 @@ if __name__ == "__main__":
     def make():
         torch.manual_seed(0)
         m = Sequential(Linear(8, 16), ReLU(), Linear(16, 4))
-        return m, AdamW(decay_groups(m, 0.1), lr=1e-2)
+        return m, OurAdamW(decay_groups(m, 0.1), lr=1e-2)
 
     def run(model, opt, n):
         for _ in range(n):

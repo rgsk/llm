@@ -1,17 +1,28 @@
+from typing import TYPE_CHECKING
+
 import torch
+from torch import Tensor, nn
+
+from backend import USE_TORCH
 from module import Module
-from torch import Tensor
 
 
-class ReLU(Module):
+class OurReLU(Module):
     def forward(self, x: Tensor) -> Tensor:
         return torch.where(x > 0, x, 0.0)
 
 
+if TYPE_CHECKING:
+    ReLU = nn.ReLU  # see backend.py
+else:
+    ReLU = nn.ReLU if USE_TORCH else OurReLU
+
+
 if __name__ == "__main__":
+    # OurReLU by name: under VIDEO_BACKEND=torch the alias is nn.ReLU
     from torch import nn
 
-    mine, ref = ReLU(), nn.ReLU()
+    mine, ref = OurReLU(), nn.ReLU()
 
     # 1. no parameters at all
     assert list(mine.parameters()) == []

@@ -1,10 +1,14 @@
+from typing import TYPE_CHECKING
+
 import torch
+from torch import Tensor, nn
+
+from backend import USE_TORCH
 from module import Module
 from parameter import Parameter
-from torch import Tensor
 
 
-class Embedding(Module):
+class OurEmbedding(Module):
     def __init__(self, num_embeddings: int, embedding_dim: int):
         super().__init__()
         self.num_embeddings = num_embeddings
@@ -15,14 +19,21 @@ class Embedding(Module):
         return self.weight[idx]  # [...] of ids -> [..., embedding_dim]
 
 
+if TYPE_CHECKING:
+    Embedding = nn.Embedding  # see backend.py
+else:
+    Embedding = nn.Embedding if USE_TORCH else OurEmbedding
+
+
 if __name__ == "__main__":
+    # OurEmbedding by name: under VIDEO_BACKEND=torch the alias is nn.Embedding
     from torch import nn
 
     V, E = 10, 4
 
     # 1. same init, draw for draw
     torch.manual_seed(0)
-    mine = Embedding(V, E)
+    mine = OurEmbedding(V, E)
     torch.manual_seed(0)
     ref = nn.Embedding(V, E)
     assert torch.equal(mine.weight, ref.weight)

@@ -1,9 +1,13 @@
+from typing import TYPE_CHECKING
+
 import torch
+from torch import Tensor, nn
+
+from backend import USE_TORCH
 from module import Module
-from torch import Tensor
 
 
-class Dropout(Module):
+class OurDropout(Module):
     """Zero each activation independently with probability p, then scale the
     survivors by 1/(1-p) so the layer keeps its expected value.
 
@@ -32,13 +36,20 @@ class Dropout(Module):
         return x * keep / (1.0 - self.p)
 
 
+if TYPE_CHECKING:
+    Dropout = nn.Dropout  # see backend.py
+else:
+    Dropout = nn.Dropout if USE_TORCH else OurDropout
+
+
 if __name__ == "__main__":
+    # OurDropout by name: under VIDEO_BACKEND=torch the alias is nn.Dropout
     from torch import nn
 
     torch.manual_seed(0)
     x = torch.randn(200, 300)
     P = 0.3
-    d, ref = Dropout(P), nn.Dropout(P)
+    d, ref = OurDropout(P), nn.Dropout(P)
 
     # 1. eval is exactly the identity -- not approximately
     d.eval(), ref.eval()
@@ -90,14 +101,14 @@ if __name__ == "__main__":
     assert torch.equal(g == 0, o == 0)  # dropped units get no gradient
 
     # 7. p=0 is the identity in train mode too
-    assert (Dropout(0.0)(x) - x).abs().max() == 0
+    assert (OurDropout(0.0)(x) - x).abs().max() == 0
 
     # 8. the flag propagates from a parent. Dropout has no parameters, so this
     #    is the ONLY thing that makes it behave differently at inference
     class Net(Module):
         def __init__(self):
             super().__init__()
-            self.drop = Dropout(0.5)
+            self.drop = OurDropout(0.5)
 
         def forward(self, x):
             return self.drop(x)
@@ -111,7 +122,7 @@ if __name__ == "__main__":
     # 9. p must be a probability, and p=1 is refused rather than dividing by zero
     for bad in (1.0, 1.5, -0.1):
         try:
-            Dropout(bad)
+            OurDropout(bad)
             raise SystemExit(f"should have failed: {bad}")
         except AssertionError:
             pass
@@ -138,6 +149,6 @@ if __name__ == "__main__":
     assert len(hit) == 1  # a "disabled" dropout that still drops
 
     torch.manual_seed(12)  # same draws, including that 0.0
-    assert (Dropout(0.0)(ones) - ones).abs().max() == 0  # ours: exactly identity
+    assert (OurDropout(0.0)(ones) - ones).abs().max() == 0  # ours: exactly identity
 
     print("ok")

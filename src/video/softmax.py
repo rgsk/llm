@@ -1,14 +1,31 @@
+from typing import TYPE_CHECKING
+
 import torch
+import torch.nn.functional as F
 from torch import Tensor
 
+from backend import USE_TORCH
 
-def softmax(x: Tensor, dim: int = -1) -> Tensor:
+
+def our_softmax(x: Tensor, dim: int = -1) -> Tensor:
     m = x.max(dim=dim, keepdim=True).values
     e = (x - m).exp()  # subtracting the max: exp() now peaks at exp(0) == 1
     return e / e.sum(dim=dim, keepdim=True)
 
 
+def torch_softmax(x: Tensor, dim: int = -1) -> Tensor:
+    """F.softmax defaults dim=None, which picks a legacy axis; ours defaults to -1."""
+    return F.softmax(x, dim=dim)
+
+
+if TYPE_CHECKING:
+    softmax = torch_softmax  # see backend.py
+else:
+    softmax = torch_softmax if USE_TORCH else our_softmax
+
+
 if __name__ == "__main__":
+    # our_softmax by name: under VIDEO_BACKEND=torch the alias is F.softmax
     import torch.nn.functional as F
 
     torch.manual_seed(0)
@@ -19,33 +36,33 @@ if __name__ == "__main__":
 
     # 1. matches F.softmax
     x = torch.randn(4, 8, 16)
-    assert (softmax(x) - F.softmax(x, dim=-1)).abs().max() < 1e-7
-    assert (softmax(x, dim=1) - F.softmax(x, dim=1)).abs().max() < 1e-7
+    assert (our_softmax(x) - F.softmax(x, dim=-1)).abs().max() < 1e-7
+    assert (our_softmax(x, dim=1) - F.softmax(x, dim=1)).abs().max() < 1e-7
 
     # 2. rows are a probability distribution
-    assert (softmax(x).sum(-1) - 1).abs().max() < 1e-6
-    assert (softmax(x) >= 0).all()
+    assert (our_softmax(x).sum(-1) - 1).abs().max() < 1e-6
+    assert (our_softmax(x) >= 0).all()
 
     # 3. the max subtraction is the whole point
     big = torch.tensor([[1000.0, 1001.0, 1002.0]])
     print("naive big: ", naive(big).tolist())
-    print("stable big:", softmax(big).tolist())
+    print("stable big:", our_softmax(big).tolist())
     assert naive(big).isnan().any()
-    assert torch.allclose(softmax(big), F.softmax(big, dim=-1))
+    assert torch.allclose(our_softmax(big), F.softmax(big, dim=-1))
 
     # and it changes nothing mathematically: softmax is shift-invariant
-    assert (softmax(x) - softmax(x + 12.34)).abs().max() < 1e-6
+    assert (our_softmax(x) - our_softmax(x + 12.34)).abs().max() < 1e-6
 
     # tiny values underflow to a uniform answer instead of 0/0
     small = torch.tensor([[-1000.0, -1000.0, -1000.0]])
     print("naive small: ", naive(small).tolist())
-    print("stable small:", softmax(small).tolist())
+    print("stable small:", our_softmax(small).tolist())
     assert naive(small).isnan().any()
-    assert torch.allclose(softmax(small), torch.full((1, 3), 1 / 3))
+    assert torch.allclose(our_softmax(small), torch.full((1, 3), 1 / 3))
 
     # 4. masked rows: -inf entries get exactly 0 probability
     masked = torch.tensor([[1.0, 2.0, float("-inf"), float("-inf")]])
-    p = softmax(masked)
+    p = our_softmax(masked)
     assert p[0, 2] == 0 and p[0, 3] == 0
     assert abs(p.sum().item() - 1.0) < 1e-6
     assert torch.equal(p, F.softmax(masked, dim=-1))
@@ -53,7 +70,7 @@ if __name__ == "__main__":
     # 5. grads match
     xm = torch.randn(4, 8, 16, requires_grad=True)
     xr = xm.detach().clone().requires_grad_(True)
-    softmax(xm).square().sum().backward()
+    our_softmax(xm).square().sum().backward()
     F.softmax(xr, dim=-1).square().sum().backward()
     assert (xm.grad - xr.grad).abs().max() < 1e-7
 

@@ -1,9 +1,10 @@
 """Which implementation the model layers use: ours, or torch's.
 
-VIDEO_BACKEND=ours (the default) exports what this package implements;
-VIDEO_BACKEND=torch exports torch's. The leaves were written to match torch's
-API exactly -- same constructor, keys, init and forward -- so the two are
-interchangeable at import time and a checkpoint crosses the boundary either way.
+VIDEO_BACKEND=torch (the default) exports torch's implementations;
+VIDEO_BACKEND=ours exports what this package implements. The leaves were written
+to match torch's API exactly -- same constructor, keys, init and forward -- so
+the two are interchangeable at import time and model weights cross the boundary
+either way. Optimizer state does not: the two AdamWs store different formats.
 
 The flag reaches the leaves and the Module base together; they have to come from
 the same side of it (see module.py). Only speed changes, not the model.
@@ -14,7 +15,7 @@ whatever the flag says.
 
 import os
 
-_BACKEND = os.getenv("VIDEO_BACKEND", "ours").lower()
+_BACKEND = os.getenv("VIDEO_BACKEND", "torch").lower()
 assert _BACKEND in ("torch", "ours"), (
     f"VIDEO_BACKEND must be 'torch' or 'ours', got {_BACKEND!r}"
 )
@@ -23,8 +24,8 @@ USE_TORCH = _BACKEND == "torch"
 
 
 if __name__ == "__main__":
-    # 1. unset means `ours`: the package behaves as it did before the switch
-    assert not USE_TORCH or os.getenv("VIDEO_BACKEND") == "torch"
+    # 1. unset means `torch`
+    assert USE_TORCH or os.getenv("VIDEO_BACKEND") == "ours"
     assert isinstance(USE_TORCH, bool)
 
     # 2. a typo fails at import, not silently

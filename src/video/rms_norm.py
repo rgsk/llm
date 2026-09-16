@@ -1,10 +1,14 @@
+from typing import TYPE_CHECKING
+
 import torch
+from torch import Tensor, nn
+
+from backend import USE_TORCH
 from module import Module
 from parameter import Parameter
-from torch import Tensor
 
 
-class RMSNorm(Module):
+class OurRMSNorm(Module):
     """LayerNorm with the centering step deleted.
 
     LayerNorm does two things: it re-centers (subtract the mean) and it re-scales
@@ -37,13 +41,21 @@ class RMSNorm(Module):
         return x_hat * self.weight
 
 
+if TYPE_CHECKING:
+    RMSNorm = nn.RMSNorm  # see backend.py
+else:
+    RMSNorm = nn.RMSNorm if USE_TORCH else OurRMSNorm
+
+
 if __name__ == "__main__":
-    from layer_norm import LayerNorm
+    # OurRMSNorm by name: under VIDEO_BACKEND=torch the alias is nn.RMSNorm
     from torch import nn
+
+    from layer_norm import LayerNorm
 
     torch.manual_seed(0)
     E = 32
-    mine, ref = RMSNorm(E), nn.RMSNorm(E, eps=1e-5)
+    mine, ref = OurRMSNorm(E), nn.RMSNorm(E, eps=1e-5)
 
     # 1. one parameter, not two -- and no RNG in the init
     assert torch.equal(mine.weight, torch.ones(E))
@@ -67,9 +79,9 @@ if __name__ == "__main__":
 
     # 3. it normalises the RMS to 1, and does NOT touch the mean.
     #    x + 3 shifts every row off centre; LayerNorm erases that, RMSNorm keeps it
-    out = RMSNorm(E)(x)
+    out = OurRMSNorm(E)(x)
     assert (out.square().mean(dim=-1) - 1).abs().max() < 1e-3
-    shifted = RMSNorm(E)(x + 3.0)
+    shifted = OurRMSNorm(E)(x + 3.0)
     print(
         f"row means -- in {(x + 3.0).mean(-1).abs().mean():.4f}  "
         f"rms out {shifted.mean(-1).abs().mean():.4f}  "
@@ -83,15 +95,15 @@ if __name__ == "__main__":
     c = x - x.mean(dim=-1, keepdim=True)
     print(
         "centred rows, rms vs layer:",
-        (RMSNorm(E)(c) - LayerNorm(E)(c)).abs().max().item(),
+        (OurRMSNorm(E)(c) - LayerNorm(E)(c)).abs().max().item(),
     )
-    assert (RMSNorm(E)(c) - LayerNorm(E)(c)).abs().max() < 1e-5
+    assert (OurRMSNorm(E)(c) - LayerNorm(E)(c)).abs().max() < 1e-5
 
     # 5. the gain scales, and there is nothing to shift by
-    r = RMSNorm(E)
+    r = OurRMSNorm(E)
     with torch.no_grad():
         r.weight.fill_(2.0)
-    assert (r(x) / 2.0 - RMSNorm(E)(x)).abs().max() < 1e-6
+    assert (r(x) / 2.0 - OurRMSNorm(E)(x)).abs().max() < 1e-6
 
     # 6. grads match torch, w.r.t. both the weight and the input
     xm = torch.randn(4, 8, E, requires_grad=True)
@@ -106,14 +118,14 @@ if __name__ == "__main__":
 
     # 7. eps guards an all-zero row instead of producing nan
     zeros = torch.zeros(2, E)
-    assert torch.isfinite(RMSNorm(E)(zeros)).all()
-    assert (RMSNorm(E)(zeros) == 0).all()
+    assert torch.isfinite(OurRMSNorm(E)(zeros)).all()
+    assert (OurRMSNorm(E)(zeros) == 0).all()
 
     # 8. it is cheaper: one reduction and one parameter vector fewer
     big = torch.randn(64, 512, 768)
     import time
 
-    rn, ln = RMSNorm(768), LayerNorm(768)
+    rn, ln = OurRMSNorm(768), LayerNorm(768)
     for f in (rn, ln):
         f(big)  # warm up
     t = {}
