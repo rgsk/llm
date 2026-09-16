@@ -61,6 +61,8 @@ fineweb_smoke_train = TrainConfig(
     eval_interval=500,
     eval_iters=40,
     name="fineweb_smoke",
+    use_wandb=True,
+    upload_ckpt=True,
 )
 
 # fineweb_cfg on a rented GPU -- batch_size 16 at block 1024 does not fit an 8 GB

@@ -48,15 +48,12 @@ gpt_cfg = GPTConfig(
 )
 
 
-gpt_cfg = fineweb_smoke_cfg
+# needs VIDEO_DATASET=fineweb_edu; train() asserts the vocab matches the shards
+gpt_cfg = fineweb_cfg
+train_cfg = fineweb_train
 
-# gpt_cfg = fineweb_cfg
-# gpt_cfg = big_cfg
-
-train_cfg = fineweb_smoke_train
-
-# train_cfg = fineweb_train  # 12L/768, a rented-GPU job
-# train_cfg = big_train
+# gpt_cfg, train_cfg = fineweb_smoke_cfg, fineweb_smoke_train  # 20 min on a 4060
+# gpt_cfg, train_cfg = big_cfg, big_train  # tinystories
 
 
 PROMPT = ENDOFTEXT if DATASET.startswith("fineweb") else "\n"
@@ -70,7 +67,7 @@ def sample(model: GPT, prompt: str = PROMPT, max_new_tokens: int = 300, **kw) ->
 
 
 if __name__ == "__main__":
-    run_training = False
+    run_training = True
     # a specific file, or None to take the newest run named train_cfg.name.
     # main.py's own checkpoints load here now -- they only need `attention`
     # named, since main.py never stored it

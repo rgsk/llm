@@ -21,6 +21,7 @@ from gpt import GPT
 from gpt_config import GPTConfig
 from logger import Run
 from lr_schedule import get_lr
+from paths import DATASET
 from train_config import TrainConfig
 
 
@@ -53,6 +54,13 @@ def train(
     opt = AdamW(decay_groups(model, weight_decay), lr=cfg.lr, betas=(0.9, 0.95))
     model.train()
 
+    # the config names a vocabulary, VIDEO_DATASET names a corpus, and nothing
+    # else checks they are the same one -- a 50k-vocab model trains happily on
+    # 4k-vocab shards and only the samples give it away
+    assert gpt_cfg.vocab_size == meta["vocab_size"], (
+        f"vocab_size {gpt_cfg.vocab_size} != dataset {DATASET!r} vocab_size "
+        f"{meta['vocab_size']} -- set VIDEO_DATASET, or pick another config"
+    )
     T = gpt_cfg.block_size
     V = gpt_cfg.vocab_size
     best_val = float("inf")
@@ -187,9 +195,6 @@ def train(
         opt.step()
 
     evaluate(cfg.max_steps, opt.lr)  # final model, after every update
-
-    if cfg.upload_ckpt and ckpt_path is not None and ckpt_path.exists():
-        run.log_checkpoint(ckpt_path)  # the best one, not necessarily the last
 
     if cfg.upload_ckpt and ckpt_path is not None and ckpt_path.exists():
         run.log_checkpoint(ckpt_path)  # the best one, not necessarily the last
