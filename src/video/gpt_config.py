@@ -2,6 +2,7 @@ from dataclasses import dataclass, fields
 
 from block import FFN, Attention, Norm
 from gpt import Position
+from tokenizer import VOCAB_SIZE
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -73,6 +74,37 @@ big_cfg = GPTConfig(
     attention="sdpa",
     norm="rms",
     ffn="gated",
+)
+
+
+# --- FineWeb-Edu, GPT-2's 50259 vocab -------------------------------------
+# 20 minutes on a 4060 at B=8 x grad_accum 2: enough to watch loss fall and read
+# the samples. 26.6M of its 29.9M params are the embedding -- the vocab IS the model
+# at this size, which is the point the shape below fixes.
+fineweb_smoke_cfg = GPTConfig(
+    vocab_size=VOCAB_SIZE,
+    block_size=512,
+    n_embed=384,
+    n_head=6,
+    n_layer=6,
+    attention="sdpa",
+    norm="rms",
+    ffn="gated",
+    position="rope",
+)
+
+# GPT-2 small's shape. 123.6M params, embedding back down to 32%.
+# 17-19 h per 1B tokens on a 4060 whatever the batch shape -- a RunPod job.
+fineweb_cfg = GPTConfig(
+    vocab_size=VOCAB_SIZE,
+    block_size=1024,
+    n_embed=768,
+    n_head=12,
+    n_layer=12,
+    attention="sdpa",
+    norm="rms",
+    ffn="gated",
+    position="rope",
 )
 
 

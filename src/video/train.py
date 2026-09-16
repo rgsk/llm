@@ -3,6 +3,7 @@ from dataclasses import asdict
 from pathlib import Path
 
 import torch
+
 from adamw import AdamW, decay_groups
 from amp import autocast
 from checkpoint import save_checkpoint
@@ -45,7 +46,7 @@ def train(
     assert select in ("val", "accept"), select
     assert select == "val" or reference is not None, "select='accept' needs a reference"
     torch.manual_seed(cfg.seed)
-    run = Run(cfg.name, asdict(cfg) | asdict(gpt_cfg), enabled=cfg.use_wandb)
+    run = Run(cfg.name, asdict(cfg) | asdict(gpt_cfg), online=cfg.use_wandb)
     train_gen = torch.Generator().manual_seed(cfg.seed)
     eval_gen = torch.Generator().manual_seed(cfg.seed + 1)
 
@@ -59,6 +60,8 @@ def train(
     history: list[dict] = []
     t0 = time.perf_counter()
     gnorm = torch.tensor(float("nan"))  # no gradient exists before the first step
+    last_t: float | None = None  # end of the previous eval, so eval time is excluded
+    last_it: int | None = None
 
     start_step = 0
     if resume is not None:
@@ -75,8 +78,16 @@ def train(
         start_step = resume["step"]
         print(f"resuming at step {start_step}, val {best_val:.4f}")
 
+    def sync() -> None:
+        if device.startswith("cuda"):
+            torch.cuda.synchronize()  # kernels are async; time them after they land
+
     def evaluate(it: int, lr: float) -> None:
-        nonlocal best_val, best_accept
+        nonlocal best_val, best_accept, last_t, last_it
+        sync()
+        ms_step = float("nan")
+        if last_t is not None and last_it is not None and it > last_it:
+            ms_step = (time.perf_counter() - last_t) / (it - last_it) * 1000
         eval_state = eval_gen.get_state()  # before the draws, so a resume replays them
         tr = estimate_loss(
             model, train_ds, cfg.batch_size, T, cfg.eval_iters, eval_gen, device
@@ -90,11 +101,13 @@ def train(
             "bpc": bpc,
             "lr": lr,
             "gnorm": gnorm.item(),
+            "ms_step": ms_step,
             "secs": time.perf_counter() - t0,
         }
         line = (
-            f"step {it:>5}  train {tr:.4f}  val {va:.4f}  bpc {bpc:.3f}  "
-            f"lr {lr:.2e}  |g| {gnorm:6.2f}  {time.perf_counter() - t0:6.1f}s"
+            f"step {it:>5}  train {tr:7.4f}  val {va:7.4f}  bpc {bpc:.3f}  "
+            f"lr {lr:.2e}  |g| {gnorm:6.2f}  {ms_step:6.1f} ms/step  "
+            f"{time.perf_counter() - t0:6.1f}s"
         )
         if reference is not None:
             # a quarter of the eval batch: this runs a second, bigger model, and
@@ -140,6 +153,8 @@ def train(
                 train_gen=train_gen.get_state(),
                 eval_gen=eval_state,
             )
+        sync()
+        last_t, last_it = time.perf_counter(), it
 
     # compile the forward, but keep `model` for everything else: zero_grad,
     # clipping and state_dict all want the real module, and the wrapper shares

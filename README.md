@@ -173,11 +173,71 @@ packed-side tensors but force a wider container on the unpacked-side ones, which
 are one element per weight and dominate. Measured 34 MB (k=4, int32) against
 64 MB (k=8, int64) at 6 bits.
 
-The old "three genuinely big remaining pieces" list is closed except for data:
+**BPE + FineWeb-Edu.** `tokenizer.py` — byte-level BPE: regex pre-split, count
+adjacent pairs, merge the most frequent, repeat. `train` / `encode` / `decode` /
+`save` / `load`, GPT-2's pre-tokenizer pattern and GPT-4's. Two backends behind
+`VIDEO_BACKEND` and the same ids either way: `OurBPETokenizer` in Python,
+`FastBPETokenizer` over tiktoken. They agree because both are built from one
+merge table — ours adopts GPT-2's with `from_mergeable_ranks` and hands its own
+back with `mergeable_ranks`, which is also how tiktoken becomes the oracle for a
+vocabulary *we* trained.
+
+A rank table says what each id expands to but not which pair built it. BPE's own
+invariant recovers that: encode a token's bytes using every lower rank and
+exactly two pieces must remain, and those are the pair. 50000 merges in 0.55s.
+GPT-2's byte ids are a permutation of 0-255, not the identity, so the base table
+is a lookup rather than an assumption.
+
+The series ships GPT-2's 50257 plus `<|im_start|>` and `<|im_end|>`, so
+`VOCAB_SIZE` is 50259 and still fits uint16. The chat specials are minted here
+because the corpus has to be tokenized with them already in the table — that is
+the whole reason this episode precedes SFT. `src/tokenizer.py`'s older save
+format still loads (GPT-4 pattern, identity byte ids), verified to reproduce
+`bpe_ts_4096.json` id for id, so `basic.py` and every TinyStories checkpoint keep
+working; `basic.py`'s `sys.path` hack into `src/` is gone.
+
+`fineweb.py` — `ShardWriter` plus a streamed build. 990M train + 10M val tokens
+of `HuggingFaceFW/fineweb-edu` `sample-10BT` at 4.59 chars/token: 1.9 GB in ten
+100M-token shards, 18.3 minutes. Documents are led by `<|endoftext|>`.
+`dataset.py`'s `BinDataset` now spans shards as one contiguous stream (bisect
+over cumulative offsets) and takes a `data_dir`; `VIDEO_DATASET=fineweb_edu`
+switches every consumer with no edit to `train.py`. TinyStories is the
+single-file case and still runs. Measurements in `tokenizer.ipynb`, six probes.
+
+The old "three genuinely big remaining pieces" list is closed, data included:
 SDPA, RMSNorm, SwiGLU, weight tying, and the KV cache all shipped. Optimizer
 hygiene — the item that sat pending longest — is done too.
 
 ## Measured, so it does not get re-derived
+
+- **Compression is linear in log2(vocab), at ~0.42 chars/token per doubling.**
+  Truncating GPT-2's ranks at N gives exactly the vocabulary it had after N-256
+  merges, so one table sweeps the whole range. On FineWeb-Edu: 1.99 chars/token
+  at 512, 2.87 at 2k, 3.31 at 4k, 3.75 at 8k, 4.13 at 16k, 4.44 at 32k, **4.59
+  at 50k**. The per-doubling gain is near constant (0.46, 0.42, 0.44, 0.43, 0.38,
+  0.31), decaying only at the top — not the sharp diminishing return it looks
+  like on a linear axis. But the rows cost linearly: 8k -> 50k is 6.1x the
+  embedding for 22% fewer tokens. A smaller vocabulary is therefore not a free
+  saving either — it shrinks the embedding and lengthens every sequence.
+
+- **Adopt the table, do not retrain it.** `train()` recounts every pair over the
+  whole corpus once per merge: 14.7s / 40.4s / 90.4s for vocab 512 / 1024 / 2048
+  on **1 MB**. Extrapolated to 50257 that is ~37 minutes for one megabyte,
+  against the hundreds of GB GPT-2's table was learned on. The unique-chunk
+  `Counter` is the only reason even the small ones finish.
+
+- **The shard build is download-bound.** Streaming steady state is 1.12M tok/s;
+  one tiktoken thread encodes 5.3M. So `num_threads=1` — which also sidesteps
+  tiktoken's pool and `datasets`' parquet reader tearing each other down at
+  interpreter exit (SIGABRT or a hang, at random, *after* every byte is on disk;
+  the build ends with `os._exit(0)` for that reason). Four parallel connections
+  summed to 3.25 MB/s, the same as one: the link is saturated, so parallel
+  downloads buy nothing either.
+
+- **Measure over a window longer than the startup cost.** The first throughput
+  number for that stream was 0.14M tok/s and 8x wrong — the window was dominated
+  by 15.2s of one-time stream startup latency. It nearly went into a comment as
+  the justification for a design choice that happens to be right anyway.
 
 - **Fold q, do not widen k/v.** With `n_kv_head < n_head` the obvious move is
   `repeat_interleave` on k and v up to `n_head`. It is correct and it rebuilds,
@@ -343,12 +403,7 @@ table the 4-weight sample had missed.
 
 ## Next, in order
 
-**1. BPE tokenizer + FineWeb-Edu.** `src/tokenizer.py` works; port and clean it
-into `video/`. Byte-level, count pairs, merge, repeat. This is also where the
-chat special tokens get minted, so it has to precede SFT. Then real data at a
-size that does not fit in RAM.
-
-**2. Padding and attention masks.** *Currently missing everywhere in
+**1. Padding and attention masks.** *Currently missing everywhere in
 `src/video/`* — checked, not assumed. Fine for pretraining on contiguous shards,
 a blocker for everything after it: SFT needs the loss masked over prompt tokens
 (`ignore_index`), and batched generation needs left-padding plus a real mask,
@@ -356,11 +411,11 @@ since `generate` assumes every row shares a prompt length. That makes this gate
 RL as well as SFT — rollouts are batched generation. Small file. It has to land
 before SFT, not during.
 
-**3. SFT + LoRA.** Cleaner versions of `src/sft.py` and `src/lora.py`. Chat
+**2. SFT + LoRA.** Cleaner versions of `src/sft.py` and `src/lora.py`. Chat
 template, loss masking, then LoRA as the parameter-efficient variant. This is
 where it stops being a continuation engine.
 
-**4. RL.** **DPO first** — a loss function over a frozen reference model, no
+**3. RL.** **DPO first** — a loss function over a frozen reference model, no
 reward model, no rollouts, no value head, which fits the file-plus-test format.
 PPO/GRPO after, and budget three episodes: sampling loop, advantage estimation,
 KL control. It is the first thing in the series that can silently fail to learn.

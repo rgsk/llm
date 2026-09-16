@@ -1,34 +1,44 @@
 """The whole thing, assembled. Every import below is a file we wrote:
 torch.nn, torch.nn.functional and torch.optim appear nowhere in the model path."""
 
-import sys
-from dataclasses import asdict, replace
+from dataclasses import asdict
 
 import torch
+
 from checkpoint import (
     CKPT_DIR,
     generate_ckpt_path,
     latest_ckpt,
     load_checkpoint,
 )
-from dataset import BinDataset
+from dataset import BinDataset, meta
 from generate import generate
 from gpt import GPT
-from gpt_config import GPTConfig, big_cfg, small_cfg  # noqa: F401
-from paths import ROOT
+from gpt_config import (  # noqa: F401
+    GPTConfig,
+    big_cfg,
+    fineweb_cfg,
+    fineweb_smoke_cfg,
+    small_cfg,
+)
+from paths import DATASET
+from tokenizer import ENDOFTEXT, tokenizer_for
 from train import train
-from train_config import TrainConfig, big_train, small_train  # noqa: F401
+from train_config import (  # noqa: F401
+    TrainConfig,
+    big_train,
+    fineweb_smoke_train,
+    fineweb_train,
+    small_train,
+)
 
-sys.path.append(str(ROOT / "src"))  # BPE is its own topic -- reuse the tokenizer
-from tokenizer import BPETokenizer
-
-tok = BPETokenizer.load(str(ROOT / "artifacts" / "tokenizer" / "bpe_ts_4096.json"))
+tok = tokenizer_for()  # follows VIDEO_DATASET, like BinDataset does
 
 # TF32 tensor cores for fp32 matmuls: ~1.26x on this model, measured.
 torch.set_float32_matmul_precision("high")
 
 gpt_cfg = GPTConfig(
-    vocab_size=4096,
+    vocab_size=meta["vocab_size"],
     block_size=128,
     n_embed=192,
     n_head=6,
@@ -37,33 +47,22 @@ gpt_cfg = GPTConfig(
     position="learned",
 )
 
+
+gpt_cfg = fineweb_smoke_cfg
+
+# gpt_cfg = fineweb_cfg
 # gpt_cfg = big_cfg
 
-train_cfg = TrainConfig(
-    batch_size=32,
-    max_steps=1500,
-    lr=1e-3,
-    min_lr=1e-4,
-    warmup_steps=100,
-    eval_interval=250,
-    eval_iters=50,
-    name="scratch",
-    use_compile=True,
-)
-train_cfg = replace(
-    big_train,
-    max_steps=250,
-    warmup_steps=20,
-    eval_interval=100,
-    eval_iters=20,
-    name="runpod",
-    upload_ckpt=True,
-)
+train_cfg = fineweb_smoke_train
 
+# train_cfg = fineweb_train  # 12L/768, a rented-GPU job
 # train_cfg = big_train
 
 
-def sample(model: GPT, prompt: str = "\n", max_new_tokens: int = 100, **kw) -> str:
+PROMPT = ENDOFTEXT if DATASET.startswith("fineweb") else "\n"
+
+
+def sample(model: GPT, prompt: str = PROMPT, max_new_tokens: int = 300, **kw) -> str:
     device = next(model.parameters()).device
     idx = torch.tensor([tok.encode(prompt)], device=device)
     out = generate(model, idx, max_new_tokens, **kw)
@@ -71,11 +70,11 @@ def sample(model: GPT, prompt: str = "\n", max_new_tokens: int = 100, **kw) -> s
 
 
 if __name__ == "__main__":
-    run_training = True
+    run_training = False
     # a specific file, or None to take the newest run named train_cfg.name.
     # main.py's own checkpoints load here now -- they only need `attention`
     # named, since main.py never stored it
-    ckpt = CKPT_DIR / "big_2026-08-30_09-09-16.pt"
+    ckpt = CKPT_DIR / "fineweb_smoke_2026-09-16_18-00-23.pt"
     ckpt = None
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"device {device}   run_training {run_training}")

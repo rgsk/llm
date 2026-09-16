@@ -18,7 +18,9 @@ class TrainConfig:
     seed: int = 1337
     name: str = "video"
     use_wandb: bool = False
-    upload_ckpt: bool = False  # best checkpoint -> wandb artifact at the end; needs use_wandb
+    upload_ckpt: bool = (
+        False  # best checkpoint -> wandb artifact at the end; needs use_wandb
+    )
 
 
 small_train = TrainConfig(
@@ -47,6 +49,36 @@ big_train = TrainConfig(
 )
 
 
+# --- FineWeb-Edu ----------------------------------------------------------
+# 4060, with fineweb_smoke_cfg: 8192 tokens per step, 65.5M tokens, ~20 min.
+fineweb_smoke_train = TrainConfig(
+    batch_size=8,
+    grad_accum_steps=2,
+    max_steps=1000,
+    lr=6e-4,
+    min_lr=6e-5,
+    warmup_steps=200,
+    eval_interval=500,
+    eval_iters=40,
+    name="fineweb_smoke",
+)
+
+# fineweb_cfg on a rented GPU -- batch_size 16 at block 1024 does not fit an 8 GB
+# card. 65536 tokens per step x 15000 = 983M, one pass over the shards.
+fineweb_train = TrainConfig(
+    batch_size=16,
+    grad_accum_steps=4,
+    max_steps=15000,
+    lr=6e-4,
+    min_lr=6e-5,
+    warmup_steps=300,
+    eval_interval=500,
+    eval_iters=100,
+    name="fineweb",
+    use_wandb=True,
+    upload_ckpt=True,
+)
+
 if __name__ == "__main__":
     from dataclasses import asdict, replace
 
@@ -63,7 +95,7 @@ if __name__ == "__main__":
     )
 
     # 2. sane relationships hold in the presets
-    for cfg in (small_train, big_train):
+    for cfg in (small_train, big_train, fineweb_smoke_train, fineweb_train):
         assert cfg.min_lr < cfg.lr
         assert cfg.warmup_steps < cfg.max_steps
         assert cfg.eval_interval <= cfg.max_steps
