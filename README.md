@@ -245,13 +245,28 @@ of `HuggingFaceFW/fineweb-edu` `sample-10BT` at 4.59 chars/token: 1.9 GB in ten
 `dataset.py`'s `BinDataset` now spans shards as one contiguous stream (bisect
 over cumulative offsets) and takes a `data_dir`; `VIDEO_DATASET=fineweb_edu`
 switches every consumer with no edit to `train.py`. TinyStories is the
-single-file case and still runs. Measurements in `tokenizer.ipynb`, six probes.
+single-file case and still runs. Measurements in `tokenizer.ipynb`, seven probes.
 
 The old "three genuinely big remaining pieces" list is closed, data included:
 SDPA, RMSNorm, SwiGLU, weight tying, and the KV cache all shipped. Optimizer
 hygiene — the item that sat pending longest — is done too.
 
 ## Measured, so it does not get re-derived
+
+- **First real pretrain: 12L/768 on FineWeb-Edu.** 123.6M params, 983M tokens
+  (0.99 epochs), 15000 steps x 65536 tokens, 4.4 h on a rented RTX PRO 4500
+  Blackwell at $0.72/h — about $3.15. **val 3.327, bpc 1.046, ppl 27.9**,
+  against the 29.9M smoke's 4.557 / 1.433 / 95.3.
+
+  Throughput is **flat in batch size** — 62.4k tok/s at B=8, 16 and 24 alike, so
+  the card saturates at B=8 and a bigger micro-batch only costs memory (+8.4 GB
+  per +8, which is the `B x T x V` logits tensor; B=32 OOMs at 32 GB). 4.25x the
+  4060's 14.7k tok/s on the same config.
+
+  Prose is fluent and facts are not: it gets mitochondria right and states that
+  photosynthesis produces carbon dioxide, in the same register. At ~8 tokens per
+  parameter against Chinchilla's 20 it is compute-starved, not broken;
+  `sample-10BT` holds 10x the tokens used.
 
 - **Compression is linear in log2(vocab), at ~0.42 chars/token per doubling.**
   Truncating GPT-2's ranks at N gives exactly the vocabulary it had after N-256
@@ -265,7 +280,7 @@ hygiene — the item that sat pending longest — is done too.
 
 - **Adopt the table, do not retrain it.** `train()` recounts every pair over the
   whole corpus once per merge: 14.7s / 40.4s / 90.4s for vocab 512 / 1024 / 2048
-  on **1 MB**. Extrapolated to 50257 that is ~37 minutes for one megabyte,
+  on **1 MB**. Extrapolated to 50257 that is ~42 minutes for one megabyte,
   against the hundreds of GB GPT-2's table was learned on. The unique-chunk
   `Counter` is the only reason even the small ones finish.
 
