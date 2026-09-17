@@ -49,8 +49,8 @@ gpt_cfg = GPTConfig(
 
 
 # needs VIDEO_DATASET=fineweb_edu; train() asserts the vocab matches the shards
-gpt_cfg = fineweb_cfg
-train_cfg = fineweb_train
+gpt_cfg = fineweb_smoke_cfg
+train_cfg = fineweb_smoke_train
 
 # gpt_cfg, train_cfg = fineweb_smoke_cfg, fineweb_smoke_train  # 20 min on a 4060
 # gpt_cfg, train_cfg = big_cfg, big_train  # tinystories
@@ -84,6 +84,18 @@ if __name__ == "__main__":
         n_params = sum(p.numel() for p in model.parameters())
         print(f"{n_params / 1e6:.2f}M params ({n_params:,})")
 
+        # what the run will actually see. 20 tok/param is chinchilla's
+        # compute-optimal ratio; below it the model is bigger than the data needs
+        tokens = (
+            train_cfg.batch_size
+            * gpt_cfg.block_size
+            * train_cfg.grad_accum_steps
+            * train_cfg.max_steps
+        )
+        print(
+            f"{tokens / 1e6:.0f}M tokens  {tokens / n_params:.1f} tok/param (20 optimal)"
+            f"  {tokens / meta['train']['n_tokens']:.2f} epochs"
+        )
         train_ds, val_ds = BinDataset("train"), BinDataset("val")
         ckpt = generate_ckpt_path(train_cfg.name)
         train(
