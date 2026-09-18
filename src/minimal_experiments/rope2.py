@@ -354,8 +354,10 @@ small_train_cfg = TrainConfig(
 
 
 def run():
+    torch.manual_seed(0)  # same init test() builds
     model = GPT(**asdict(small_gpt_cfg))
     model.to(device)
+    torch.manual_seed(1)  # same batches evaluate(0) draws in test()
     train(model, small_train_cfg)
     prompt = torch.tensor([tok.encode("\n")], device=device)
     sample = tok.decode(generate(model, prompt, max_new_tokens=100)[0].tolist())
@@ -363,7 +365,91 @@ def run():
 
 
 def test():
+    # step-0 loss, before any update: same weights and same batches through each
+    # impl must give the same number, and the n_kv_head run() uses reproduces
+    # run()'s own first line. comparing FINAL loss cannot show this -- float32
+    # rounding differs by summation order and AdamW amplifies one ulp
+    base = asdict(small_gpt_cfg)
+    E, NH = base["n_embed"], base["n_head"]
+    B, ITERS = small_train_cfg.batch_size, small_train_cfg.eval_iters
+
+    def step0(cls, n_kv_head, state):
+        """Exactly what train()'s evaluate(0) prints, for one attention impl."""
+        torch.manual_seed(0)  # same init as run()
+        model = GPT(**{**base, "n_kv_head": n_kv_head})
+        for b in model.blocks:  # same stack, only the attention swapped
+            b.attn = cls(E, NH) if cls is FlashAttention else cls(E, NH, n_kv_head)
+        model.load_state_dict(state)  # the swap re-inits; put the weights back
+        model.to(device)
+        torch.manual_seed(1)  # same batches train_loss_est draws in run()
+        return train_loss_est(model, B, ITERS), full_val_loss(model, B).item()
+
+    cases = (
+        ("n_kv_head=16 (MHA)", NH, (FlashAttention, GQAttention)),
+        (
+            f"n_kv_head={base['n_kv_head']}  (GQA, what run() uses)",
+            base["n_kv_head"],
+            (GQAttention,),
+        ),
+    )
+    for label, nkv, impls in cases:
+        torch.manual_seed(0)
+        state = GPT(**{**base, "n_kv_head": nkv}).state_dict()  # one inited set
+        out = {cls.__name__: step0(cls, nkv, state) for cls in impls}
+        print(f"  {label}")
+        for name, (tr, va) in out.items():
+            print(f"      step    0 : train {tr:.3f}   val {va:.3f}   {name}")
+        for i in (0, 1):
+            vals = [v[i] for v in out.values()]
+            assert max(vals) - min(vals) < 1e-5, f"{label}: impls disagree"
+
+    # the real check. step-0 loss above is only a smoke test: at init the stack
+    # is barely sensitive to attention weights, so a corrupted impl still scores
+    # bit-identical. float64 at module level has ~9 orders of headroom instead
+    torch.set_default_dtype(torch.float64)
     torch.manual_seed(0)
+    T, hs = 8, E // NH
+    cos, sin = rope_tables(base["block_size"], hs)
+    cos, sin = cos[:T], sin[:T]
+    x = torch.randn(2, T, E)
+    tril = torch.ones(T, T, dtype=torch.bool).tril()
+
+    # MHA: enable_gqa off, so SDPA's own causal kernel is the oracle
+    a, b = FlashAttention(E, NH), GQAttention(E, NH, NH)
+    assert a.state_dict().keys() == b.state_dict().keys()
+    b.load_state_dict(a.state_dict())
+    d = (a(x, cos, sin) - b(x, cos, sin)).abs().max().item()
+    print(f"  {'GQAttention(n_kv_head=16) vs FlashAttention':44} {d:.1e}")
+    assert d <= 1e-12, f"MHA degenerate case differs by {d:.2e}"
+
+    # GQA: no second impl here to compare against, so compute it by hand --
+    # q head h attends with kv head h // n_rep, one head at a time
+    def by_hand(m, pick):
+        q, k, v = m.qkv(x).split([E, m.n_kv_head * hs, m.n_kv_head * hs], dim=-1)
+        q = q.view(2, T, NH, hs).transpose(1, 2)
+        k = k.view(2, T, m.n_kv_head, hs).transpose(1, 2)
+        v = v.view(2, T, m.n_kv_head, hs).transpose(1, 2)
+        q, k = apply_rope(q, cos, sin), apply_rope(k, cos, sin)
+        heads = []
+        for h in range(NH):
+            g = pick(h, m)
+            sc = q[:, h] @ k[:, g].transpose(-2, -1) * hs**-0.5
+            heads.append(sc.masked_fill(~tril, float("-inf")).softmax(-1) @ v[:, g])
+        return m.proj(torch.cat(heads, dim=-1))
+
+    for nkv in (4, 1):
+        m = GQAttention(E, NH, nkv)
+        ref = m(x, cos, sin)
+        d = (by_hand(m, lambda h, m: h // m.n_rep) - ref).abs().max().item()
+        wrong = (by_hand(m, lambda h, m: h % m.n_kv_head) - ref).abs().max().item()
+        print(
+            f"  {f'GQAttention n_kv_head={nkv}: h // n_rep':44} {d:.1e}   (h % n_kv_head: {wrong:.1e})"
+        )
+        assert d <= 1e-12, f"n_kv_head={nkv}: grouping differs by {d:.2e}"
+        if nkv > 1:  # at n_kv_head=1 both conventions pick head 0, so they agree
+            assert wrong > 1e-3, "the wrong grouping was not distinguishable"
+    torch.set_default_dtype(torch.float32)
+
     print("✅ all tests ok")
 
 

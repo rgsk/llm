@@ -407,8 +407,10 @@ small_train_cfg = TrainConfig(
 
 
 def run():
+    torch.manual_seed(0)  # same init test() builds
     model = GPT(**asdict(small_gpt_cfg))
     model.to(device)
+    torch.manual_seed(1)  # same batches evaluate(0) draws in test()
     train(model, small_train_cfg)
     prompt = torch.tensor([tok.encode("\n")], device=device)
     sample = tok.decode(generate(model, prompt, max_new_tokens=100)[0].tolist())
@@ -416,7 +418,104 @@ def run():
 
 
 def test():
+    # step-0 loss, before any update: the impls are the same function, so with
+    # the same weights and the same batch they must agree. comparing FINAL loss
+    # cannot show this -- float32 rounding differs by summation order, and AdamW
+    # amplifies one ulp into a gap bigger than the seed-to-seed spread
+    base = asdict(small_gpt_cfg)
+    E, NH = base["n_embed"], base["n_head"]
+    B, ITERS = small_train_cfg.batch_size, small_train_cfg.eval_iters
+
+    def step0(cls, n_kv_head, state):
+        """Exactly what train()'s evaluate(0) prints, for one attention impl."""
+        torch.manual_seed(0)  # same init as run()
+        model = GPT(**{**base, "n_kv_head": n_kv_head})
+        for b in model.blocks:  # same stack, only the attention swapped
+            b.attn = cls(E, NH) if cls is FusedQKVAttention else cls(E, NH, n_kv_head)
+        model.load_state_dict(state)  # the swap re-inits; put the weights back
+        model.to(device)
+        torch.manual_seed(1)  # same batches train_loss_est draws in run()
+        return train_loss_est(model, B, ITERS), full_val_loss(model, B).item()
+
+    cases = (
+        (
+            "n_kv_head=16 (MHA)",
+            16,
+            (FusedQKVAttention, GQAttentionFusedRepeatInterleave, GQAttentionFused),
+        ),
+        (
+            f"n_kv_head={base['n_kv_head']}  (GQA, what run() uses)",
+            base["n_kv_head"],
+            (GQAttentionFusedRepeatInterleave, GQAttentionFused),
+        ),
+    )
+    for label, nkv, impls in cases:
+        torch.manual_seed(0)
+        state = GPT(**{**base, "n_kv_head": nkv}).state_dict()  # one inited set
+        out = {cls.__name__: step0(cls, nkv, state) for cls in impls}
+        print(f"  {label}")
+        for name, (tr, va) in out.items():
+            print(f"      step    0 : train {tr:.3f}   val {va:.3f}   {name}")
+        for i in (0, 1):
+            vals = [v[i] for v in out.values()]
+            spread = max(vals) - min(vals)
+            assert spread < 1e-5, f"{label}: impls disagree by {spread:.2e}"
+
+    # the real check. step-0 loss above is only a smoke test: at init the stack
+    # is barely sensitive to attention weights, so a corrupted impl still scores
+    # bit-identical (measured: +1e-2 on a whole qkv moves the loss by 0.0e+00).
+    # comparing the layers directly in float64 has ~9 orders of headroom instead
+    torch.set_default_dtype(torch.float64)
     torch.manual_seed(0)
+    B, T = 2, 8
+    cos, sin = rope_tables(base["block_size"], E // NH)
+    cos, sin = cos[:T], sin[:T]
+    causal = torch.ones(T, T, dtype=torch.bool).tril()
+    x = torch.randn(B, T, E)
+
+    def compare(a, b, label, tol=1e-12):
+        assert a.state_dict().keys() == b.state_dict().keys(), f"{label}: key mismatch"
+        b.load_state_dict(a.state_dict())
+        a.zero_grad()  # a is reused across calls; stale grads would fake a mismatch
+        b.zero_grad()
+        xa, xb = x.clone().requires_grad_(True), x.clone().requires_grad_(True)
+        ya, yb = a(xa, cos, sin, causal), b(xb, cos, sin, causal)
+        w = torch.randn_like(ya)  # random weighting, so a sign flip cannot cancel
+        (ya * w).sum().backward()
+        (yb * w).sum().backward()
+        d = max(
+            (ya - yb).abs().max().item(),
+            (xa.grad - xb.grad).abs().max().item(),
+            *(
+                (pa.grad - pb.grad).abs().max().item()
+                for pa, pb in zip(a.parameters(), b.parameters())
+            ),
+        )
+        print(f"  {label:44} {d:.1e}")
+        assert d <= tol, f"{label}: differs by {d:.2e}"  # not (<=) also traps nan
+        return d
+
+    for nkv in (NH, 4, 1):  # n_rep 1, 4, 16 -- the fused reshape is identity at 1
+        ref = GQAttentionFusedRepeatInterleave(E, NH, nkv)
+        compare(
+            ref, GQAttentionFused(E, NH, nkv), f"GQAttentionFused    n_kv_head={nkv}"
+        )
+        if nkv == NH:  # only here is qkv square, so the MHA-only impl fits
+            compare(
+                ref, FusedQKVAttention(E, NH), f"FusedQKVAttention   n_kv_head={nkv}"
+            )
+
+    # negative control: the comparison has to be able to fail
+    a = GQAttentionFusedRepeatInterleave(E, NH, 4)
+    bad = GQAttentionFused(E, NH, 4)
+    bad.load_state_dict(a.state_dict())
+    with torch.no_grad():
+        bad.qkv.weight += 1e-8  # a thousandth of what the loss test cannot see
+    d = (a(x, cos, sin, causal) - bad(x, cos, sin, causal)).abs().max().item()
+    assert d > 1e-12, "float64 compare went blind"
+    print(f"  {'negative control (+1e-8 on qkv)':44} {d:.1e}  caught")
+    torch.set_default_dtype(torch.float32)
+
     print("✅ all tests ok")
 
 
