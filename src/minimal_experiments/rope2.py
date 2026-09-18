@@ -94,34 +94,33 @@ def apply_rope(x: Tensor, cos: Tensor, sin: Tensor) -> Tensor:
     return out
 
 
-class FusedQKVAttention(nn.Module):
+class FlashAttention(nn.Module):
     def __init__(self, n_embed: int, n_head: int):
         super().__init__()
         assert n_embed % n_head == 0
         self.n_head = n_head
-        self.head_size = n_embed // n_head
         self.qkv = nn.Linear(n_embed, 3 * n_embed, bias=False)
         self.proj = ResidualProj(n_embed, n_embed)
 
-    def forward(self, x: Tensor, cos: Tensor, sin: Tensor, causal: Tensor):
-        # cos/sin [T, hs/2] and causal [T, T] are sliced to this call by GPT
-        B, T, E = x.shape
-        nh, hs = self.n_head, self.head_size
+    def forward(self, x: Tensor, cos: Tensor, sin: Tensor):
+        nh = self.n_head
         qkv = self.qkv(x)  # [B, T, 3E]
         qkv = rearrange(qkv, "b t (three e) -> three b t e", three=3)
         q, k, v = [rearrange(t, "b t (nh hs) -> b nh t hs", nh=nh) for t in qkv]
         q = apply_rope(q, cos, sin)
         k = apply_rope(k, cos, sin)
-        scores = q @ rearrange(k, "b nh t hs -> b nh hs t") * hs**-0.5  # [B, nh, T, T]
-        scores = scores.masked_fill(~causal, float("-inf"))
-        w = F.softmax(scores, dim=-1)
-        out = w @ v  # [B, nh, T, hs]
+        out = F.scaled_dot_product_attention(
+            q,
+            k,
+            v,
+            is_causal=True,
+        )  # [B, nh, T, hs]
         out = rearrange(out, "b nh t hs -> b t (nh hs)")  # [B, T, E]
         out = self.proj(out)
         return out
 
 
-class GQAttentionFusedRepeatInterleave(nn.Module):
+class GQAttention(nn.Module):
     def __init__(
         self,
         n_embed: int,
@@ -143,7 +142,7 @@ class GQAttentionFusedRepeatInterleave(nn.Module):
         )
         self.proj = ResidualProj(n_embed, n_embed)
 
-    def forward(self, x: Tensor, cos: Tensor, sin: Tensor, causal: Tensor):
+    def forward(self, x: Tensor, cos: Tensor, sin: Tensor):
         B, T, E = x.shape
         nkv, hs = self.n_kv_head, self.head_size
         qkv: Tensor = self.qkv(x)
@@ -151,58 +150,13 @@ class GQAttentionFusedRepeatInterleave(nn.Module):
         q, k, v = [rearrange(t, "b t (n hs) -> b n t hs", hs=hs) for t in [q, k, v]]
         q = apply_rope(q, cos, sin)
         k = apply_rope(k, cos, sin)
-        k = k.repeat_interleave(self.n_rep, dim=1)
-        v = v.repeat_interleave(self.n_rep, dim=1)
-        scores: Tensor = (
-            q @ rearrange(k, "b nh t hs -> b nh hs t") * hs**-0.5
-        )  # [B, nh, T, T]
-        scores = scores.masked_fill(~causal, float("-inf"))
-        w = F.softmax(scores, dim=-1)
-        out = w @ v  # [B, nh, T, hs]
-        out = rearrange(out, "b nh t hs -> b t (nh hs)")  # [B, T, E]
-        out = self.proj(out)
-        return out
-
-
-class GQAttentionFused(nn.Module):
-    def __init__(
-        self,
-        n_embed: int,
-        n_head: int,
-        n_kv_head: int | None = None,
-    ):
-        super().__init__()
-        assert n_embed % n_head == 0
-        n_kv_head = n_head if n_kv_head is None else n_kv_head
-        assert n_head % n_kv_head == 0
-        self.n_head = n_head
-        self.head_size = n_embed // n_head
-        self.n_kv_head = n_kv_head
-        self.n_rep = n_head // n_kv_head  # q heads per kv head
-        self.qkv = nn.Linear(
-            n_embed,
-            n_embed + 2 * n_kv_head * self.head_size,
-            bias=False,
-        )
-        self.proj = ResidualProj(n_embed, n_embed)
-
-    def forward(self, x: Tensor, cos: Tensor, sin: Tensor, causal: Tensor):
-        B, T, E = x.shape
-        nh, nkv, hs = self.n_head, self.n_kv_head, self.head_size
-        qkv: Tensor = self.qkv(x)
-        q, k, v = qkv.split([E, nkv * hs, nkv * hs], dim=-1)
-        q, k, v = [rearrange(t, "b t (n hs) -> b n t hs", hs=hs) for t in [q, k, v]]
-        q = apply_rope(q, cos, sin)
-        k = apply_rope(k, cos, sin)
-        q = q.reshape(B, nkv, self.n_rep * T, hs)  # [B, nkv, n_rep*T, hs]
-        scores: Tensor = (
-            q @ rearrange(k, "b nkv t hs -> b nkv hs t") * hs**-0.5
-        )  # [B, nkv, n_rep*T, T]
-        causal = causal.repeat(self.n_rep, 1)  # [n_rep*T, T]
-        scores = scores.masked_fill(~causal, float("-inf"))
-        w = F.softmax(scores, dim=-1)
-        out = w @ v  # [B, nkv, n_rep*T, hs]
-        out = out.view(B, nh, T, hs)
+        out = F.scaled_dot_product_attention(
+            q,
+            k,
+            v,
+            is_causal=True,
+            enable_gqa=self.n_rep > 1,
+        )  # [B, nh, T, hs]
         out = rearrange(out, "b nh t hs -> b t (nh hs)")  # [B, T, E]
         out = self.proj(out)
         return out
@@ -231,11 +185,11 @@ class Block(nn.Module):
         super().__init__()
         self.ln1 = nn.LayerNorm(n_embed)
         self.ln2 = nn.LayerNorm(n_embed)
-        self.attn = GQAttentionFusedRepeatInterleave(n_embed, n_head, n_kv_head)
+        self.attn = GQAttention(n_embed, n_head, n_kv_head)
         self.ffwd = FeedForward(n_embed)
 
-    def forward(self, x: Tensor, cos: Tensor, sin: Tensor, causal: Tensor):
-        x = x + self.attn(self.ln1(x), cos, sin, causal)
+    def forward(self, x: Tensor, cos: Tensor, sin: Tensor):
+        x = x + self.attn(self.ln1(x), cos, sin)
         x = x + self.ffwd(self.ln2(x))
         return x
 
@@ -243,7 +197,6 @@ class Block(nn.Module):
 class GPT(nn.Module):
     rope_cos: Tensor
     rope_sin: Tensor
-    tril: Tensor
 
     def __init__(
         self,
@@ -263,11 +216,6 @@ class GPT(nn.Module):
         cos, sin = rope_tables(block_size, n_embed // n_head)
         self.register_buffer("rope_cos", cos, persistent=False)
         self.register_buffer("rope_sin", sin, persistent=False)
-        self.register_buffer(
-            "tril",
-            torch.ones(block_size, block_size, dtype=torch.bool).tril(),
-            persistent=False,
-        )
 
         self.blocks = nn.ModuleList(
             [Block(n_embed, n_head, n_kv_head) for _ in range(n_layer)]
@@ -295,9 +243,8 @@ class GPT(nn.Module):
         x = self.token_embedding_table(idx)
         # every position-dependent tensor is sliced once here, not once per layer
         cos, sin = self.rope_cos[:T], self.rope_sin[:T]
-        causal = self.tril[:T, :T]
         for block in self.blocks:
-            x = block(x, cos, sin, causal)
+            x = block(x, cos, sin)
         x = self.ln_f(x)
         logits = self.lm_head(x)
         return logits
