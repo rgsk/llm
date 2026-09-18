@@ -206,10 +206,10 @@ def batch_loss(model: GPT, x: Tensor, y: Tensor) -> Tensor:
 
 
 @torch.no_grad()
-def full_val_loss(model: GPT, batch_size: int, block_size: int):
+def full_val_loss(model: GPT, batch_size: int):
     was_training = model.training
     model.eval()
-    B, T = batch_size, block_size
+    B, T = batch_size, model.block_size
     nwin = (len(val_data) - 1) // T  # how many full windows fit
     x = val_data[: nwin * T].view(nwin, T)  # (nwin, T) inputs
     y = val_data[1 : nwin * T + 1].view(nwin, T)  # targets, shifted +1
@@ -226,14 +226,14 @@ def full_val_loss(model: GPT, batch_size: int, block_size: int):
 
 
 @torch.no_grad()
-def train_loss_est(model: GPT, batch_size: int, block_size: int, iters=100):
+def train_loss_est(model: GPT, batch_size: int, iters=100):
     """Cheap train-loss estimate from random batches (the train split is huge; no
     full pass needed)."""
     was_training = model.training
     model.eval()
     losses = []
     for _ in range(iters):
-        xb, yb = get_batch("train", batch_size, block_size)
+        xb, yb = get_batch("train", batch_size, model.block_size)
         loss = batch_loss(model, xb, yb)
         losses.append(loss)
     est = torch.stack(losses).mean().item()
@@ -244,15 +244,14 @@ def train_loss_est(model: GPT, batch_size: int, block_size: int, iters=100):
 def train(
     model: GPT,
     train_cfg: TrainConfig,
-    gpt_cfg: GPTConfig,
 ):
-    B, T = train_cfg.batch_size, gpt_cfg.block_size
+    B, T = train_cfg.batch_size, model.block_size
     opt = torch.optim.AdamW(model.parameters(), lr=train_cfg.lr)
 
     def evaluate(it: int):
         tr, va = (
-            train_loss_est(model, B, T, train_cfg.eval_iters),
-            full_val_loss(model, B, T),
+            train_loss_est(model, B, train_cfg.eval_iters),
+            full_val_loss(model, B),
         )
         print(f"  step {it:>4} : train {tr:.3f}   val {va:.3f}")
 
@@ -284,7 +283,7 @@ small_train_cfg = TrainConfig(
 if __name__ == "__main__":
     model = GPT(**asdict(small_gpt_cfg))
     model.to(device)
-    train(model, small_train_cfg, small_gpt_cfg)
+    train(model, small_train_cfg)
     prompt = torch.tensor([tok.encode("\n")], device=device)
     sample = tok.decode(generate(model, prompt, max_new_tokens=100)[0].tolist())
     print(sample)
