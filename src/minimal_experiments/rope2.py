@@ -371,10 +371,10 @@ def test():
     # rounding differs by summation order and AdamW amplifies one ulp
     base = asdict(small_gpt_cfg)
     E, NH = base["n_embed"], base["n_head"]
-    B, ITERS = small_train_cfg.batch_size, small_train_cfg.eval_iters
 
     def step0(cls, n_kv_head, state):
         """Exactly what train()'s evaluate(0) prints, for one attention impl."""
+        B, ITERS = small_train_cfg.batch_size, small_train_cfg.eval_iters
         torch.manual_seed(0)  # same init as run()
         model = GPT(**{**base, "n_kv_head": n_kv_head})
         for b in model.blocks:  # same stack, only the attention swapped
@@ -408,10 +408,10 @@ def test():
     # bit-identical. float64 at module level has ~9 orders of headroom instead
     torch.set_default_dtype(torch.float64)
     torch.manual_seed(0)
-    T, hs = 8, E // NH
+    B, T, hs = 4, 8, E // NH
     cos, sin = rope_tables(base["block_size"], hs)
     cos, sin = cos[:T], sin[:T]
-    x = torch.randn(2, T, E)
+    x = torch.randn(B, T, E)
     tril = torch.ones(T, T, dtype=torch.bool).tril()
 
     # MHA: enable_gqa off, so SDPA's own causal kernel is the oracle
@@ -426,9 +426,9 @@ def test():
     # q head h attends with kv head h // n_rep, one head at a time
     def by_hand(m, pick):
         q, k, v = m.qkv(x).split([E, m.n_kv_head * hs, m.n_kv_head * hs], dim=-1)
-        q = q.view(2, T, NH, hs).transpose(1, 2)
-        k = k.view(2, T, m.n_kv_head, hs).transpose(1, 2)
-        v = v.view(2, T, m.n_kv_head, hs).transpose(1, 2)
+        q = q.view(B, T, NH, hs).transpose(1, 2)
+        k = k.view(B, T, m.n_kv_head, hs).transpose(1, 2)
+        v = v.view(B, T, m.n_kv_head, hs).transpose(1, 2)
         q, k = apply_rope(q, cos, sin), apply_rope(k, cos, sin)
         heads = []
         for h in range(NH):
