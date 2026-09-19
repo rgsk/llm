@@ -26,6 +26,7 @@ dev = [
     "ipywidgets>=8.1.9",
     "mypy>=2.3.1",
     "nbqa>=1.9.1",
+    "pytest>=9.1.1",
     "ruff>=0.16.2",
 ]
 
@@ -35,3 +36,10 @@ dev = [
 # `tokenizer` resolves to src/tokenizer.py from one and src/video/tokenizer.py from
 # the other. Pinned here to match settings.json's python.analysis.extraPaths.
 src = ["src", "src/video", "src/scratch"]
+
+[tool.pytest.ini_options]
+# registering the mark silences the unknown-mark warning; --strict-markers is
+# what makes it useful, turning a typo'd @pytest.mark.slwo into a collection
+# error instead of a mark that silently never gets deselected
+addopts = ["--strict-markers"]
+markers = ["slow: seconds, not milliseconds -- skip with -m 'not slow'"]
