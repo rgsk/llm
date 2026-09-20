@@ -488,7 +488,30 @@ KL control. It is the first thing in the series that can silently fail to learn.
 - **MoE** — routing, top-k experts, load-balancing loss. Self-contained.
 - **An eval beyond val loss** — bpc is there; something task-shaped makes the SFT
   and RL episodes legible.
-- **YaRN / NTK context extension** — only as a RoPE sequel, if RoPE lands well.
+- **PI / NTK / YaRN context extension** — **built and measured in
+  `src/minimal_experiments/rope6.py` (NTK) and `rope7.py` (PI, NTK, YaRN in one
+  table)**; integration into `src/video/` is pending, still as a RoPE sequel. All
+  three live entirely in the angle computation — attention, mask, KV cache and
+  `generate` are untouched — which is what makes them a small episode. The whole
+  family is three lines of `theta` shrink per pair, fastest to slowest, at x8:
+
+      pi    8.00 8.00 8.00 8.00 8.00 8.00 8.00 8.00
+      ntk   1.00 1.35 1.81 2.44 3.28 4.42 5.94 8.00
+      yarn  1.00 1.00 1.80 4.13 7.00 8.00 8.00 8.00
+
+  PI is the control and it earns its place: slowing the fast pairs costs **1.92
+  -> 2.95** inside the trained range at x2 alone, against NTK's 1.92 -> 2.09 at
+  x8 for a better far field. Frequency-selectivity is worth ~1.4 nats, measured,
+  not asserted.
+
+  The open question is that all of this is **zero-shot**, which is the case only
+  NTK was designed for — PI and YaRN are both published *with* a fine-tune at the
+  extended length, and YaRN's pinning of well-covered pairs exists precisely to
+  make that fine-tune cheap and non-destructive. A frozen model sees the cost and
+  none of the benefit, and YaRN duly loses to NTK here. The experiment that
+  settles it: **fine-tune ~100 steps at 4096 with each scaling on**, then re-run
+  the per-position table. Worth doing after BPE+FineWeb rather than on the char
+  model, where long context means something.
 
 ## Skip
 
