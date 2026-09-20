@@ -558,26 +558,25 @@ def extrapolation_report(model: GPT, window: int, scales=(2.0, 4.0, 8.0)):
     nwin = min(64, (len(val_data) - 1) // window)
     # enable_gqa drops sdpa off the flash path onto one that materialises the
     # scores, so peak memory grows with window**2, not window
-    batch = max(1, 2048 // window)
     d = val_data[: nwin * window + 1]
     x = d[: nwin * window].view(nwin, window)  # cpu; moved a batch at a time
     y = d[1 : nwin * window + 1].view(nwin, window)
     spans = list(zip(edges, edges[1:]))
 
     def row(label: str):
-        bands, rows = [0.0] * len(spans), 0
-        for i in range(0, nwin, batch):
-            xb, yb = x[i : i + batch].to(device), y[i : i + batch].to(device)
+        chunks = []
+        for i in range(nwin):
+            xb, yb = x[i : i + 1].to(device), y[i : i + 1].to(device)
             logits = model(xb)
-            loss = F.cross_entropy(
-                logits.reshape(-1, logits.size(-1)), yb.reshape(-1), reduction="none"
-            ).view(xb.size(0), window)
-            for j, (lo, hi) in enumerate(spans):
-                bands[j] += loss[:, lo:hi].sum().item()
-            rows += xb.size(0)
-        cells = "".join(
-            f"{t / (rows * (hi - lo)):10.3f}" for t, (lo, hi) in zip(bands, spans)
-        )
+            chunks.append(
+                F.cross_entropy(
+                    logits.reshape(-1, logits.size(-1)),
+                    yb.reshape(-1),
+                    reduction="none",
+                ).view(xb.size(0), window)
+            )
+        loss = torch.cat(chunks)  # [nwin, window], the batching undone
+        cells = "".join(f"{loss[:, lo:hi].mean().item():10.3f}" for lo, hi in spans)
         print(f"    {label:<12}" + cells)
 
     print(f"  per-position val loss, window={window}, block_size={model.block_size}")
