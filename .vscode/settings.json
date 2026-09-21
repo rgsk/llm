@@ -14,4 +14,12 @@
         "src/video",
         "src/scratch"
     ],
+    "python.testing.pytestEnabled": true,
+    "python.testing.unittestEnabled": false,
+    "python.testing.pytestArgs": [
+        "src",
+        // don't swallow print() from passing tests -- the test explorer only
+        // ever shows what pytest itself writes out
+        "-rP"
+    ],
 }

@@ -458,16 +458,13 @@ if __name__ == "__main__":
         )
         assert flipped < 1e-4 * total and drift < 1e-2
 
-        import sys
+        from paths import TOKENIZER_DIR
+        from tokenizer import OurBPETokenizer
 
-        from paths import ROOT
-
-        sys.path.append(str(ROOT / "src"))
-        from tokenizer import BPETokenizer
-
-        tok = BPETokenizer.load(
-            str(ROOT / "artifacts" / "tokenizer" / "bpe_ts_4096.json")
-        )
+        # our own reader, not src/tokenizer.py's: sys.path.append puts src/
+        # LAST, so "tokenizer" resolved here anyway and the name it exports
+        # differs. Same file on disk either way
+        tok = OurBPETokenizer.load(str(TOKENIZER_DIR / "bpe_ts_4096.json"))
         print(
             f"\nfrom the {int8_mb:.0f} MB file, fp32 never built:\n{tok.decode(b[0].tolist())!r}"
         )
