@@ -23,6 +23,7 @@ from gpt_config import (
     fineweb_smoke_cfg,
     small_cfg,
 )
+from instruct import Instruct
 from paths import DATASET
 from reverse import Reverse
 from sft import sft
@@ -50,7 +51,7 @@ CFGS: dict[str, tuple[GPTConfig, TrainConfig]] = {
     "fineweb": (fineweb_cfg, fineweb_train),
 }
 # the registry lives here, not in task.py: task.py is what reverse.py imports
-TASKS = {"reverse": Reverse}
+TASKS = {"reverse": Reverse, "instruct": Instruct}
 
 PROMPT = ENDOFTEXT if DATASET.startswith("fineweb") else "\n"
 

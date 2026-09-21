@@ -163,8 +163,9 @@ class GPT(Module):
             if use_cache:
                 layer_cache = kv_caches[i] if kv_caches is not None else None
                 x, new_cache = block(
-                    x, layer_cache, use_cache=True, block_mask=block_mask
-                )
+                    x, layer_cache, use_cache=True, block_mask=block_mask,
+                    cos=cos, sin=sin,
+                )  # fmt: skip
                 new_caches.append(new_cache)
             else:
                 x = block(x, block_mask=block_mask, cos=cos, sin=sin)

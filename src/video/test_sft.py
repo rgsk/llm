@@ -116,3 +116,18 @@ def test_masking_opens_a_gap_between_the_two_halves(task, model, cfg, gpt_cfg):
     assert abs(first["comp"] - first["prompt"]) < 0.05  # untrained, both at ln(V)
     assert last["comp"] < first["comp"] - 3.0
     assert last["prompt"] - last["comp"] > 0.5  # only one half is in the loss
+
+
+def test_the_best_checkpoint_follows_the_task_not_a_metric_name(
+    task, model, cfg, gpt_cfg, tmp_path
+):
+    class Renamed(Reverse):
+        name = "renamed"
+
+        def evaluate(self, model, n=200, **kw):
+            scores = super().evaluate(model, n, **kw)
+            return {"solved": scores["exact_match"], **scores}
+
+    ckpt = tmp_path / "renamed.pt"
+    sft(model, Renamed(task.tok), cfg, gpt_cfg, block_size=16, ckpt_path=ckpt, eval_n=8)
+    assert torch.load(ckpt, map_location="cpu", weights_only=False)["task"] == "renamed"

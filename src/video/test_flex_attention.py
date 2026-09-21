@@ -144,3 +144,25 @@ def test_flex_matches_sdpa_on_the_same_mask(layer):
     assert torch.allclose(
         layer(x, cos, sin), layer(x, cos, sin, block_mask=bm), atol=1e-4
     )
+
+
+def test_gpt_threads_angles_through_the_cached_path_too():
+    # the decode branch had no cos/sin, so flex + use_cache raised on the first
+    # step -- exercised only once a task generated with a cache
+    from dataclasses import asdict
+
+    from generate import generate
+    from gpt import GPT
+    from gpt_config import GPTConfig
+
+    cfg = GPTConfig(
+        vocab_size=64, block_size=64, n_embed=E, n_head=NH, n_layer=2,
+        attention="flex", n_kv_head=2, position="rope",
+    )  # fmt: skip
+    torch.manual_seed(0)
+    m = GPT(**asdict(cfg))
+    prompt = torch.randint(0, 64, (2, 5))
+    assert torch.equal(
+        generate(m, prompt, 8, temperature=0.0),
+        generate(m, prompt, 8, temperature=0.0, use_cache=True),
+    )

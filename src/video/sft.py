@@ -87,9 +87,14 @@ def sft(
     weight_decay: float = 0.1,
     grad_clip: float = 1.0,
     eval_n: int = 200,
+    select: str | None = None,
 ) -> list[dict]:
     """block_size is the training window, not the model's: rope is computed on
-    demand, so a 1024-block model finetunes fine on 256-wide windows."""
+    demand, so a 1024-block model finetunes fine on 256-wide windows.
+
+    select names the metric the best checkpoint is kept on. The default is the
+    first key the task's evaluate returns, so a task declares its own headline
+    number by ordering rather than by agreeing on a name."""
     T = gpt_cfg.block_size if block_size is None else block_size
     assert T <= gpt_cfg.block_size, f"window {T} > model block_size"
     V = gpt_cfg.vocab_size
@@ -110,7 +115,7 @@ def sft(
     opt = AdamW(decay_groups(model, weight_decay), lr=cfg.lr, betas=(0.9, 0.95))
     model.train()
 
-    best = (-1.0, -float("inf"))  # (exact_match, -completion loss)
+    best = (-1.0, -float("inf"))  # (the task's headline metric, -completion loss)
     history: list[dict] = []
     t0 = time.perf_counter()
     gnorm = torch.tensor(float("nan"))
@@ -140,7 +145,7 @@ def sft(
         )
         run.log(row, step=it)
         # the scoreboard is the objective; completion loss only breaks ties
-        score = (scores["exact_match"], -comp)
+        score = (scores[select or next(iter(scores))], -comp)
         if score > best and ckpt_path is not None:
             save_checkpoint(
                 ckpt_path, model, gpt_cfg, step=it, val_loss=comp,
