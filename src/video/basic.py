@@ -1,20 +1,22 @@
 """The whole thing, assembled. Every import below is a file we wrote:
-torch.nn, torch.nn.functional and torch.optim appear nowhere in the model path."""
+torch.nn, torch.nn.functional and torch.optim appear nowhere in the model path.
 
-from dataclasses import asdict
+    python basic.py pretrain --cfg fineweb_smoke
+    python basic.py sft --task reverse
+    python basic.py sample --ckpt artifacts/checkpoints/....pt
+"""
+
+import argparse
+from dataclasses import asdict, replace
+from pathlib import Path
 
 import torch
 
-from checkpoint import (
-    CKPT_DIR,
-    generate_ckpt_path,
-    latest_ckpt,
-    load_checkpoint,
-)
+from checkpoint import generate_ckpt_path, latest_ckpt, load_checkpoint
 from dataset import BinDataset, meta
 from generate import generate
 from gpt import GPT
-from gpt_config import (  # noqa: F401
+from gpt_config import (
     GPTConfig,
     big_cfg,
     fineweb_cfg,
@@ -22,13 +24,16 @@ from gpt_config import (  # noqa: F401
     small_cfg,
 )
 from paths import DATASET
+from reverse import Reverse
+from sft import sft
 from tokenizer import ENDOFTEXT, tokenizer_for
 from train import train
-from train_config import (  # noqa: F401
+from train_config import (
     TrainConfig,
     big_train,
     fineweb_smoke_train,
     fineweb_train,
+    sft_train,
     small_train,
 )
 
@@ -37,24 +42,15 @@ tok = tokenizer_for()  # follows VIDEO_DATASET, like BinDataset does
 # TF32 tensor cores for fp32 matmuls: ~1.26x on this model, measured.
 torch.set_float32_matmul_precision("high")
 
-gpt_cfg = GPTConfig(
-    vocab_size=meta["vocab_size"],
-    block_size=128,
-    n_embed=192,
-    n_head=6,
-    n_layer=4,
-    attention="sdpa",
-    position="learned",
-)
-
-
-# needs VIDEO_DATASET=fineweb_edu; train() asserts the vocab matches the shards
-gpt_cfg = fineweb_smoke_cfg
-train_cfg = fineweb_smoke_train
-
-# gpt_cfg, train_cfg = fineweb_smoke_cfg, fineweb_smoke_train  # 20 min on a 4060
-# gpt_cfg, train_cfg = big_cfg, big_train  # tinystories
-
+# a pretraining run is a (model, schedule) pair -- neither half means much alone
+CFGS: dict[str, tuple[GPTConfig, TrainConfig]] = {
+    "small": (small_cfg, small_train),
+    "big": (big_cfg, big_train),
+    "fineweb_smoke": (fineweb_smoke_cfg, fineweb_smoke_train),
+    "fineweb": (fineweb_cfg, fineweb_train),
+}
+# the registry lives here, not in task.py: task.py is what reverse.py imports
+TASKS = {"reverse": Reverse}
 
 PROMPT = ENDOFTEXT if DATASET.startswith("fineweb") else "\n"
 
@@ -66,53 +62,140 @@ def sample(model: GPT, prompt: str = PROMPT, max_new_tokens: int = 300, **kw) ->
     return tok.decode(out[0].tolist())
 
 
-if __name__ == "__main__":
-    run_training = True
-    # a specific file, or None to take the newest run named train_cfg.name.
-    # main.py's own checkpoints load here now -- they only need `attention`
-    # named, since main.py never stored it
-    ckpt = CKPT_DIR / "fineweb_smoke_2026-09-16_18-00-23.pt"
-    ckpt = None
+def overrides(args, **names) -> dict:
+    """Flags left unset keep the preset's value."""
+    return {
+        k: getattr(args, a) for k, a in names.items() if getattr(args, a) is not None
+    }
+
+
+def cmd_pretrain(args, device: str) -> Path:
+    gpt_cfg, train_cfg = CFGS[args.cfg]
+    train_cfg = replace(train_cfg, **overrides(args, max_steps="steps", lr="lr"))
+    print(gpt_cfg, train_cfg, sep="\n")
+    torch.manual_seed(train_cfg.seed)
+    model = GPT(**asdict(gpt_cfg)).to(device)
+    n_params = sum(p.numel() for p in model.parameters())
+
+    # 20 tok/param is chinchilla's compute-optimal ratio; below it the model is
+    # bigger than the data needs
+    tokens = (
+        train_cfg.batch_size
+        * gpt_cfg.block_size
+        * train_cfg.grad_accum_steps
+        * train_cfg.max_steps
+    )
+    print(f"{n_params / 1e6:.2f}M params ({n_params:,})")
+    print(
+        f"{tokens / 1e6:.0f}M tokens  {tokens / n_params:.1f} tok/param (20 optimal)"
+        f"  {tokens / meta['train']['n_tokens']:.2f} epochs"
+    )
+
+    train_ds, val_ds = BinDataset("train"), BinDataset("val")
+    ckpt = generate_ckpt_path(train_cfg.name)
+    train(model, train_cfg, gpt_cfg, train_ds, val_ds, device=device, ckpt_path=ckpt)
+    train_ds.close()
+    val_ds.close()
+    return ckpt
+
+
+def cmd_sft(args, device: str) -> Path:
+    base = Path(args.ckpt) if args.ckpt else latest_ckpt(args.base, max_val_loss=6.0)
+    # flex is what SFT trains on; the base was pretrained under plain sdpa, and
+    # the weights are the same either way
+    model, m = load_checkpoint(base, device, attention="flex")
+    gpt_cfg = replace(GPTConfig.from_dict(m["config"]), attention="flex")
+    task = TASKS[args.task]()
+    cfg = replace(
+        sft_train,
+        name=f"sft_{task.name}",
+        use_wandb=args.wandb,
+        **overrides(
+            args,
+            max_steps="steps",
+            lr="lr",
+            batch_size="batch_size",
+            grad_accum_steps="grad_accum",
+        ),
+    )
+    print(f"base {base.name}   val {m['val_loss']:.4f}   task {task.name}")
+    print(cfg)
+    ckpt = generate_ckpt_path(cfg.name)
+    sft(
+        model,
+        task,
+        cfg,
+        gpt_cfg,
+        block_size=args.block_size,
+        device=device,
+        ckpt_path=ckpt,
+        eval_n=args.eval_n,
+    )
+    return ckpt
+
+
+def cmd_sample(args, device: str) -> Path:
+    return Path(args.ckpt) if args.ckpt else latest_ckpt(args.name)
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser(description=__doc__)
+    sub = ap.add_subparsers(dest="cmd")
+
+    pre = sub.add_parser("pretrain", help="train a model from scratch")
+    pre.add_argument("--cfg", default="fineweb_smoke", choices=list(CFGS))
+
+    ft = sub.add_parser("sft", help="finetune a checkpoint on a task")
+    ft.add_argument("--task", default="reverse", choices=list(TASKS))
+    ft.add_argument("--ckpt", help="base checkpoint (default: newest --base run)")
+    ft.add_argument("--base", default="fineweb", help="checkpoint name prefix")
+    ft.add_argument("--block-size", type=int, default=256, help="training window")
+    ft.add_argument("--batch-size", type=int)
+    # the OOM lever: the [B, T, vocab] logits are the peak, and accumulating
+    # keeps tokens-per-step the same while halving it
+    ft.add_argument("--grad-accum", type=int)
+    ft.add_argument("--eval-n", type=int, default=200, help="samples per scoreboard")
+    ft.add_argument("--wandb", action="store_true")
+
+    smp = sub.add_parser("sample", help="generate from a checkpoint")
+    smp.add_argument("--ckpt")
+    smp.add_argument("--name", default="fineweb", help="checkpoint name prefix")
+    smp.add_argument("--prompt", default=PROMPT)
+    smp.add_argument("--tokens", type=int, default=300)
+
+    for p in (pre, ft):
+        p.add_argument("--steps", type=int)
+        p.add_argument("--lr", type=float)
+
+    args = ap.parse_args()
+    if args.cmd is None:
+        ap.print_help()
+        return
+
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    print(f"device {device}   run_training {run_training}")
-
-    if run_training:
-        print(gpt_cfg)
-        print(train_cfg)
-        torch.manual_seed(train_cfg.seed)
-        model = GPT(**asdict(gpt_cfg)).to(device)
-        n_params = sum(p.numel() for p in model.parameters())
-        print(f"{n_params / 1e6:.2f}M params ({n_params:,})")
-
-        # what the run will actually see. 20 tok/param is chinchilla's
-        # compute-optimal ratio; below it the model is bigger than the data needs
-        tokens = (
-            train_cfg.batch_size
-            * gpt_cfg.block_size
-            * train_cfg.grad_accum_steps
-            * train_cfg.max_steps
-        )
-        print(
-            f"{tokens / 1e6:.0f}M tokens  {tokens / n_params:.1f} tok/param (20 optimal)"
-            f"  {tokens / meta['train']['n_tokens']:.2f} epochs"
-        )
-        train_ds, val_ds = BinDataset("train"), BinDataset("val")
-        ckpt = generate_ckpt_path(train_cfg.name)
-        train(
-            model, train_cfg, gpt_cfg, train_ds, val_ds, device=device, ckpt_path=ckpt
-        )
-        train_ds.close()
-        val_ds.close()
-    else:
-        ckpt = ckpt or latest_ckpt(train_cfg.name)
+    print(f"device {device}")
+    ckpt = {"pretrain": cmd_pretrain, "sft": cmd_sft, "sample": cmd_sample}[args.cmd](
+        args, device
+    )
 
     # always sample from the file, never the in-memory model: if the checkpoint
     # is wrong, this is where it shows
     print(f"\nloading {ckpt.name}")
     model, m = load_checkpoint(ckpt, device)
-    print(f"best step {m['step']}   val {m['val_loss']:.4f}   bpc {m['bpc']:.3f}")
+    print("  ".join(f"{k} {v:.4f}" for k, v in m.items() if isinstance(v, float)))
 
+    if "task" in m:  # a task model is scored, not sampled from
+        scores = TASKS[m["task"]]().evaluate(model, getattr(args, "eval_n", 200))
+        print("  ".join(f"{k} {v:.3f}" for k, v in scores.items()))
+        return
+
+    prompt = getattr(args, "prompt", PROMPT)
+    tokens = getattr(args, "tokens", 300)
     print("\n--- greedy ---")
-    print(sample(model, temperature=0.0, use_cache=True))
+    print(sample(model, prompt, tokens, temperature=0.0, use_cache=True))
     print("\n--- temperature 0.8, top_p 0.95 ---")
-    print(sample(model, temperature=0.8, top_p=0.95, use_cache=True))
+    print(sample(model, prompt, tokens, temperature=0.8, top_p=0.95, use_cache=True))
+
+
+if __name__ == "__main__":
+    main()

@@ -81,6 +81,21 @@ fineweb_train = TrainConfig(
     upload_ckpt=True,
 )
 
+# --- finetuning -----------------------------------------------------------
+# lr an order of magnitude under pretraining: the weights are already good, and
+# a short run on a narrow task is where a big step does its damage.
+sft_train = TrainConfig(
+    batch_size=16,
+    max_steps=400,
+    lr=3e-5,
+    min_lr=3e-6,
+    warmup_steps=20,
+    eval_interval=50,
+    eval_iters=20,
+    name="sft",
+)
+
+
 if __name__ == "__main__":
     from dataclasses import asdict, replace
 

@@ -38,7 +38,9 @@ def latest_ckpt(
     disk and pages in only the pickled metadata: ~2 ms against ~32 ms for a real
     load of a 100 MB checkpoint.
     """
-    matches = sorted(ckpt_dir.glob(f"{prefix}*.pt"))
+    # the timestamp has to be there: a bare {prefix}*.pt glob makes "fineweb"
+    # match "fineweb_smoke_..." too, and pick another run's model
+    matches = sorted(ckpt_dir.glob(f"{prefix}_????-??-??_??-??-??.pt"))
     if not matches:
         raise FileNotFoundError(f"no checkpoint matching {prefix}*.pt in {ckpt_dir}")
     if max_val_loss is None:
