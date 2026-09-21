@@ -10,6 +10,7 @@ from linear import Linear
 from module import Module
 from module_list import ModuleList
 from residual_proj import ResidualProj
+from rope import rope_angles
 from sinusoidal import SinusoidalEmbedding
 
 Position = Literal["learned", "sinusoidal", "rope"]
@@ -61,6 +62,7 @@ class GPT(Module):
         super().__init__()
         self.block_size = block_size
         self.n_layer = n_layer
+        self.head_size = n_embed // n_head
         # with pinned sinks under rope the caches re-index their own positions,
         # so block_size stops bounding the run and bounds only the chunk
         self.streaming = sinks > 0 and position == "rope"
@@ -114,6 +116,7 @@ class GPT(Module):
         idx: Tensor,
         kv_caches: list[KVCache] | None = None,
         use_cache: bool = False,
+        block_mask=None,
     ) -> Tensor | tuple[Tensor, list[KVCache]]:
         """One cache per block, in layer order -- blocks share nothing.
 
@@ -149,14 +152,22 @@ class GPT(Module):
             pos = torch.arange(T_past, T_past + T, device=idx.device)
             x = x + self.position_embedding_table(pos)
 
+        # one set of angles for every layer, not one table per layer
+        cos = sin = None
+        if getattr(self.blocks[0].attn, "takes_rope", False):
+            cos, sin = rope_angles(T_past, T, self.head_size, device=x.device)
+            cos, sin = cos.to(x.dtype), sin.to(x.dtype)
+
         new_caches: list[KVCache] = []
         for i, block in enumerate(self.blocks):
             if use_cache:
                 layer_cache = kv_caches[i] if kv_caches is not None else None
-                x, new_cache = block(x, layer_cache, use_cache=True)
+                x, new_cache = block(
+                    x, layer_cache, use_cache=True, block_mask=block_mask
+                )
                 new_caches.append(new_cache)
             else:
-                x = block(x)
+                x = block(x, block_mask=block_mask, cos=cos, sin=sin)
         x = self.ln_f(x)
         logits = self.lm_head(x)  # [B, T, V]
         return (logits, new_caches) if use_cache else logits

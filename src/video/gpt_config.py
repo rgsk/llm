@@ -33,8 +33,8 @@ class GPTConfig:
         if self.position == "rope":
             # rope rotates inside attention, so only an attention that knows
             # about it can carry it -- and it pairs dims per HEAD, not per model
-            assert self.attention in ("sdpa", "gqa"), (
-                "position='rope' needs attention='sdpa' or 'gqa'"
+            assert self.attention in ("sdpa", "gqa", "flex"), (
+                "position='rope' needs attention='sdpa', 'gqa' or 'flex'"
             )
             assert (self.n_embed // self.n_head) % 2 == 0, (
                 "rope needs an even head_size: the dims rotate in pairs"
@@ -63,8 +63,14 @@ class GPTConfig:
                 f"sinks + window ({self.sinks} + {self.window}) is the cache, and "
                 f"read-time rope indexes a block_size {self.block_size} table by rank"
             )
+        if self.attention == "flex":
+            # flex always rotates; a learned table on top would double-count
+            # window/ring/sinks are already rejected above for anything but gqa
+            assert self.position == "rope", "attention='flex' needs position='rope'"
         if self.n_kv_head is not None:
-            assert self.attention == "gqa", "n_kv_head needs attention='gqa'"
+            assert self.attention in ("gqa", "flex"), (
+                "n_kv_head needs attention='gqa' or 'flex'"
+            )
             assert self.n_head % self.n_kv_head == 0, (
                 "n_kv_head must divide n_head: every kv head serves the same group"
             )

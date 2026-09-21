@@ -4,6 +4,7 @@ from torch import Tensor
 
 from common import KVCache
 from feed_forward import FeedForward
+from flex_attention import FlexAttention
 from fused_qkv_attention import FusedQKVAttention
 from gated_feed_forward import GatedFeedForward
 from gqa_attention import GQAttention
@@ -13,7 +14,7 @@ from multi_head_attention import MultiHeadAttention
 from rms_norm import RMSNorm
 from sdpa_attention import SDPAttention
 
-Attention = Literal["mha", "fused", "sdpa", "gqa"]
+Attention = Literal["mha", "fused", "sdpa", "gqa", "flex"]
 Norm = Literal["layer", "rms"]
 FFN = Literal["dense", "gated"]
 
@@ -42,8 +43,8 @@ def make_attention(
     -- it is a mask, and only the two layers that build their mask from
     sliding_window_mask know how to narrow it.
     """
-    assert not use_rope or kind in ("sdpa", "gqa"), (
-        f"use_rope needs attention='sdpa' or 'gqa', not {kind!r}"
+    assert not use_rope or kind in ("sdpa", "gqa", "flex"), (
+        f"use_rope needs attention='sdpa', 'gqa' or 'flex', not {kind!r}"
     )
     assert window is None or kind in ("sdpa", "gqa"), (
         f"window needs attention='sdpa' or 'gqa', not {kind!r}"
@@ -76,6 +77,9 @@ def make_attention(
                 ring,
                 sinks,
             )
+        case "flex":
+            # rope always, mask handed in per batch -- see attention.py
+            return FlexAttention(n_embed, n_head, block_size, dropout, n_kv_head)
         case _:
             raise ValueError(f"unknown attention: {kind}")
 
@@ -140,6 +144,9 @@ class Block(Module):
         x: Tensor,
         kv_cache: KVCache | None = None,
         use_cache: bool = False,
+        block_mask=None,
+        cos: Tensor | None = None,
+        sin: Tensor | None = None,
     ) -> Tensor | tuple[Tensor, KVCache]:
         """The cache belongs to attn -- ln1, ffwd and the two residual adds are
         per-position, so they neither read it nor need one of their own. A block
@@ -147,10 +154,17 @@ class Block(Module):
 
         use_cache needs attention="fused", "sdpa" or "gqa"; "mha" takes x only.
         """
+        # the older attentions hold their own rope tables and build their own
+        # masks, so neither is added to every signature
+        args = (self.ln1(x),)
+        if getattr(self.attn, "takes_rope", False):
+            assert cos is not None, "this attention needs cos/sin threaded from GPT"
+            args += (cos, sin)
+        kw = {} if block_mask is None else {"block_mask": block_mask}
         if use_cache:
-            attn_out, new_cache = self.attn(self.ln1(x), kv_cache, use_cache=True)
+            attn_out, new_cache = self.attn(*args, kv_cache, use_cache=True, **kw)
         else:
-            attn_out = self.attn(self.ln1(x))
+            attn_out = self.attn(*args, **kw)
         x = x + attn_out  # communicate
         x = x + self.ffwd(self.ln2(x))  # compute
         return (x, new_cache) if use_cache else x  # [B, T, E]

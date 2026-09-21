@@ -43,9 +43,16 @@ class KVCache:
     once positions are relative -- which is RoPE's episode, not this one.
     """
 
-    def __init__(self, shape: tuple[int, int, int, int] | None = None):
-        """shape is [B, n_kv_head, block_size, head_size]. None grows by copying."""
+    def __init__(
+        self, shape: tuple[int, int, int, int] | None = None, grow: bool = False
+    ):
+        """shape is [B, n_kv_head, block_size, head_size]. None grows by copying.
+
+        grow=True doubles a preallocated buffer instead of refusing, so block_size
+        stops being a ceiling on a run. Amortized O(T): log2(T) copies, against
+        the O(T^2) that concatenating every step costs."""
         self.shape = shape
+        self.grow = grow
         self.k: Tensor | None = None
         self.v: Tensor | None = None
         self.pos = 0  # positions written so far
@@ -70,9 +77,23 @@ class KVCache:
             self.k = torch.empty(self.shape, device=k.device, dtype=k.dtype)
             self.v = torch.empty_like(self.k)
         end = self.pos + T
-        assert end <= self.shape[2], (
-            f"sequence of {end} outgrew the cache's block_size {self.shape[2]}"
-        )
+        if end > self.k.size(2):
+            assert self.grow, (
+                f"sequence of {end} outgrew the cache's block_size "
+                f"{self.k.size(2)}; pass grow=True to extend instead"
+            )
+            cap = self.k.size(2)
+            while cap < end:
+                cap *= 2
+            for name in ("k", "v"):
+                old_buf = getattr(self, name)
+                buf = torch.empty(
+                    (*old_buf.shape[:2], cap, old_buf.shape[3]),
+                    device=old_buf.device,
+                    dtype=old_buf.dtype,
+                )
+                buf[:, :, : self.pos] = old_buf[:, :, : self.pos]
+                setattr(self, name, buf)
         self.k[:, :, self.pos : end] = k
         self.v[:, :, self.pos : end] = v
         self.pos = end
