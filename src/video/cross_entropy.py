@@ -13,11 +13,15 @@ def log_softmax(x: Tensor, dim: int = -1) -> Tensor:
     return z - z.exp().sum(dim=dim, keepdim=True).log()  # log(sum(exp)) done stably
 
 
-def our_cross_entropy(logits: Tensor, targets: Tensor) -> Tensor:
+def our_cross_entropy(
+    logits: Tensor, targets: Tensor, *, ignore_index: int = -100
+) -> Tensor:
+    """ignore_index is keyword-only, because F.cross_entropy takes `weight` third."""
     n = targets.size(0)
     logp = log_softmax(logits, dim=-1)  # [N, V]
-    picked = logp[torch.arange(n), targets]  # [N] -- the correct class's log-prob
-    return -picked.mean()
+    # ignored targets are not valid columns, so clamp them and drop them after
+    picked = logp[torch.arange(n), targets.clamp(min=0)]  # the true class's log-prob
+    return -picked[targets != ignore_index].mean()
 
 
 if TYPE_CHECKING:
@@ -53,7 +57,9 @@ if __name__ == "__main__":
     print(
         f"random-init incorrect loss: {our_cross_entropy(logits * 2, targets).item():.4f}"
     )
-    print(f"random-init incorrect loss: {our_cross_entropy(logits, targets).item():.4f}")
+    print(
+        f"random-init incorrect loss: {our_cross_entropy(logits, targets).item():.4f}"
+    )
     print(
         f"random-init correct loss: {our_cross_entropy(logits * 0.02, targets).item():.4f}"
     )
@@ -84,5 +90,23 @@ if __name__ == "__main__":
     conf = torch.tensor([[10.0, 0.0]])
     assert our_cross_entropy(conf, torch.tensor([0])).item() < 1e-4
     assert our_cross_entropy(conf, torch.tensor([1])).item() > 9.0
+
+    # 6. ignore_index: masked rows leave the mean and the gradient alone
+    masked = targets.clone()
+    masked[::2] = -100
+    assert (
+        our_cross_entropy(logits, masked) - F.cross_entropy(logits, masked)
+    ).abs() < 1e-5
+    kept = our_cross_entropy(logits[1::2], targets[1::2])  # the same rows, by hand
+    assert (our_cross_entropy(logits, masked) - kept).abs() < 1e-5
+    lm = logits.clone().requires_grad_(True)
+    our_cross_entropy(lm, masked).backward()
+    assert lm.grad[::2].abs().max() == 0
+
+    # and nothing to average is nan, as it is in torch -- a batch of all prompt
+    # tokens is a bug, not a free step
+    allmasked = torch.full_like(targets, -100)
+    assert our_cross_entropy(logits, allmasked).isnan()
+    assert F.cross_entropy(logits, allmasked).isnan()
 
     print("ok")
