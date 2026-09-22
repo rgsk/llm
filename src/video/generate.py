@@ -32,6 +32,15 @@ def filter_min_p(probs: Tensor, min_p: float) -> Tensor:
     return probs / probs.sum(dim=-1, keepdim=True)
 
 
+def length_groups(lengths: list[int], cap: int) -> list[list[int]]:
+    """Indices of equal-length prompts, at most cap per group: they share one
+    generate call with no padding."""
+    by_len: dict[int, list[int]] = {}
+    for i, n in enumerate(lengths):
+        by_len.setdefault(n, []).append(i)
+    return [g[j : j + cap] for g in by_len.values() for j in range(0, len(g), cap)]
+
+
 @torch.no_grad()
 def generate(
     model: GPT,
@@ -43,6 +52,7 @@ def generate(
     min_p: float | None = None,  # 0.0 no-op | 1.0 greedy | 0.05-0.1 recommended
     generator: torch.Generator | None = None,
     use_cache: bool = False,  # needs attention="fused" or "sdpa"
+    stop: int | None = None,  # end early once every row has emitted this id
 ) -> Tensor:
     assert temperature >= 0.0
     assert top_k is None or top_k > 0
@@ -73,6 +83,7 @@ def generate(
     was_training = model.training
     model.eval()
     kv_caches = None
+    done = torch.zeros(idx.size(0), dtype=torch.bool, device=idx.device)
     for _ in range(max_new_tokens):
         if use_cache:
             # first pass prefills the whole prompt, every one after it feeds a
@@ -97,6 +108,10 @@ def generate(
                 probs = filter_min_p(probs, min_p)
             nxt = multinomial(probs, generator)
         idx = torch.cat([idx, nxt], dim=1)
+        if stop is not None:
+            done |= nxt[:, 0] == stop
+            if done.all():
+                break
 
     if was_training:
         model.train()
@@ -132,6 +147,10 @@ if __name__ == "__main__":
     assert torch.equal(greedy, generate(m, prompt, 10, top_k=1))
     assert torch.equal(greedy, generate(m, prompt, 10, top_p=0.0))
     assert torch.equal(greedy, generate(m, prompt, 10, min_p=1.0))
+
+    # stop: ends once every row has emitted it; a row that stopped keeps sampling
+    first = int(greedy[0, 5])
+    assert generate(m, prompt[:1], 10, temperature=0.0, stop=first).shape == (1, 6)
 
     # 4. seeded sampling is reproducible, different seeds differ
     a = generate(

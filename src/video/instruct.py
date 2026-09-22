@@ -34,7 +34,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from generate import generate
+from generate import generate, length_groups
 from paths import DATA_ROOT
 from task import Packed
 from tokenizer import ENDOFTEXT, tokenizer_for
@@ -292,6 +292,13 @@ class Instruct:
             self._prompts = pool
         return self._prompts
 
+    def pair_prompts(self, n: int) -> list[str]:
+        """n train prompts past the first n_train, so SFT never saw them."""
+        recs = iter_records(source_path("train"))
+        for _ in zip(range(self.n_train), recs):
+            pass
+        return [render(r)[0] for _, r in zip(range(n), recs)]
+
     def evaluate(
         self,
         model,
@@ -300,10 +307,11 @@ class Instruct:
         seed: int = 0,
         temperature: float = 0.0,
         top_p: float | None = None,
+        group: int = 32,
     ) -> dict[str, float]:
-        """Stories for n held-out prompts, one generate call each -- prompts
-        differ in length and generate() has no padding, so this is the expensive
-        metric in the loop. ~0.8 s per sample on a 123.6M model.
+        """Stories for n held-out prompts. Equal-length prompts share a generate
+        call (no padding), up to `group` per call; a decode step costs about the
+        same at 1 row as at 32.
 
         Greedy by default, which makes the number reproducible and is also the
         worst case for repetition: this base loops 100% of the time at
@@ -318,19 +326,23 @@ class Instruct:
         pool = self.prompts()
         picks = rng.choice(len(pool), size=min(n, len(pool)), replace=False)
 
+        prompts = [pool[int(i)] for i in picks]
+        enc = [self.tok.encode(p) for p in prompts]
         rewards, scored, lengths = [], [], []
-        for i in picks:
-            prompt = pool[int(i)]
-            x = torch.tensor([self.tok.encode(prompt)], device=device)
+        for gi in length_groups([len(e) for e in enc], group):
+            n_p = len(enc[gi[0]])
+            x = torch.tensor([enc[i] for i in gi], device=device)
+            g = torch.Generator(device=device).manual_seed(seed + gi[0])
             out = generate(
-                model, x, max_new_tokens, temperature=temperature, top_p=top_p,
-                use_cache=True, generator=torch.Generator(device=device).manual_seed(seed),
+                model, x, min(max_new_tokens, model.block_size + 1 - n_p),
+                temperature=temperature, top_p=top_p, use_cache=True,
+                generator=g, stop=self.eot,
             )  # fmt: skip
-            text = self.tok.decode(out[0, x.size(1) :].tolist())
-            story = text.split(ENDOFTEXT)[0]
-            rewards.append(self.reward(prompt, text))
-            scored.append(checks(prompt, text, self.idf))
-            lengths.append(len(story.split()))
+            for j, i in enumerate(gi):
+                text = self.tok.decode(out[j, n_p:].tolist())
+                rewards.append(self.reward(prompts[i], text))
+                scored.append(checks(prompts[i], text, self.idf))
+                lengths.append(len(text.split(ENDOFTEXT)[0].split()))
 
         # each check is averaged over the prompts that have it, so at n=20
         # sentence and dialogue rest on ~6 prompts each

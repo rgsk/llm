@@ -631,6 +631,17 @@ disqualifying: the model chases what is measured, and this measures three words.
   checks (independent signal). Needs the same copy guard: pasting the summary
   scores PMI 1.105 vs gold 0.047.
 
+  **DPO, first run** (2026-09-22, `dpo.py`, `dpo_instruct_2026-09-22_19-24-50.pt`): reference =
+  `sft_instruct_17-53-47`; 2000 train prompts past the SFT 200k, k=8 at t=1.0, best vs worst ->
+  1999 pairs (13% have a non-stopping rejected), beta 0.1, lr 1e-5, 500 steps x 8 pairs. Held-out
+  pair acc 0.80 by step 100, flat after; d_chosen -13.2 / d_rejected -22.1 (both fall). SFT -> DPO on
+  the same 300 held-out prompts, 384 budget: reward **0.653/0.640 -> 0.759/0.741** sampled (2 seeds),
+  **0.681 -> 0.781** greedy; words 0.53 -> 0.71; dialogue 0.87 -> 0.98; stop unchanged. Stories
+  **+22% longer** (165 -> 202 words) — the pair length bias (chosen longer in 69%); how much of the
+  words gain is length is unmeasured. Pod (RTX 4000 Ada): sampling 3.5 -> 0.196 s/prompt by batching
+  equal-length prompts (32 x 8 rows) + early stop in `generate`; the pod CPU, not the GPU, was the
+  limit.
+
 **4. A code corpus — a search, not a build.** The intended analogue,
 `nampdn-ai/tiny-codes`, is **gated**. Of what was verified to load:
 `codeparrot-clean` is raw GitHub Python (Django views, not tiny),

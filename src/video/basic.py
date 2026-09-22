@@ -5,10 +5,12 @@ torch.nn, torch.nn.functional and torch.optim appear nowhere in the model path.
     python basic.py sft --task reverse
     python basic.py sft --task reverse --lora 8 --lr 1e-3
     python basic.py sft --task joint --lora 8 --lr 1e-3
+    python basic.py dpo --ckpt artifacts/checkpoints/sft_instruct_....pt
     python basic.py sample --ckpt artifacts/checkpoints/....pt
 """
 
 import argparse
+import time
 from dataclasses import asdict, replace
 from functools import partial
 from pathlib import Path
@@ -22,6 +24,7 @@ from checkpoint import (
     save_checkpoint,
 )
 from dataset import BinDataset, meta
+from dpo import Pair, dpo, make_pairs
 from generate import generate
 from gpt import GPT
 from gpt_config import (
@@ -32,7 +35,7 @@ from gpt_config import (
     small_cfg,
     tinystories_cfg,
 )
-from instruct import Instruct
+from instruct import CACHE, Instruct
 from joint import Joint
 from lora import apply_lora, load_lora, param_counts, save_lora
 from reverse import Reverse
@@ -42,6 +45,7 @@ from train import train
 from train_config import (
     TrainConfig,
     big_train,
+    dpo_train,
     fineweb_smoke_train,
     fineweb_train,
     sft_train,
@@ -182,6 +186,57 @@ def cmd_sft(args, device: str) -> Path:
     return ckpt
 
 
+def cmd_dpo(args, device: str) -> Path:
+    sft_ckpt = Path(args.ckpt) if args.ckpt else latest_ckpt("sft_instruct")
+    model, m = load_checkpoint(sft_ckpt, device)
+    gpt_cfg = GPTConfig.from_dict(m["config"])
+    task = Instruct()
+    # sampling is the expensive half (~0.8 s per prompt at k=8), so pairs are kept
+    path = CACHE / f"pairs_{sft_ckpt.stem}_{args.prompts}_{args.k}.pt"
+    if path.exists():
+        pairs = [Pair(**p) for p in torch.load(path)]
+    else:
+        # saved every 100 prompts, so a crash resumes instead of resampling
+        part = path.with_suffix(".part.pt")
+        done, saved = torch.load(part) if part.exists() else (0, [])
+        pairs = [Pair(**p) for p in saved]
+        # sorted by length, so each saved chunk holds few lengths and batches well
+        prompts = sorted(
+            task.pair_prompts(args.prompts), key=lambda p: len(task.tok.encode(p))
+        )
+        path.parent.mkdir(parents=True, exist_ok=True)
+        t0, step = time.perf_counter(), 256
+        for i in range(done, len(prompts), step):
+            chunk = prompts[i : i + step]
+            pairs += make_pairs(model, task, chunk, k=args.k, seed=i, group=args.group)
+            torch.save((i + step, [asdict(p) for p in pairs]), part)
+            print(
+                f"pairs {min(i + step, len(prompts))}/{len(prompts)}  {time.perf_counter() - t0:.0f}s"
+            )
+        torch.save([asdict(p) for p in pairs], path)
+        part.unlink()
+    n_val = max(len(pairs) // 10, 1)
+    train_pairs, val_pairs = pairs[n_val:], pairs[:n_val]
+    gap = sum(p.r_chosen - p.r_rejected for p in pairs) / len(pairs)
+    print(
+        f"sft {sft_ckpt.name}  {len(pairs)} pairs from {args.prompts} prompts "
+        f"(ties dropped)  mean reward gap {gap:.3f}"
+    )
+    cfg = replace(
+        dpo_train,
+        name="dpo_instruct",
+        use_wandb=args.wandb,
+        **overrides(args, max_steps="steps", lr="lr", batch_size="batch_size"),
+    )
+    print(cfg)
+    ckpt = generate_ckpt_path(cfg.name)
+    dpo(
+        model, train_pairs, val_pairs, task, cfg, gpt_cfg, beta=args.beta,
+        device=device, ckpt_path=ckpt, eval_n=args.eval_n,
+    )  # fmt: skip
+    return ckpt
+
+
 def cmd_sample(args, device: str) -> Path:
     return Path(args.ckpt) if args.ckpt else latest_ckpt(args.name)
 
@@ -215,13 +270,23 @@ def main() -> None:
     ft.add_argument("--eval-interval", type=int)
     ft.add_argument("--wandb", action="store_true")
 
+    po = sub.add_parser("dpo", help="preference-tune an instruct SFT checkpoint")
+    po.add_argument("--ckpt", help="SFT checkpoint (default: newest sft_instruct)")
+    po.add_argument("--prompts", type=int, default=2000, help="prompts to sample")
+    po.add_argument("--k", type=int, default=8, help="samples per prompt")
+    po.add_argument("--group", type=int, default=16, help="prompts per generate call")
+    po.add_argument("--beta", type=float, default=0.1)
+    po.add_argument("--batch-size", type=int, help="pairs per step")
+    po.add_argument("--eval-n", type=int, default=100, help="samples per scoreboard")
+    po.add_argument("--wandb", action="store_true")
+
     smp = sub.add_parser("sample", help="generate from a checkpoint")
     smp.add_argument("--ckpt")
     smp.add_argument("--name", default="fineweb", help="checkpoint name prefix")
     smp.add_argument("--prompt", default=PROMPT)
     smp.add_argument("--tokens", type=int, default=300)
 
-    for p in (pre, ft):
+    for p in (pre, ft, po):
         p.add_argument("--steps", type=int)
         p.add_argument("--lr", type=float)
 
@@ -232,9 +297,8 @@ def main() -> None:
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"device {device}")
-    ckpt = {"pretrain": cmd_pretrain, "sft": cmd_sft, "sample": cmd_sample}[args.cmd](
-        args, device
-    )
+    cmds = {"pretrain": cmd_pretrain, "sft": cmd_sft, "dpo": cmd_dpo}
+    ckpt = (cmds | {"sample": cmd_sample})[args.cmd](args, device)
 
     # always sample from the file, never the in-memory model: if the checkpoint
     # is wrong, this is where it shows

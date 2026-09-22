@@ -110,6 +110,18 @@ sft_train = TrainConfig(
     name="sft",
 )
 
+dpo_train = TrainConfig(
+    batch_size=8,  # pairs, so 16 rows per forward
+    max_steps=500,
+    lr=1e-5,
+    min_lr=1e-6,
+    warmup_steps=20,
+    eval_interval=100,
+    eval_iters=1,
+    use_compile=False,  # every batch is a different padded length
+    name="dpo",
+)
+
 
 if __name__ == "__main__":
     from dataclasses import asdict, replace
