@@ -601,6 +601,36 @@ disqualifying: the model chases what is measured, and this measures three words.
   to 1.000 and has no preference to express. Preference pairs stay free — sample
   K, rank, take best against worst.
 
+  **Reward widened** (2026-09-22): `instruct.checks` returns every check a
+  prompt supports — `words` (fraction), `sentence` (Random sentence verbatim,
+  case-folded), `dialogue` (a `"` when Features asks for Dialogue), `stop` — and
+  `reward` is `stop x mean(content checks)`, or just `stop` for the 20% of
+  prompts that are Summary-only. The stop gate kills the run-to-budget,
+  list-every-word policy. Gold ceiling over 3000 val records: words 0.984,
+  sentence 1.000, dialogue 0.908. Open cost: 11.4% of gold stories exceed the
+  256-token eval budget and so would fail the gate (3.7% exceed 384).
+
+  **Summary, pooled with Words, rarity-weighted** (same day). `words` is now one
+  set: the `Words:` line plus the Summary's non-stopword words, stemmed
+  (wants/wanted, cats/cat; car does not match careful). Each word counts by its
+  idf over 20k train stories (lily 1.39, dog 2.49, stitches 6.41), so missing
+  the plot costs more than missing a name. Zeroed if the story shares a 12-word
+  run with the Summary (pasting it in otherwise wins; fires on 0.6% of gold).
+  `reward` = points / points available: stop, sentence, dialogue 1 each, words
+  2, and a story that never stops scores 0 (the gate stays). Why the weighting: two SFT samples on
+  the waffle prompt (one drops "bitten/hospital/stitches", the other "toy car/
+  meet") both hit 9/12 words and tied; weighted, **0.720 vs 0.849**, the right
+  way round. Gold words 0.767 vs **0.052** against a random story; gold reward
+  0.860, only 5.7% exactly 1.0 — read it as a ranking, not a pass rate. Still
+  words, not plot.
+
+  **After the DPO loop works: replace it with PMI** — `log p(story | prompt) -
+  log p(story | prompt without Summary)` per story token, under the frozen SFT
+  model (the DPO reference, so no extra model). Picks own summary over a
+  swapped one 100/100, no ties within a group, Spearman 0.08 with the string
+  checks (independent signal). Needs the same copy guard: pasting the summary
+  scores PMI 1.105 vs gold 0.047.
+
 **4. A code corpus — a search, not a build.** The intended analogue,
 `nampdn-ai/tiny-codes`, is **gated**. Of what was verified to load:
 `codeparrot-clean` is raw GitHub Python (Django views, not tiny),
