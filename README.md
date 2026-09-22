@@ -558,27 +558,50 @@ table the 4-weight sample had missed.
 
 ## Next, in order
 
-Padding and masking, which used to head this list, shipped as `mask.py` plus the
-flex `BlockMask` path; SFT shipped as `task.py` + `sft.py` with two tasks on it.
-What follows assumes the 27M TinyStories base.
+Padding and masking shipped as `mask.py` plus the flex `BlockMask` path; SFT as
+`task.py` + `sft.py`; LoRA as `lora.py`; the two-task mix as `joint.py`. Results
+are in `src/video/sft_results.ipynb` and `lora_results.ipynb`. What follows
+assumes the 27M TinyStories base.
 
-**1. TinyStories + instruct, through SFT then LoRA then DPO.** One base, three
-algorithms, the same scoreboard throughout, so the deltas are comparable. SFT is
-done from the FineWeb base and needs re-running from this one — a base that
-already ends its stories changes what the rung shows: **format and word
-constraints, not termination**. LoRA is a port of `src/lora.py`. DPO goes on
-instruct and **not** on reverse, which is solved to 1.000 and therefore has no
-preference to express; on instruct, ~80% of sampled stories miss at least one
-required word, and `Instruct.reward` already scores them, so the preference pairs
-are free — sample K, rank, take best against worst.
+**1. SFT and LoRA — done.** Full SFT and a rank-8 adapter on qkv+proj
+(196,608 params, **0.72%**) both learn instruct. Once *both* arms get their own
+lr sweep, LoRA is ~4% worse on completion loss and drifts ~15% less on
+TinyStories val; compared at a single lr the gap looks twice that, which is the
+trap. Reverse is the opposite — **no lr lets LoRA match full SFT**, and at 3e-3
+it costs the base **+3.80 nats against instruct's +0.115**. An lr does not
+transfer between tasks on one base; sweep per task, on completion loss *and* a
+base-loss check, never on the task scoreboard alone. Two other findings worth
+keeping: the adapter's loss floor is set by **rank, not lr** (0.1175 vs 0.1179
+across a 3x lr gap), and a generated scoreboard at n=40 carries ±0.1, enough to
+keep the wrong checkpoint — hence `--select comp`.
 
-**2. Joint LoRA.** The old track's best result and the one most worth
-reproducing: LoRA on a 67/33 instruct+reverse mix scored **0.969 against full
-SFT's 1.000, at 0.67% of the parameters**, while post-hoc stacking of two
-separately-trained adapters failed. `concat()` exists for this, and it is the
-real test of whether the Task interface holds two tasks at once.
+**2. Joint LoRA — done, and it clears the old track.** One rank-8 adapter on the
+67/33 instruct+reverse mix reaches **reverse exact_match 1.000** while its
+instruct scores stay within one standard error of the instruct-only adapter:
+reverse comes essentially free. The old track got 0.969 with the same adapter
+size on a same-size base. `joint.py` sets the mix by **start count**, because
+windows open at starts, and it does so by dropping starts rather than resizing a
+task — nothing in the `Task` protocol exposes its own size.
 
-**3. A code corpus — a search, not a build.** The intended analogue,
+**3. DPO — fix the reward first.** `Instruct.reward` scores only the `Words:`
+line, so it ranks a plot-faithful story that misses one word **below** a
+word-stuffed one that ignores the Summary entirely. As an SFT scoreboard that
+costs nothing, because nothing optimises it. As a DPO/GRPO objective it is
+disqualifying: the model chases what is measured, and this measures three words.
+
+  Field coverage over 3000 val records: `Summary` 100%, `Words` **61.4%**,
+  `Features` 49.2%, `Random sentence` 29.6%. Two free string-match checks the
+  reward currently ignores — the `Random sentence` appears **verbatim** in its
+  story **100%** of the time, and `Features: Dialogue` implies a quote in the
+  story 90.8% of the time. The Summary is **not** checkable by string match at
+  all, which is precisely why the model learned to ignore it.
+
+  So: widen `reward` to a composite over the checkable fields before building
+  the rung on it. DPO goes on instruct and **not** on reverse, which is solved
+  to 1.000 and has no preference to express. Preference pairs stay free — sample
+  K, rank, take best against worst.
+
+**4. A code corpus — a search, not a build.** The intended analogue,
 `nampdn-ai/tiny-codes`, is **gated**. Of what was verified to load:
 `codeparrot-clean` is raw GitHub Python (Django views, not tiny),
 `flytech/python-codes-25k` is toy interactive scripts that cannot be unit-tested,
@@ -589,7 +612,7 @@ before building any of the RL rung on it.** If a from-scratch code model scores
 ~0, there is no gradient for DPO or GRPO and the phase ends there, which is a
 finding rather than a failure.
 
-**4. Competitive programming on a real model: sandbox, then GRPO.** The data is
+**5. Competitive programming on a real model: sandbox, then GRPO.** The data is
 better than expected — `deepmind/code_contests` loads, is **61% Codeforces**, and
 ships `description`, `cf_rating`, `cf_index`, `cf_tags`, 80-100 **generated tests
 per problem**, and `incorrect_solutions` on 79% of problems, which are free
@@ -605,7 +628,7 @@ a compile step, which is a failure mode a small model will hit constantly.
   lesson moves from owning the weights to owning the algorithm. Build in order:
 
   - **the sandbox** — subprocess, timeout, no network, memory cap. It is the
-    reward function for everything in phases 3 and 4, so it lands first.
+    reward function for everything in phases 4 and 5, so it lands first.
   - **pass@1 on Qwen2.5-Coder 1.5B and 7B**, over the rated <= 1000 band and over
     MBPP. Pick the band where it falls in 20-50%: higher and there is nothing to
     amplify, zero and there is no gradient. Contamination is real here — those
@@ -613,7 +636,7 @@ a compile step, which is a failure mode a small model will hit constantly.
   - **GRPO** on the band that measurement chooses. DPO is also available without
     sampling, straight from `incorrect_solutions`.
 
-**5. Chat and QA.** Multi-turn masking: `doc_ids` generalises from eot boundaries
+**6. Chat and QA.** Multi-turn masking: `doc_ids` generalises from eot boundaries
 to scoring only the assistant's turns, and `<|im_start|>`/`<|im_end|>` are
 already in the 50259 vocab because the tokenizer episode minted them for this.
 
