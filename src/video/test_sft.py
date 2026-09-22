@@ -118,6 +118,19 @@ def test_masking_opens_a_gap_between_the_two_halves(task, model, cfg, gpt_cfg):
     assert last["prompt"] - last["comp"] > 0.5  # only one half is in the loss
 
 
+def test_selecting_on_comp_keeps_the_lowest_loss_step(
+    task, model, cfg, gpt_cfg, tmp_path
+):
+    ckpt = tmp_path / "comp.pt"
+    history = sft(
+        model, task, cfg, gpt_cfg, block_size=16, ckpt_path=ckpt, eval_n=8,
+        select="comp",
+    )  # fmt: skip
+    saved = torch.load(ckpt, map_location="cpu", weights_only=False)
+    assert saved["val_loss"] == min(r["comp"] for r in history)
+    assert saved["step"] == min(history, key=lambda r: r["comp"])["step"]
+
+
 def test_the_best_checkpoint_follows_the_task_not_a_metric_name(
     task, model, cfg, gpt_cfg, tmp_path
 ):

@@ -88,13 +88,19 @@ def sft(
     grad_clip: float = 1.0,
     eval_n: int = 200,
     select: str | None = None,
+    save=save_checkpoint,
 ) -> list[dict]:
     """block_size is the training window, not the model's: rope is computed on
     demand, so a 1024-block model finetunes fine on 256-wide windows.
 
     select names the metric the best checkpoint is kept on. The default is the
     first key the task's evaluate returns, so a task declares its own headline
-    number by ordering rather than by agreeing on a name."""
+    number by ordering rather than by agreeing on a name. "comp" is the
+    exception: it selects on completion loss, which every task has and no task
+    can make noisy by sampling too few generations.
+
+    save is save_checkpoint or lora.save_lora -- an adapter run writes A and B
+    only, and the loop never learns which it is."""
     T = gpt_cfg.block_size if block_size is None else block_size
     assert T <= gpt_cfg.block_size, f"window {T} > model block_size"
     V = gpt_cfg.vocab_size
@@ -115,7 +121,9 @@ def sft(
     opt = AdamW(decay_groups(model, weight_decay), lr=cfg.lr, betas=(0.9, 0.95))
     model.train()
 
-    best = (-1.0, -float("inf"))  # (the task's headline metric, -completion loss)
+    # -inf, not -1: with select="comp" the headline is a negative loss, and a
+    # 0-1 floor would refuse to save anything until comp dropped below 1
+    best = (-float("inf"), -float("inf"))  # (headline, -completion loss)
     history: list[dict] = []
     t0 = time.perf_counter()
     gnorm = torch.tensor(float("nan"))
@@ -145,9 +153,10 @@ def sft(
         )
         run.log(row, step=it)
         # the scoreboard is the objective; completion loss only breaks ties
-        score = (scores[select or next(iter(scores))], -comp)
+        headline = -comp if select == "comp" else scores[select or next(iter(scores))]
+        score = (headline, -comp)
         if score > best and ckpt_path is not None:
-            save_checkpoint(
+            save(
                 ckpt_path, model, gpt_cfg, step=it, val_loss=comp,
                 prompt_loss=prompt, **scores, task=task.name,
             )  # fmt: skip

@@ -3,16 +3,24 @@ torch.nn, torch.nn.functional and torch.optim appear nowhere in the model path.
 
     python basic.py pretrain --cfg fineweb_smoke
     python basic.py sft --task reverse
+    python basic.py sft --task reverse --lora 8 --lr 1e-3
+    python basic.py sft --task joint --lora 8 --lr 1e-3
     python basic.py sample --ckpt artifacts/checkpoints/....pt
 """
 
 import argparse
 from dataclasses import asdict, replace
+from functools import partial
 from pathlib import Path
 
 import torch
 
-from checkpoint import generate_ckpt_path, latest_ckpt, load_checkpoint
+from checkpoint import (
+    generate_ckpt_path,
+    latest_ckpt,
+    load_checkpoint,
+    save_checkpoint,
+)
 from dataset import BinDataset, meta
 from generate import generate
 from gpt import GPT
@@ -25,6 +33,8 @@ from gpt_config import (
     tinystories_cfg,
 )
 from instruct import Instruct
+from joint import Joint
+from lora import apply_lora, load_lora, param_counts, save_lora
 from reverse import Reverse
 from sft import sft
 from tokenizer import ENDOFTEXT, tokenizer_for
@@ -53,7 +63,7 @@ CFGS: dict[str, tuple[GPTConfig, TrainConfig]] = {
     "tinystories": (tinystories_cfg, tinystories_train),
 }
 # the registry lives here, not in task.py: task.py is what reverse.py imports
-TASKS = {"reverse": Reverse, "instruct": Instruct}
+TASKS = {"reverse": Reverse, "instruct": Instruct, "joint": Joint}
 
 PROMPT = ENDOFTEXT if ENDOFTEXT in tok.specials else "\n"
 
@@ -133,9 +143,17 @@ def cmd_sft(args, device: str) -> Path:
     model, m = load_checkpoint(base, device, attention="flex")
     gpt_cfg = replace(GPTConfig.from_dict(m["config"]), attention="flex")
     task = TASKS[args.task]()
+    save = save_checkpoint
+    if args.lora:
+        alpha = 2.0 * args.lora
+        apply_lora(model, args.lora, alpha)
+        n, total = param_counts(model)
+        print(f"lora r={args.lora} alpha={alpha:g}  {n:,} trainable ({n / total:.2%})")
+        # the base path travels in the file: an adapter alone rebuilds nothing
+        save = partial(save_lora, base_ckpt=base, r=args.lora, alpha=alpha)
     cfg = replace(
         sft_train,
-        name=f"sft_{task.name}",
+        name=f"{'lora' if args.lora else 'sft'}_{task.name}",
         use_wandb=args.wandb,
         **overrides(
             args,
@@ -158,6 +176,8 @@ def cmd_sft(args, device: str) -> Path:
         device=device,
         ckpt_path=ckpt,
         eval_n=args.eval_n,
+        select=args.select,
+        save=save,
     )
     return ckpt
 
@@ -185,6 +205,11 @@ def main() -> None:
     # keeps tokens-per-step the same while halving it
     ft.add_argument("--grad-accum", type=int)
     ft.add_argument("--eval-n", type=int, default=200, help="samples per scoreboard")
+    # LoRA usually wants ~5-10x the full-finetune lr; pass --lr, it is not measured
+    ft.add_argument("--lora", type=int, metavar="R", help="train a rank-R adapter")
+    # a generated scoreboard at eval_n 40 carries ~0.1, enough to keep the wrong
+    # step; comp is the same number every eval. Pass a task metric to override.
+    ft.add_argument("--select", default="comp", help="metric the best ckpt is kept on")
     # instruct generates one story per sample, so the scoreboard is the
     # expensive part of the loop, not the training
     ft.add_argument("--eval-interval", type=int)
@@ -214,7 +239,8 @@ def main() -> None:
     # always sample from the file, never the in-memory model: if the checkpoint
     # is wrong, this is where it shows
     print(f"\nloading {ckpt.name}")
-    model, m = load_checkpoint(ckpt, device)
+    load = load_lora if getattr(args, "lora", None) else load_checkpoint
+    model, m = load(ckpt, device)
     print("  ".join(f"{k} {v:.4f}" for k, v in m.items() if isinstance(v, float)))
 
     if "task" in m:  # a task model is scored, not sampled from

@@ -1,0 +1,3 @@
+/tmp/claude-1000/-home-rahul-Documents-codes-projects-llm/0346e9f2-67c8-4942-bae2-e25b07f1b36c/scratchpad/dummy_a.log
+/tmp/claude-1000/-home-rahul-Documents-codes-projects-llm/0346e9f2-67c8-4942-bae2-e25b07f1b36c/scratchpad/dummy_b.log
+/tmp/claude-1000/-home-rahul-Documents-codes-projects-llm/0346e9f2-67c8-4942-bae2-e25b07f1b36c/scratchpad/nbexec2.log

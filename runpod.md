@@ -81,6 +81,60 @@ rsync -avP -e "ssh -i ~/.ssh/rgsk_github_ssh -p <port>" \
 ```
 Run this **locally**: on the pod, the key path points at the pod's own disk and ssh asks for a password.
 
+## Pulling files off a pod
+
+A fresh pod has no `rsync` until `setup.sh` runs, so use `tar` over ssh — it
+needs nothing but the image's own tools:
+
+```bash
+cd artifacts/logs
+ssh -i ~/.ssh/rgsk_github_ssh -p <port> root@<ip> \
+  'cd /workspace/llm/artifacts/logs && tar cf - *.jsonl' | tar xvf -
+```
+
+**The volume outlives the pod.** `/workspace` is a network volume, so anything
+written under `/workspace/llm/artifacts/` survives termination and can be pulled
+from the *next* pod. Only files outside `/workspace` are lost with the pod.
+
+## Terminating a pod over ssh
+
+The documented `runpodctl remove pod $RUNPOD_POD_ID` fails from a
+non-interactive ssh: the variable lives in the **container's init environment**,
+not the ssh session, and a fresh pod has no runpodctl config either. Both are in
+`/proc/1/environ`:
+
+```bash
+ssh -i ~/.ssh/rgsk_github_ssh -p <port> root@<ip> \
+  'eval $(tr "\0" "\n" < /proc/1/environ \
+      | grep -E "^RUNPOD_(POD_ID|API_KEY)=" | sed "s/^/export /")
+   runpodctl config --apiKey "$RUNPOD_API_KEY" >/dev/null 2>&1
+   runpodctl remove pod "$RUNPOD_POD_ID"'
+```
+
+Prints `pod "<id>" removed`; ssh then refuses, which is the confirmation.
+
+## Watching a run
+
+A pod bills by the minute, so an unnoticed finish is wasted money. Two habits:
+
+- **End every script with a loud marker** — `print("\n------ FINISHED ------")`,
+  or append `; echo; echo ------ FINISHED ------` to the launch line. Watchers
+  then grep one fixed string instead of a result line that changes per run.
+- **Use `python -u`.** Without it stdout is block-buffered when redirected and
+  the log stays empty until the process exits.
+
+To follow a pod log locally, poll-copy it rather than `ssh tail -f`, which dies
+silently with the connection:
+
+```bash
+while true; do
+  ssh -i ~/.ssh/rgsk_github_ssh -p <port> root@<ip> \
+    'cat /workspace/llm/<run>.log' > out.log.tmp && mv out.log.tmp out.log
+  grep -q FINISHED out.log && break
+  sleep 20
+done
+```
+
 ## Layout
 
 - **Network volume:** 30 GB, EU-2 datacenter, mounted at `/workspace`.
