@@ -305,6 +305,8 @@ def load_tokenizer():
 
 def tokenizer_for(dataset: str = DATASET):
     """The tokenizer a prepared dataset was written with -- ids are meaningless otherwise."""
+    if dataset.startswith("tinystories_eot"):  # same merges, plus a real eot
+        return OurBPETokenizer.load(TOKENIZER_DIR / "bpe_ts_4097.json")
     if dataset.startswith("tinystories"):
         return OurBPETokenizer.load(TOKENIZER_DIR / "bpe_ts_4096.json")
     return load_tokenizer()

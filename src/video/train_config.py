@@ -81,6 +81,21 @@ fineweb_train = TrainConfig(
     upload_ckpt=True,
 )
 
+# --- TinyStories ----------------------------------------------------------
+# 16384 tokens per step x 33000 = 541M over a 472.8M-token corpus: 1.14 epochs,
+# and 20 tok/param, which is chinchilla's compute-optimal ratio for 27M.
+tinystories_train = TrainConfig(
+    batch_size=32,
+    max_steps=33000,
+    lr=6e-4,
+    min_lr=6e-5,
+    warmup_steps=500,
+    eval_interval=1000,
+    eval_iters=100,
+    name="tinystories",
+)
+
+
 # --- finetuning -----------------------------------------------------------
 # lr an order of magnitude under pretraining: the weights are already good, and
 # a short run on a narrow task is where a big step does its damage.

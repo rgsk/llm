@@ -14,7 +14,7 @@ def repo_root() -> Path:
 ROOT = repo_root()
 DATA_ROOT = ROOT / "artifacts" / "data"
 # which prepared dataset train.py reads; VIDEO_DATASET=fineweb_edu switches it
-DATASET = os.getenv("VIDEO_DATASET", "tinystories")
+DATASET = os.getenv("VIDEO_DATASET", "tinystories_eot")
 DATA_DIR = DATA_ROOT / DATASET
 CKPT_DIR = ROOT / "artifacts" / "checkpoints"
 TOKENIZER_DIR = ROOT / "artifacts" / "tokenizer"

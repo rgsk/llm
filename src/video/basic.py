@@ -22,9 +22,9 @@ from gpt_config import (
     fineweb_cfg,
     fineweb_smoke_cfg,
     small_cfg,
+    tinystories_cfg,
 )
 from instruct import Instruct
-from paths import DATASET
 from reverse import Reverse
 from sft import sft
 from tokenizer import ENDOFTEXT, tokenizer_for
@@ -36,6 +36,7 @@ from train_config import (
     fineweb_train,
     sft_train,
     small_train,
+    tinystories_train,
 )
 
 tok = tokenizer_for()  # follows VIDEO_DATASET, like BinDataset does
@@ -49,11 +50,12 @@ CFGS: dict[str, tuple[GPTConfig, TrainConfig]] = {
     "big": (big_cfg, big_train),
     "fineweb_smoke": (fineweb_smoke_cfg, fineweb_smoke_train),
     "fineweb": (fineweb_cfg, fineweb_train),
+    "tinystories": (tinystories_cfg, tinystories_train),
 }
 # the registry lives here, not in task.py: task.py is what reverse.py imports
 TASKS = {"reverse": Reverse, "instruct": Instruct}
 
-PROMPT = ENDOFTEXT if DATASET.startswith("fineweb") else "\n"
+PROMPT = ENDOFTEXT if ENDOFTEXT in tok.specials else "\n"
 
 
 def sample(model: GPT, prompt: str = PROMPT, max_new_tokens: int = 300, **kw) -> str:
@@ -73,9 +75,22 @@ def overrides(args, **names) -> dict:
 def cmd_pretrain(args, device: str) -> Path:
     gpt_cfg, train_cfg = CFGS[args.cfg]
     train_cfg = replace(train_cfg, **overrides(args, max_steps="steps", lr="lr"))
-    print(gpt_cfg, train_cfg, sep="\n")
     torch.manual_seed(train_cfg.seed)
-    model = GPT(**asdict(gpt_cfg)).to(device)
+
+    resume = None
+    if args.resume:
+        # get_lr is a pure function of the step, so the schedule picks up
+        # exactly where it left off -- as long as max_steps is the same number
+        # it was. Shortening it would finish the cosine early and a later run
+        # would warm up again, which is two schedules, not one.
+        path = Path(args.ckpt) if args.ckpt else latest_ckpt(train_cfg.name)
+        model, resume = load_checkpoint(path, device)
+        gpt_cfg = GPTConfig.from_dict(resume["config"])
+        print(f"resuming {path.name} at step {resume['step']}")
+    else:
+        model = GPT(**asdict(gpt_cfg)).to(device)
+
+    print(gpt_cfg, train_cfg, sep="\n")
     n_params = sum(p.numel() for p in model.parameters())
 
     # 20 tok/param is chinchilla's compute-optimal ratio; below it the model is
@@ -93,8 +108,19 @@ def cmd_pretrain(args, device: str) -> Path:
     )
 
     train_ds, val_ds = BinDataset("train"), BinDataset("val")
+    # a fresh path even on resume, so a diverging continuation cannot eat the
+    # checkpoint it started from
     ckpt = generate_ckpt_path(train_cfg.name)
-    train(model, train_cfg, gpt_cfg, train_ds, val_ds, device=device, ckpt_path=ckpt)
+    train(
+        model,
+        train_cfg,
+        gpt_cfg,
+        train_ds,
+        val_ds,
+        device=device,
+        ckpt_path=ckpt,
+        resume=resume,
+    )
     train_ds.close()
     val_ds.close()
     return ckpt
@@ -145,6 +171,8 @@ def main() -> None:
 
     pre = sub.add_parser("pretrain", help="train a model from scratch")
     pre.add_argument("--cfg", default="fineweb_smoke", choices=list(CFGS))
+    pre.add_argument("--resume", action="store_true", help="continue a run")
+    pre.add_argument("--ckpt", help="which one to resume (default: newest --cfg run)")
 
     ft = sub.add_parser("sft", help="finetune a checkpoint on a task")
     ft.add_argument("--task", default="reverse", choices=list(TASKS))

@@ -32,7 +32,7 @@ import torch
 from generate import generate
 from paths import DATA_ROOT
 from task import Packed
-from tokenizer import ENDOFTEXT, load_tokenizer
+from tokenizer import ENDOFTEXT, tokenizer_for
 
 HF_DATASET = "roneneldan/TinyStoriesInstruct"
 FILES = {
@@ -110,7 +110,8 @@ class Instruct:
         n_val: int = 2_000,
         eval_pool: int = 500,
     ):
-        self.tok = load_tokenizer() if tok is None else tok
+        # the corpus the base was pretrained on picks the vocab, not GPT-2's
+        self.tok = tokenizer_for() if tok is None else tok
         self.n_train, self.n_val, self.eval_pool = n_train, n_val, eval_pool
         self.eot = self.tok.specials[ENDOFTEXT]
         self._prompts: list[str] | None = None

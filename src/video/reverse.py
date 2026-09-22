@@ -14,7 +14,7 @@ import torch
 
 from generate import generate
 from task import Packed
-from tokenizer import ENDOFTEXT, load_tokenizer
+from tokenizer import ENDOFTEXT, tokenizer_for
 
 LETTERS = string.ascii_lowercase
 SEP = ">"
@@ -36,7 +36,8 @@ class Reverse:
         seed: int = 1337,
         weights: list[float] | None = None,
     ):
-        self.tok = load_tokenizer() if tok is None else tok
+        # the corpus the base was pretrained on picks the vocab, not GPT-2's
+        self.tok = tokenizer_for() if tok is None else tok
         self.n_train, self.n_val, self.seed = n_train, n_val, seed
         self.eot = self.tok.specials[ENDOFTEXT]
 

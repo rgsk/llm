@@ -251,7 +251,104 @@ The old "three genuinely big remaining pieces" list is closed, data included:
 SDPA, RMSNorm, SwiGLU, weight tying, and the KV cache all shipped. Optimizer
 hygiene — the item that sat pending longest — is done too.
 
+### Finetuning: a Task interface, and the first two tasks
+
+`task.py` — `Packed` (a flat uint16 stream plus `mask` and `starts`), `windows()`
+which opens every training window at an example start so a prompt sits at
+position 0 exactly as it does at inference, `masked_targets` into
+`ignore_index`, and a three-method `Task` protocol: `build`, `reward`,
+`evaluate`. `reward` returns a float rather than a bool because GRPO needs the
+magnitude. `concat()` mixes two tasks, and start count sets the ratio. Nothing
+downstream names a dataset.
+
+`mask.py` — document masking from eot positions, as a materialized `[B,1,T,T]`
+bool and as a flex `BlockMask`. `flex_attention.py` — GQA plus rope, flex while
+training and SDPA at decode, with the rope angles threaded from `GPT` instead of
+tabled per layer. `cross_entropy.py` grew `ignore_index` on the hand-written
+backend, keyword-only so the two aliases agree at the call site.
+
+`sft.py` — `train.py`'s loop fed by a Task: windows instead of `get_batch`, the
+loss masked to the completion, a document mask built once per batch and shared
+across layers, and **two val numbers instead of one** — completion and prompt —
+because masking moves them in opposite directions and one number hides half of
+what SFT does. `select` defaults to the first key the task's `evaluate` returns,
+so a task declares its own headline metric rather than everything agreeing on a
+name.
+
+`reverse.py` — `"cat>"` -> `"tac<eot>"`, encoded char by char so reversal is
+position work and not spelling. `instruct.py` — TinyStoriesInstruct, fields in
+and a story out; `Words:` appears in 66.6% of records and is the checkable part.
+
+`tinystories.py` — the prepared corpus had no eot *token*: the boundary sat in
+the stream as the three tokens that spell `<|endoftext|>`. Appending one
+vocabulary entry and rewriting the boundary in place cost minutes and no
+re-tokenization, because ids 0-4095 kept their meanings. 468.5M tokens, 2.12M
+documents, vocab 4097. The assert that every `<|` is a boundary earned its keep
+immediately — it caught 230 occurrences of a second spelling.
+
+`basic.py` is now `pretrain` / `sft` / `sample` subcommands with `--resume`, and
+a `TASKS` registry. `sft_results.ipynb` is the finetuning archive: every number
+in it is read from the run's own `artifacts/logs/*.jsonl`, so re-running it
+costs seconds rather than GPU hours.
+
 ## Measured, so it does not get re-derived
+
+- **SFT works, and the scoreboard is not val loss.** Reverse, from the 123.6M
+  FineWeb base: **exact match 0.40 @50 steps, 0.995 @100, 1.000 @250**, 1000
+  steps in 4.6 min on the 4060 (block 256, batch 8 x accum 2, lr 3e-5, flex +
+  document mask). Completion loss starts at **6.07, not ln(50259)=10.8** — that
+  gap is what pretraining bought on a task the base has never seen. A 11.2M
+  model from scratch needs lr 1e-3 and 200 steps for the same result. **Batch 16
+  x window 256 OOMs on 8 GB**: the `[B,T,50259]` fp32 logits are ~785 MiB and the
+  backward wants another, so halve the batch and accumulate.
+
+- **Prompt loss is U-shaped, and only when the two halves are in tension.** The
+  masked-out prompt loss falls, then climbs past where it started: from scratch
+  **10.8 -> 6.5 @100 -> 11.7 @400**; from the pretrained base **8.73 -> 8.02 @50
+  -> 9.82 @1000**, a much shallower dip because the base already models text.
+  Leg one is learning the task's 27-token inventory, which helps every position
+  including the untrained ones; leg two is specialisation making the model
+  confidently wrong where it was never scored. The floor is ln(26) = 3.26 and
+  neither run reaches it. Probed at the token level, the finetuned 123.6M model
+  predicts **an early letter of the word** at every prompt position (p=0.8-0.97)
+  while the small from-scratch one **echoes the current token** at p=1.00; mass
+  on the 26 letters stays ~1.0, so this is certainty, not forgetting. The
+  mechanism is untested — attention sinking onto position 0 is a guess.
+
+  **On instruct there is no U-shape at all**: prompt loss drifts *down*, 4.32 ->
+  4.09. The prompt is 18% of tokens rather than 50%, and it is English that
+  shares vocabulary with the story, so specialising on the completion never makes
+  it unpredictable.
+
+- **On TinyStoriesInstruct, what SFT buys is the eot.** Same base, window 512,
+  batch 4 x accum 4, lr 3e-5, 1000 steps in 13 min. **stop_rate 0.00 -> 0.80**,
+  words present 0.15 -> 0.68, all-words 0.00 -> 0.25, stories 213 -> 154 words.
+  The base is fluent and cannot stop: it echoes the Summary back and loops
+  `Story:` headers until the budget runs out. 200k records is 51.8M tokens and
+  the cache builds in 12s.
+
+- **Greedy decoding measures the decoder, not just the weights.** Same instruct
+  checkpoint, n=40: greedy words 0.550 / all 0.100 / **stop 0.725**; t=0.8
+  p=0.95 **0.633 / 0.200 / 0.925**; t=1.0 0.567 / 0.175 / 0.775. Half the
+  failures a greedy scoreboard counts belong to the decoder — the same base loops
+  100% of the time at temperature 0 and 4% at 1.0. Also: `words_all` at n=20
+  carries about **±0.1**, so a single eval's value is not a trend.
+
+- **sdpa and flex are the same speed when there is no block_mask.** 4 x 200
+  steps alternating in fresh processes: sdpa 163.9 / 164.0, flex 166.2 / 165.3
+  ms/step, val identical to four decimals. flex falls through to the same
+  `F.scaled_dot_product_attention(is_causal=True)` call, and weights transfer
+  bit-identically (`max |sdpa - flex| = 0.0` from one state_dict). Pretrain with
+  flex anyway, for structure and not speed: **sdpa bakes `rope_cos`/`rope_sin`
+  buffers sized to `block_size` into every layer of the checkpoint, flex stores
+  none**, so nothing caps a later PI/NTK/YaRN extension. One earlier timing of
+  211.5 ms for sdpa was a cold-process artifact and was briefly read as flex
+  being faster — a single timing from a different process is not a measurement.
+
+- **TinyStories base, 27.0M params** (512/8/8, vocab 4097, rope, only 8%
+  embedding — the opposite balance to a 50k-vocab model of the same size). 164
+  ms/step at batch 32 x block 512 on the 4060, so 33000 steps = **541M tokens,
+  1.14 epochs, 20 tok/param in ~1h40m**, of which 10 minutes is the 34 evals.
 
 - **First real pretrain: 12L/768 on FineWeb-Edu.** 123.6M params, 983M tokens
   (0.99 epochs), 15000 steps x 65536 tokens, 4.4 h on a rented RTX PRO 4500
@@ -461,33 +558,68 @@ table the 4-weight sample had missed.
 
 ## Next, in order
 
-**1. Padding and attention masks.** *Currently missing everywhere in
-`src/video/`* — checked, not assumed. Fine for pretraining on contiguous shards,
-a blocker for everything after it: SFT needs the loss masked over prompt tokens
-(`ignore_index`), and batched generation needs left-padding plus a real mask,
-since `generate` assumes every row shares a prompt length. That makes this gate
-RL as well as SFT — rollouts are batched generation. Small file. It has to land
-before SFT, not during.
+Padding and masking, which used to head this list, shipped as `mask.py` plus the
+flex `BlockMask` path; SFT shipped as `task.py` + `sft.py` with two tasks on it.
+What follows assumes the 27M TinyStories base.
 
-**2. SFT + LoRA.** Cleaner versions of `src/sft.py` and `src/lora.py`. Chat
-template, loss masking, then LoRA as the parameter-efficient variant. This is
-where it stops being a continuation engine.
+**1. TinyStories + instruct, through SFT then LoRA then DPO.** One base, three
+algorithms, the same scoreboard throughout, so the deltas are comparable. SFT is
+done from the FineWeb base and needs re-running from this one — a base that
+already ends its stories changes what the rung shows: **format and word
+constraints, not termination**. LoRA is a port of `src/lora.py`. DPO goes on
+instruct and **not** on reverse, which is solved to 1.000 and therefore has no
+preference to express; on instruct, ~80% of sampled stories miss at least one
+required word, and `Instruct.reward` already scores them, so the preference pairs
+are free — sample K, rank, take best against worst.
 
-**3. RL.** **DPO first** — a loss function over a frozen reference model, no
-reward model, no rollouts, no value head, which fits the file-plus-test format.
-PPO/GRPO after, and budget three episodes: sampling loop, advantage estimation,
-KL control. It is the first thing in the series that can silently fail to learn.
+**2. Joint LoRA.** The old track's best result and the one most worth
+reproducing: LoRA on a 67/33 instruct+reverse mix scored **0.969 against full
+SFT's 1.000, at 0.67% of the parameters**, while post-hoc stacking of two
+separately-trained adapters failed. `concat()` exists for this, and it is the
+real test of whether the Task interface holds two tasks at once.
+
+**3. A code corpus — a search, not a build.** The intended analogue,
+`nampdn-ai/tiny-codes`, is **gated**. Of what was verified to load:
+`codeparrot-clean` is raw GitHub Python (Django views, not tiny),
+`flytech/python-codes-25k` is toy interactive scripts that cannot be unit-tested,
+and MBPP is 974 problems — eval-sized, not a pretraining corpus. There is no
+drop-in "TinyStories for code", so this phase begins with finding or assembling
+one, and may conclude that 27M is the wrong scale for it. **Gate: measure pass@1
+before building any of the RL rung on it.** If a from-scratch code model scores
+~0, there is no gradient for DPO or GRPO and the phase ends there, which is a
+finding rather than a failure.
+
+**4. Competitive programming on a real model: sandbox, then GRPO.** The data is
+better than expected — `deepmind/code_contests` loads, is **61% Codeforces**, and
+ships `description`, `cf_rating`, `cf_index`, `cf_tags`, 80-100 **generated tests
+per problem**, and `incorrect_solutions` on 79% of problems, which are free
+preference pairs. From a 1500-row stream — 891 Codeforces, 101 of them rated
+<= 1000 — extrapolating over the full set gives **roughly 7,700 Codeforces
+problems and ~900 rated <= 1000**, statements averaging ~430 tokens. The total
+row count is taken on trust, so treat both figures as order-of-magnitude. Python, not
+C++: solution counts are equal (42k vs 40k in a 300-problem sample) and C++ adds
+a compile step, which is a failure mode a small model will hit constantly.
+
+  This is a track change rather than a rung — a different tokenizer, weights that
+  are not ours, and ~2k context that the from-scratch models do not have. The
+  lesson moves from owning the weights to owning the algorithm. Build in order:
+
+  - **the sandbox** — subprocess, timeout, no network, memory cap. It is the
+    reward function for everything in phases 3 and 4, so it lands first.
+  - **pass@1 on Qwen2.5-Coder 1.5B and 7B**, over the rated <= 1000 band and over
+    MBPP. Pick the band where it falls in 20-50%: higher and there is nothing to
+    amplify, zero and there is no gradient. Contamination is real here — those
+    solutions are on GitHub — so hold out recent problems as a clean test set.
+  - **GRPO** on the band that measurement chooses. DPO is also available without
+    sampling, straight from `incorrect_solutions`.
+
+**5. Chat and QA.** Multi-turn masking: `doc_ids` generalises from eot boundaries
+to scoring only the assistant's turns, and `<|im_start|>`/`<|im_end|>` are
+already in the 50259 vocab because the tokenizer episode minted them for this.
 
 ## Worth covering, unscheduled
 
-- **Activation quantization** — the half `quantize.py` does not do. Needs
-  calibration, is where per-tensor genuinely fails, and weight-only already
-  delivers the 4x. Probably not an episode.
-- **Chat templates and special tokens** — cheap, high payoff, pairs with SFT.
-  The difference between a continuer and an assistant is mostly a format contract.
 - **MoE** — routing, top-k experts, load-balancing loss. Self-contained.
-- **An eval beyond val loss** — bpc is there; something task-shaped makes the SFT
-  and RL episodes legible.
 - **PI / NTK / YaRN context extension** — **built and measured in
   `src/minimal_experiments/rope6.py` (NTK) and `rope7.py` (PI, NTK, YaRN in one
   table)**; integration into `src/video/` is pending, still as a RoPE sequel. All

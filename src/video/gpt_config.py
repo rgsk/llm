@@ -96,6 +96,25 @@ big_cfg = GPTConfig(
 )
 
 
+# --- TinyStories, its own 4096 vocab --------------------------------------
+# big_cfg's shape, with rope and flex. Pretraining packs one continuous stream,
+# so there is no block_mask and flex falls through to the same SDPA kernel --
+# bit-identical output. What differs is the checkpoint: "sdpa" bakes a
+# block_size rope table into every layer as buffers, flex threads the angles
+# from GPT and stores none, so nothing caps a later extension.
+# ~27M params, only 2.1M of it embedding -- the opposite balance to fineweb_smoke.
+tinystories_cfg = GPTConfig(
+    vocab_size=4097,  # 4096 merges + <|endoftext|>
+    block_size=512,
+    n_embed=512,
+    n_head=8,
+    n_layer=8,
+    attention="flex",
+    norm="rms",
+    ffn="gated",
+    position="rope",
+)
+
 # --- FineWeb-Edu, GPT-2's 50259 vocab -------------------------------------
 # 20 minutes on a 4060 at B=8 x grad_accum 2: enough to watch loss fall and read
 # the samples. 26.6M of its 29.9M params are the embedding -- the vocab IS the model
