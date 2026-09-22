@@ -143,6 +143,7 @@ def cmd_sft(args, device: str) -> Path:
             lr="lr",
             batch_size="batch_size",
             grad_accum_steps="grad_accum",
+            eval_interval="eval_interval",
         ),
     )
     print(f"base {base.name}   val {m['val_loss']:.4f}   task {task.name}")
@@ -184,6 +185,9 @@ def main() -> None:
     # keeps tokens-per-step the same while halving it
     ft.add_argument("--grad-accum", type=int)
     ft.add_argument("--eval-n", type=int, default=200, help="samples per scoreboard")
+    # instruct generates one story per sample, so the scoreboard is the
+    # expensive part of the loop, not the training
+    ft.add_argument("--eval-interval", type=int)
     ft.add_argument("--wandb", action="store_true")
 
     smp = sub.add_parser("sample", help="generate from a checkpoint")
