@@ -1,3 +1,12 @@
-/tmp/claude-1000/-home-rahul-Documents-codes-projects-llm/f2af0f62-b9cb-47b8-aa03-13e4ad78d874/scratchpad/pilot.log
-/tmp/claude-1000/-home-rahul-Documents-codes-projects-llm/f2af0f62-b9cb-47b8-aa03-13e4ad78d874/scratchpad/dpo_run1.log
-/tmp/claude-1000/-home-rahul-Documents-codes-projects-llm/f2af0f62-b9cb-47b8-aa03-13e4ad78d874/scratchpad/dpo_pod.log
+/tmp/claude-1000/-home-rahul-Documents-codes-projects-llm/452478af-f9f1-4f76-923d-aaa985e50e87/scratchpad/ab15.log
+/tmp/claude-1000/-home-rahul-Documents-codes-projects-llm/452478af-f9f1-4f76-923d-aaa985e50e87/scratchpad/k8.log
+/tmp/claude-1000/-home-rahul-Documents-codes-projects-llm/452478af-f9f1-4f76-923d-aaa985e50e87/scratchpad/cf3b_pod.log
+/tmp/claude-1000/-home-rahul-Documents-codes-projects-llm/452478af-f9f1-4f76-923d-aaa985e50e87/scratchpad/cf_sft_pod.log
+/tmp/claude-1000/-home-rahul-Documents-codes-projects-llm/452478af-f9f1-4f76-923d-aaa985e50e87/scratchpad/sft_data_shape.txt
+/tmp/claude-1000/-home-rahul-Documents-codes-projects-llm/452478af-f9f1-4f76-923d-aaa985e50e87/scratchpad/cf_eval_pod.log
+/tmp/claude-1000/-home-rahul-Documents-codes-projects-llm/452478af-f9f1-4f76-923d-aaa985e50e87/scratchpad/gen0_pod.log
+/tmp/claude-1000/-home-rahul-Documents-codes-projects-llm/452478af-f9f1-4f76-923d-aaa985e50e87/scratchpad/gen1_local.log
+/tmp/claude-1000/-home-rahul-Documents-codes-projects-llm/452478af-f9f1-4f76-923d-aaa985e50e87/scratchpad/gen1r_pod.log
+/tmp/claude-1000/-home-rahul-Documents-codes-projects-llm/452478af-f9f1-4f76-923d-aaa985e50e87/scratchpad/grade_pod.log
+/tmp/claude-1000/-home-rahul-Documents-codes-projects-llm/452478af-f9f1-4f76-923d-aaa985e50e87/scratchpad/rft_pod.log
+/tmp/claude-1000/-home-rahul-Documents-codes-projects-llm/452478af-f9f1-4f76-923d-aaa985e50e87/scratchpad/split_pod.log
