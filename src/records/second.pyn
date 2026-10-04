@@ -1,0 +1,278 @@
+from pathlib import Path
+from typing import TYPE_CHECKING
+
+import torch
+import torch.nn.functional as F
+from einops import rearrange
+from torch import Tensor, nn
+
+type GPTConfig = (
+    vocab_size: int, block_size: int, n_embed: int, n_head: int, n_layer: int
+)
+type TrainConfig = (
+    batch_size: int, max_steps: int, lr: float, eval_interval: int, eval_iters: int
+)
+
+
+def repo_root() -> Path:
+    here = Path(__file__)
+    for d in here.parents:
+        if (d / "pyproject.toml").exists():
+            return d
+    raise RuntimeError("no pyproject.toml found above " + str(here))
+
+
+text = (repo_root() / "data" / "input.txt").read_text()
+
+
+# the tokenizer is just three locals handed back by name, no class needed
+def char_tokenizer(text: str):
+    itoc = sorted(set(text))
+    ctoi = {c: i for i, c in enumerate(itoc)}
+    vocab_size = len(itoc)
+
+    def encode(s: str) -> list[int]:
+        return [ctoi[c] for c in s]
+
+    def decode(ids: list[int]) -> str:
+        return "".join(itoc[i] for i in ids)
+
+    return (vocab_size=, encode=, decode=)
+
+
+(vocab_size=, encode=, decode=) = char_tokenizer(text)
+device = "cuda" if torch.cuda.is_available() else "cpu"
+
+data = torch.tensor(encode(text), dtype=torch.long)
+n = int(0.9 * len(data))
+train_data, val_data = data[:n], data[n:]
+
+
+def get_batch(d: Tensor, *, batch_size: int, block_size: int):
+    ix = torch.randint(len(d) - block_size, (batch_size,))
+    x = torch.stack([d[i : i + block_size] for i in ix])
+    y = torch.stack([d[i + 1 : i + 1 + block_size] for i in ix])
+    return (x=x.to(device), y=y.to(device))
+
+
+class ResidualProj(nn.Linear):
+    """Linear whose output is added to the residual stream; gets 1/sqrt(2*n_layer) init."""
+
+
+class FlashAttention(nn.Module):
+    def __init__(self, *, n_embed: int, n_head: int):
+        super().__init__()
+        assert n_embed % n_head == 0
+        self.n_head = n_head
+        self.qkv = nn.Linear(n_embed, 3 * n_embed, bias=False)
+        self.proj = ResidualProj(n_embed, n_embed)
+
+    def forward(self, x: Tensor) -> Tensor:
+        qkv: Tensor = self.qkv(x)  # [B, T, 3E]
+        qkv = rearrange(qkv, "b t (three e) -> three b t e", three=3)
+        q, k, v = [
+            rearrange(t, "b t (nh hs) -> b nh t hs", nh=self.n_head) for t in qkv
+        ]
+        out = F.scaled_dot_product_attention(q, k, v, is_causal=True)  # [B, nh, T, hs]
+        out = rearrange(out, "b nh t hs -> b t (nh hs)")  # [B, T, E]
+        return self.proj(out)
+
+
+class FeedForward(nn.Module):
+    def __init__(self, *, n_embed: int):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(n_embed, 4 * n_embed),
+            nn.ReLU(),
+            ResidualProj(4 * n_embed, n_embed),
+        )
+
+    def forward(self, x: Tensor) -> Tensor:
+        return self.net(x)  # [B, T, E]
+
+
+class Block(nn.Module):
+    def __init__(self, *, n_embed: int, n_head: int):
+        super().__init__()
+        self.ln1 = nn.LayerNorm(n_embed)
+        self.ln2 = nn.LayerNorm(n_embed)
+        self.attn = FlashAttention(n_embed=, n_head=)
+        self.ffwd = FeedForward(n_embed=)
+
+    def forward(self, x: Tensor) -> Tensor:
+        x = x + self.attn(self.ln1(x))
+        x = x + self.ffwd(self.ln2(x))
+        return x
+
+
+class GPT(nn.Module):
+    def __init__(
+        self,
+        (vocab_size=, block_size=, n_embed=, n_head=, n_layer=): (
+            vocab_size: int,
+            block_size: int,
+            n_embed: int,
+            n_head: int,
+            n_layer: int,
+            ...,
+        ),
+    ):
+        super().__init__()
+        self.n_layer = n_layer
+        self.block_size = block_size
+        self.token_embedding_table = nn.Embedding(vocab_size, n_embed)
+        self.position_embedding_table = nn.Embedding(block_size, n_embed)
+        self.blocks = nn.ModuleList(
+            [Block(n_embed=, n_head=) for _ in range(n_layer)]
+        )
+        self.ln_f = nn.LayerNorm(n_embed)
+        self.lm_head = nn.Linear(n_embed, vocab_size, bias=False)
+        self.apply(self._init_weights)
+        self.lm_head.weight = self.token_embedding_table.weight
+
+    def _init_weights(self, module: nn.Module) -> None:
+        with torch.no_grad():
+            if isinstance(module, nn.Linear):
+                std = 0.02
+                if isinstance(module, ResidualProj):
+                    # ** with a float exponent is Any in the stubs (could be complex)
+                    std *= (2 * self.n_layer) ** -0.5  # any:ok
+                module.weight.normal_(mean=0.0, std=std)
+                if module.bias is not None:
+                    module.bias.zero_()
+            elif isinstance(module, nn.Embedding):
+                module.weight.normal_(mean=0.0, std=0.02)
+
+    def forward(self, idx: Tensor) -> Tensor:
+        _, T = idx.shape
+        x: Tensor = self.token_embedding_table(idx)
+        x = x + self.position_embedding_table(torch.arange(T, device=idx.device))
+        for block in self.blocks:
+            x = block(x)
+        return self.lm_head(self.ln_f(x))  # [B, T, V]
+
+    # nn.Module types model(x) as Any; checker-only, keep in step with forward
+    if TYPE_CHECKING:
+
+        def __call__(self, idx: Tensor) -> Tensor: ...
+
+
+def batch_loss(model: GPT, *, x: Tensor, y: Tensor) -> Tensor:
+    B, T = x.shape
+    logits = model(x)  # [B, T, V]
+    return F.cross_entropy(logits.reshape(B * T, -1), y.reshape(B * T))
+
+
+@torch.no_grad()
+def full_val_loss(model: GPT, *, batch_size: int) -> float:
+    was_training = model.training
+    model.eval()
+    T = model.block_size
+    nwin = (len(val_data) - 1) // T  # how many full windows fit
+    xs = val_data[: nwin * T].view(nwin, T)
+    ys = val_data[1 : nwin * T + 1].view(nwin, T)  # targets, shifted +1
+    total, count = 0.0, 0
+    for i in range(0, nwin, batch_size):
+        x, y = xs[i : i + batch_size].to(device), ys[i : i + batch_size].to(device)
+        # weight by #tokens so the mean is correct over the uneven last chunk
+        total += batch_loss(model, x=, y=).item() * y.numel()
+        count += y.numel()
+    model.train(was_training)
+    return total / count
+
+
+@torch.no_grad()
+def train_loss_est(model: GPT, *, batch_size: int, iters: int) -> float:
+    """Cheap estimate from random batches; the train split is too big for a full pass."""
+    was_training = model.training
+    model.eval()
+    block_size = model.block_size
+    losses = [
+        batch_loss(
+            model, **get_batch(train_data, batch_size=, block_size=)
+        ).item()
+        for _ in range(iters)
+    ]
+    model.train(was_training)
+    return sum(losses) / len(losses)
+
+
+def train(
+    model: GPT,
+    (batch_size=, max_steps=, lr=, eval_interval=, eval_iters=): (
+        batch_size: int,
+        max_steps: int,
+        lr: float,
+        eval_interval: int,
+        eval_iters: int,
+        ...,
+    ),
+):
+    block_size = model.block_size
+    opt = torch.optim.AdamW(model.parameters(), lr=lr)
+
+    def evaluate(step: int):
+        tr = train_loss_est(model, batch_size=, iters=eval_iters)
+        va = full_val_loss(model, batch_size=)
+        print(f"  step {step:>4} : train {tr:.3f}   val {va:.3f}")
+
+    for step in range(max_steps):
+        if step % eval_interval == 0:
+            evaluate(step)
+        (x=, y=) = get_batch(train_data, batch_size=, block_size=)
+        loss = batch_loss(model, x=, y=)
+        opt.zero_grad()
+        loss.backward()
+        opt.step()
+    evaluate(max_steps)
+
+
+@torch.no_grad()
+def generate(model: GPT, idx: Tensor, *, max_new_tokens: int) -> Tensor:
+    was_training = model.training
+    model.eval()
+    for _ in range(max_new_tokens):
+        logits = model(idx[:, -model.block_size :])[:, -1, :]  # [B, V]
+        probs = F.softmax(logits, dim=-1)
+        nxt = torch.multinomial(probs, num_samples=1)  # [B, 1]
+        idx = torch.cat([idx, nxt], dim=1)
+    model.train(was_training)
+    return idx
+
+
+# defaults hold only size-independent fields; size-dependent ones are required in every
+# config, so a stale block_size can't ride along. Annotate: unannotated spreads are unchecked
+gpt_defaults = (vocab_size=)
+train_defaults = (eval_interval=100, eval_iters=100)
+
+gpt_cfg: GPTConfig = (**gpt_defaults, block_size=32, n_embed=64, n_head=4, n_layer=3)
+train_cfg: TrainConfig = (**train_defaults, batch_size=32, max_steps=500, lr=1e-2)
+print(gpt_cfg)
+print(train_cfg)
+
+(x=, y=) = get_batch(
+    train_data,
+    batch_size=train_cfg.batch_size,
+    block_size=gpt_cfg.block_size,
+)
+print(x.shape, y.shape)
+
+# checked: a missing or wrong-typed field is an error; extra fields are fine
+model = GPT(gpt_cfg).to(device)
+deep_cfg: GPTConfig = (
+    **gpt_defaults, block_size=32, n_embed=64, n_head=4, n_layer=6
+)
+for cfg in (gpt_cfg, deep_cfg):
+    n_params = sum(p.numel() for p in GPT(cfg).parameters())
+    print(f"n_layer={cfg.n_layer}: {n_params:,} params")
+
+print(model(x).shape)  # [B, T, V]
+# untrained, so close to uniform over the vocab: loss ≈ ln(65) = 4.17
+print(batch_loss(model, x=, y=).item())
+
+train(model, train_cfg)
+
+prompt = torch.tensor([encode("\n")], device=device)
+out = generate(model, prompt, max_new_tokens=200)
+ids = out[0].tolist()  # list[Unknown] in torch's stubs, any:ok
+print(decode(ids))

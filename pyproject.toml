@@ -7,6 +7,7 @@ requires-python = ">=3.12"
 dependencies = [
     "accelerate>=1.15.0",
     "beartype>=0.22.9",
+    "byname",
     "datasets>=5.0.1",
     "einops>=0.8.2",
     "jaxtyping>=0.3.11",
@@ -21,6 +22,7 @@ dependencies = [
 
 [dependency-groups]
 dev = [
+    "basedpyright>=1.40.1",
     # <7: ipykernel 7 reworked the kernel async/status protocol and the
     # current VS Code Jupyter ext (2025.9.1) can miss the reply that ends
     # a cell -- outputs land but the spinner never resolves, needing a reload
@@ -46,3 +48,6 @@ src = ["src", "src/video", "src/scratch"]
 # error instead of a mark that silently never gets deselected
 addopts = ["--strict-markers"]
 markers = ["slow: seconds, not milliseconds -- skip with -m 'not slow'"]
+
+[tool.uv.sources]
+byname = { path = "../byname", editable = true }
