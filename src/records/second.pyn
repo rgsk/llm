@@ -40,10 +40,10 @@ def char_tokenizer(text: str):
     return (vocab_size=, encode=, decode=)
 
 
-(vocab_size=, encode=, decode=) = char_tokenizer(text)
+tok = char_tokenizer(text)
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
-data = torch.tensor(encode(text), dtype=torch.long)
+data = torch.tensor(tok.encode(text), dtype=torch.long)
 n = int(0.9 * len(data))
 train_data, val_data = data[:n], data[n:]
 
@@ -241,7 +241,7 @@ def generate(model: GPT, idx: Tensor, *, max_new_tokens: int) -> Tensor:
 
 # defaults hold only size-independent fields; size-dependent ones are required in every
 # config, so a stale block_size can't ride along. Annotate: unannotated spreads are unchecked
-gpt_defaults = (vocab_size=)
+gpt_defaults = (vocab_size=tok.vocab_size)
 train_defaults = (eval_interval=100, eval_iters=100)
 
 gpt_cfg: GPTConfig = (**gpt_defaults, block_size=32, n_embed=64, n_head=4, n_layer=3)
@@ -271,7 +271,7 @@ print(batch_loss(model, x, y).item())
 
 train(model, train_cfg)
 
-prompt = torch.tensor([encode("\n")], device=device)
+prompt = torch.tensor([tok.encode("\n")], device=device)
 out = generate(model, prompt, max_new_tokens=200)
 ids = out[0].tolist()  # list[Unknown] in torch's stubs, any:ok
-print(decode(ids))
+print(tok.decode(ids))
