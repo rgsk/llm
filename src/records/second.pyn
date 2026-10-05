@@ -171,14 +171,15 @@ def full_val_loss(model: GPT, *, batch_size: int) -> float:
     nwin = (len(val_data) - 1) // T  # how many full windows fit
     xs = val_data[: nwin * T].view(nwin, T)
     ys = val_data[1 : nwin * T + 1].view(nwin, T)  # targets, shifted +1
-    total, count = 0.0, 0
+    # summed on the GPU: no sync per batch
+    total, count = torch.tensor(0.0, device=device), 0
     for i in range(0, nwin, batch_size):
         x, y = xs[i : i + batch_size].to(device), ys[i : i + batch_size].to(device)
         # weight by #tokens so the mean is correct over the uneven last chunk
-        total += batch_loss(model, x, y).item() * y.numel()
+        total += batch_loss(model, x, y) * y.numel()
         count += y.numel()
     model.train(was_training)
-    return total / count
+    return (total / count).item()
 
 
 @torch.no_grad()
@@ -187,13 +188,12 @@ def train_loss_est(model: GPT, *, batch_size: int, iters: int) -> float:
     was_training = model.training
     model.eval()
     block_size = model.block_size
-    losses = []
+    losses: list[Tensor] = []
     for _ in range(iters):
         x, y = get_batch(train_data, batch_size=, block_size=)
-        loss = batch_loss(model, x, y).item()
-        losses.append(loss)
+        losses.append(batch_loss(model, x, y))
     model.train(was_training)
-    return sum(losses) / len(losses)
+    return torch.stack(losses).mean().item()  # one sync, not one per batch
 
 
 def train(
