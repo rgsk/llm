@@ -52,7 +52,7 @@ def get_batch(d: Tensor, *, batch_size: int, block_size: int):
     ix = torch.randint(len(d) - block_size, (batch_size,))
     x = torch.stack([d[i : i + block_size] for i in ix])
     y = torch.stack([d[i + 1 : i + 1 + block_size] for i in ix])
-    return (x=x.to(device), y=y.to(device))
+    return (x := x.to(device), y := y.to(device))
 
 
 class ResidualProj(nn.Linear):
@@ -157,7 +157,7 @@ class GPT(nn.Module):
         def __call__(self, idx: Tensor) -> Tensor: ...
 
 
-def batch_loss(model: GPT, *, x: Tensor, y: Tensor) -> Tensor:
+def batch_loss(model: GPT, x: Tensor, y: Tensor) -> Tensor:
     B, T = x.shape
     logits = model(x)  # [B, T, V]
     return F.cross_entropy(logits.reshape(B * T, -1), y.reshape(B * T))
@@ -175,7 +175,7 @@ def full_val_loss(model: GPT, *, batch_size: int) -> float:
     for i in range(0, nwin, batch_size):
         x, y = xs[i : i + batch_size].to(device), ys[i : i + batch_size].to(device)
         # weight by #tokens so the mean is correct over the uneven last chunk
-        total += batch_loss(model, x=, y=).item() * y.numel()
+        total += batch_loss(model, x, y).item() * y.numel()
         count += y.numel()
     model.train(was_training)
     return total / count
@@ -187,12 +187,11 @@ def train_loss_est(model: GPT, *, batch_size: int, iters: int) -> float:
     was_training = model.training
     model.eval()
     block_size = model.block_size
-    losses = [
-        batch_loss(
-            model, **get_batch(train_data, batch_size=, block_size=)
-        ).item()
-        for _ in range(iters)
-    ]
+    losses = []
+    for _ in range(iters):
+        x, y = get_batch(train_data, batch_size=, block_size=)
+        loss = batch_loss(model, x, y).item()
+        losses.append(loss)
     model.train(was_training)
     return sum(losses) / len(losses)
 
@@ -219,8 +218,8 @@ def train(
     for step in range(max_steps):
         if step % eval_interval == 0:
             evaluate(step)
-        (x=, y=) = get_batch(train_data, batch_size=, block_size=)
-        loss = batch_loss(model, x=, y=)
+        x, y = get_batch(train_data, batch_size=, block_size=)
+        loss = batch_loss(model, x, y)
         opt.zero_grad()
         loss.backward()
         opt.step()
@@ -250,7 +249,7 @@ train_cfg: TrainConfig = (**train_defaults, batch_size=32, max_steps=500, lr=1e-
 print(gpt_cfg)
 print(train_cfg)
 
-(x=, y=) = get_batch(
+x, y = get_batch(
     train_data,
     batch_size=train_cfg.batch_size,
     block_size=gpt_cfg.block_size,
@@ -268,7 +267,7 @@ for cfg in (gpt_cfg, deep_cfg):
 
 print(model(x).shape)  # [B, T, V]
 # untrained, so close to uniform over the vocab: loss ≈ ln(65) = 4.17
-print(batch_loss(model, x=, y=).item())
+print(batch_loss(model, x, y).item())
 
 train(model, train_cfg)
 
