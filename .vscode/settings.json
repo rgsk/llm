@@ -1,5 +1,5 @@
 {
-    "python.analysis.typeCheckingMode": "off",
+    "basedpyright.analysis.typeCheckingMode": "off",
     "[python]": {
         "editor.defaultFormatter": "charliermarsh.ruff",
         "editor.formatOnSave": true,
@@ -9,7 +9,7 @@
         }
     },
     "notebook.formatOnSave.enabled": true,
-    "python.analysis.extraPaths": [
+    "basedpyright.analysis.extraPaths": [
         "src",
         "src/video",
         "src/scratch"
@@ -22,4 +22,5 @@
         // ever shows what pytest itself writes out
         "-rP"
     ],
+    "python.languageServer": "None",
 }
