@@ -39,7 +39,7 @@ dev = [
 # ruff infers first-party packages from the cwd, so the CLI (run inside src/video)
 # and the VS Code extension (run from the repo root) sorted imports differently --
 # `tokenizer` resolves to src/tokenizer.py from one and src/video/tokenizer.py from
-# the other. Pinned here to match settings.json's python.analysis.extraPaths.
+# the other. Pinned here to match [tool.basedpyright]'s extraPaths below.
 src = ["src", "src/video", "src/scratch"]
 
 [tool.pytest.ini_options]
@@ -51,3 +51,10 @@ markers = ["slow: seconds, not milliseconds -- skip with -m 'not slow'"]
 
 [tool.uv.sources]
 byname = { path = "../byname", editable = true }
+
+[tool.basedpyright]
+# read by the editor (byname lsp) and Alt+L (`byname tool basedpyright`) alike. .py files are checked in
+# "standard" too, but the editor shows only .pyn findings (byname.pythonDiagnostics false): .py errors are
+# for Alt+L
+typeCheckingMode = "standard"
+extraPaths = ["src", "src/video", "src/scratch"]

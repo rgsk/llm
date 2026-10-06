@@ -1,19 +1,39 @@
 {
-    "basedpyright.analysis.typeCheckingMode": "off",
-    "[python]": {
-        "editor.defaultFormatter": "charliermarsh.ruff",
+    // --- type checking: byname (basedpyright behind it) for .pyn, .py and notebooks ---
+    // no second language server from the Python extension; the BasedPyright extension stays off here.
+    // Checker and Ruff config live in pyproject.toml ([tool.basedpyright], [tool.ruff]), not here
+    "python.languageServer": "None",
+    // .py files and plain notebooks: no errors or warnings in the editor (syntax errors and faded unused
+    // code still show); Alt+L checks them
+    "byname.pythonDiagnostics": false,
+
+    // --- Ruff: format and fix on save, all through byname (the project's ruff, pyproject.toml's [tool.ruff]) ---
+    // The Ruff extension isn't needed: disable it here, or its fixes on save would run alongside byname's
+    "[pyn]": {
         "editor.formatOnSave": true,
         "editor.codeActionsOnSave": {
-            "source.organizeImports.ruff": "explicit",
-            "source.fixAll.ruff": "explicit"
+            "source.fixAll": "explicit",
+            "source.organizeImports": "explicit"
         }
     },
+    "[python]": {
+        "editor.defaultFormatter": "rgsk.byname",
+        "editor.formatOnSave": true,
+        "editor.codeActionsOnSave": {
+            "source.fixAll": "explicit",
+            "source.organizeImports": "explicit"
+        }
+    },
+    // notebooks (byname or plain): notebook-wide, Ruff seeing the whole notebook (an import used in a
+    // later cell is used)
+    "notebook.defaultFormatter": "rgsk.byname",
     "notebook.formatOnSave.enabled": true,
-    "basedpyright.analysis.extraPaths": [
-        "src",
-        "src/video",
-        "src/scratch"
-    ],
+    "notebook.codeActionsOnSave": {
+        "notebook.source.fixAll": "explicit",
+        "notebook.source.organizeImports": "explicit"
+    },
+
+    // Testing panel + run buttons in the gutter
     "python.testing.pytestEnabled": true,
     "python.testing.unittestEnabled": false,
     "python.testing.pytestArgs": [
@@ -21,6 +41,5 @@
         // don't swallow print() from passing tests -- the test explorer only
         // ever shows what pytest itself writes out
         "-rP"
-    ],
-    "python.languageServer": "None",
+    ]
 }

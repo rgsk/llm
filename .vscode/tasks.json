@@ -15,9 +15,9 @@
     "tasks": [
         {
             "label": "check: current file",
-            "detail": "ruff + mypy on the open file (.py or .ipynb); .pyn gets ruff + basedpyright via byname (mypy sees records as Any), plus scripts/any_check.py",
+            "detail": "ruff + basedpyright on the open .pyn, .py or .ipynb through byname tool (byname notebooks translated); .pyn also gets scripts/any_check.py",
             "type": "shell",
-            "command": "F=$(echo '${file}' | cut -d'#' -f1); echo \"checking $F\"; echo; case \"$F\" in *.pyn) echo '─── ruff ───'; uv run byname tool ruff check --output-format=concise \"$F\" && echo '✅ ruff ok'; echo; echo '─── basedpyright ───'; uv run byname tool basedpyright \"$F\" && echo '✅ basedpyright ok'; echo; echo '─── untyped names (Any) ───'; uv run python scripts/any_check.py \"$F\" && echo '✅ no Any names';; *) echo '─── ruff ───'; uv run ruff check --output-format=concise \"$F\" && echo '✅ ruff ok'; echo; echo '─── mypy ───'; { case \"$F\" in *.ipynb) uv run nbqa mypy \"$F\";; *) uv run mypy \"$F\";; esac; } && echo '✅ mypy ok';; esac; echo",
+            "command": "F=$(echo '${file}' | cut -d'#' -f1); echo \"checking $F\"; echo; case \"$F\" in *.pyn|*.py|*.ipynb) ;; *) echo 'not a .pyn, .py or .ipynb file'; exit 0;; esac; echo '─── ruff ───'; uv run byname tool ruff check --output-format=concise \"$F\" && echo '✅ ruff ok'; echo; echo '─── basedpyright ───'; uv run byname tool basedpyright \"$F\" && echo '✅ basedpyright ok'; echo; case \"$F\" in *.pyn) echo '─── untyped names (Any) ───'; uv run python scripts/any_check.py \"$F\" && echo '✅ no Any names'; echo;; esac",
             "problemMatcher": []
         }
     ]
