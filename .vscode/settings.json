@@ -1,14 +1,12 @@
 {
     // --- type checking: byname (basedpyright behind it) for .pyn, .py and notebooks ---
-    // no second language server from the Python extension; the BasedPyright extension stays off here.
+    // no second language server from the Python extension (it would start Jedi, Pylance not being installed).
     // Checker and Ruff config live in pyproject.toml ([tool.basedpyright], [tool.ruff]), not here
     "python.languageServer": "None",
     // .py files and plain notebooks: no errors or warnings in the editor (syntax errors and faded unused
     // code still show); Alt+L checks them
     "byname.pythonDiagnostics": false,
-
     // --- Ruff: format and fix on save, all through byname (the project's ruff, pyproject.toml's [tool.ruff]) ---
-    // The Ruff extension isn't needed: disable it here, or its fixes on save would run alongside byname's
     "[pyn]": {
         "editor.formatOnSave": true,
         "editor.codeActionsOnSave": {
@@ -32,7 +30,6 @@
         "notebook.source.fixAll": "explicit",
         "notebook.source.organizeImports": "explicit"
     },
-
     // Testing panel + run buttons in the gutter
     "python.testing.pytestEnabled": true,
     "python.testing.unittestEnabled": false,

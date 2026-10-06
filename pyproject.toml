@@ -20,6 +20,19 @@ dependencies = [
     "wandb>=0.28.2",
 ]
 
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build]
+# `uv sync` installs the project editable, and this puts these folders on every interpreter's sys.path
+# (a .pth in .venv): scripts, Alt+R, uv run, byname run, Jupyter kernels, the debugger and pytest all find
+# `utils`, `tokenizer` and friends from anywhere, as the checker does
+dev-mode-dirs = ["src", "src/video", "src/scratch"]
+
+[tool.hatch.build.targets.wheel]
+bypass-selection = true  # nothing to package: the install is only for the paths above
+
 [dependency-groups]
 dev = [
     "basedpyright>=1.40.1",
@@ -28,18 +41,14 @@ dev = [
     # a cell -- outputs land but the spinner never resolves, needing a reload
     "ipykernel>=6.29,<7",
     "ipywidgets>=8.1.9",
-    "mypy>=2.3.1",
     "nbconvert>=7.17.1",
-    "nbqa>=1.9.1",
     "pytest>=9.1.1",
     "ruff>=0.16.2",
 ]
 
 [tool.ruff]
-# ruff infers first-party packages from the cwd, so the CLI (run inside src/video)
-# and the VS Code extension (run from the repo root) sorted imports differently --
-# `tokenizer` resolves to src/tokenizer.py from one and src/video/tokenizer.py from
-# the other. Pinned here to match [tool.basedpyright]'s extraPaths below.
+# the folders whose modules are first-party, so imports from them sort together (I001), as extraPaths makes
+# them importable for the checker below; keep the three lists in step with dev-mode-dirs above
 src = ["src", "src/video", "src/scratch"]
 
 [tool.pytest.ini_options]
@@ -58,3 +67,7 @@ byname = { path = "../byname", editable = true }
 # for Alt+L
 typeCheckingMode = "standard"
 extraPaths = ["src", "src/video", "src/scratch"]
+# a module in a file's own folder first, as at runtime (the script's folder leads sys.path). basedpyright
+# otherwise tries that folder last, after extraPaths and the .pth, so a same-named module elsewhere (src/x.py
+# next to src/records/x.py) would win. One entry per folder that shadows a module from another
+executionEnvironments = [{ root = "src/records" }]
