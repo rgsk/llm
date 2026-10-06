@@ -109,12 +109,12 @@ class GPT(nn.Module):
     def __init__(
         self,
         (vocab_size=, block_size=, n_embed=, n_head=, n_layer=): (
+            ...,
             vocab_size: int,
             block_size: int,
             n_embed: int,
             n_head: int,
             n_layer: int,
-            ...,
         ),
     ):
         super().__init__()
@@ -199,12 +199,12 @@ def train_loss_est(model: GPT, *, batch_size: int, iters: int) -> float:
 def train(
     model: GPT,
     (batch_size=, max_steps=, lr=, eval_interval=, eval_iters=): (
+        ...,
         batch_size: int,
         max_steps: int,
         lr: float,
         eval_interval: int,
         eval_iters: int,
-        ...,
     ),
 ):
     block_size = model.block_size
