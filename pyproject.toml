@@ -7,7 +7,6 @@ requires-python = ">=3.12"
 dependencies = [
     "accelerate>=1.15.0",
     "beartype>=0.22.9",
-    "byname",
     "datasets>=5.0.1",
     "einops>=0.8.2",
     "jaxtyping>=0.3.11",
@@ -26,7 +25,7 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build]
 # `uv sync` installs the project editable, and this puts these folders on every interpreter's sys.path
-# (a .pth in .venv): scripts, Alt+R, uv run, byname run, Jupyter kernels, the debugger and pytest all find
+# (a .pth in .venv): scripts, Alt+R, uv run, Jupyter kernels, the debugger and pytest all find
 # `utils`, `tokenizer` and friends from anywhere, as the checker does
 dev-mode-dirs = ["src", "src/video", "src/scratch"]
 
@@ -47,8 +46,8 @@ dev = [
 ]
 
 [tool.ruff]
-# the folders whose modules are first-party, so imports from them sort together (I001), as extraPaths makes
-# them importable for the checker below; keep the three lists in step with dev-mode-dirs above
+# the folders whose modules are first-party, so imports from them sort together (I001), as dev-mode-dirs
+# makes them importable; keep the two lists in step
 src = ["src", "src/video", "src/scratch"]
 
 [tool.pytest.ini_options]
@@ -57,17 +56,3 @@ src = ["src", "src/video", "src/scratch"]
 # error instead of a mark that silently never gets deselected
 addopts = ["--strict-markers"]
 markers = ["slow: seconds, not milliseconds -- skip with -m 'not slow'"]
-
-[tool.uv.sources]
-byname = { path = "../byname", editable = true }
-
-[tool.basedpyright]
-# read by the editor (byname lsp) and Alt+L (`byname tool basedpyright`) alike. .py files are checked in
-# "standard" too, but the editor shows only .pyn findings (byname.pythonDiagnostics false): .py errors are
-# for Alt+L
-typeCheckingMode = "standard"
-extraPaths = ["src", "src/video", "src/scratch"]
-# a module in a file's own folder first, as at runtime (the script's folder leads sys.path). basedpyright
-# otherwise tries that folder last, after extraPaths and the .pth, so a same-named module elsewhere (src/x.py
-# next to src/records/x.py) would win. One entry per folder that shadows a module from another
-executionEnvironments = [{ root = "src/records" }]
