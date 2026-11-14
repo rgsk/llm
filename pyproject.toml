@@ -56,3 +56,6 @@ src = ["src", "src/video", "src/scratch"]
 # error instead of a mark that silently never gets deselected
 addopts = ["--strict-markers"]
 markers = ["slow: seconds, not milliseconds -- skip with -m 'not slow'"]
+
+[tool.basedpyright]
+typeCheckingMode = "off"
