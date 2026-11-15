@@ -230,14 +230,14 @@ def generate(model: GPT, idx: Tensor, *, max_new_tokens: int) -> Tensor:
 gpt_defaults = namespace(vocab_size=tok.vocab_size)
 train_defaults = namespace(eval_interval=100, eval_iters=100)
 
-gpt_cfg = namespace(
+gpt_cfg: GPTConfig = namespace(
     **vars(gpt_defaults),
     block_size=8,
     n_embed=64,
     n_head=4,
     n_layer=3,
 )
-train_cfg = namespace(
+train_cfg: TrainConfig = namespace(
     **vars(train_defaults),
     batch_size=32,
     max_steps=500,
@@ -254,7 +254,7 @@ x, y = get_batch(
 print(x.shape, y.shape)
 
 model = GPT(gpt_cfg).to(device)
-deep_cfg = namespace(**vars(gpt_cfg) | dict(n_layer=6))
+deep_cfg: GPTConfig = namespace(**vars(gpt_cfg) | dict(n_layer=6))
 for cfg in (gpt_cfg, deep_cfg):
     n_params = sum(p.numel() for p in GPT(cfg).parameters())
     print(f"n_layer={cfg.n_layer}: {n_params:,} params")
